@@ -1,12 +1,21 @@
 package quasar
 
-// TODO: rename? naming collides
-type GetOption func(*getOptions)
+type LoadOption func(*loadOptions)
 
-type getOptions struct{}
+func getLoadOptions(opts []LoadOption) loadOptions {
+	var cfg loadOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
 
-func WaitForUID(uid int) GetOption {
-	return func(opt *getOptions) {
-		panic("not implemented")
+type loadOptions struct {
+	waitFor int
+}
+
+func WaitForUID(uid int) LoadOption {
+	return func(opt *loadOptions) {
+		opt.waitFor = uid
 	}
 }
