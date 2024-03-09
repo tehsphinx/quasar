@@ -4,7 +4,9 @@ go 1.18
 
 require (
 	github.com/hashicorp/raft v1.6.1
+	github.com/magefile/mage v1.15.0
 	github.com/matryer/is v1.4.1
+	google.golang.org/protobuf v1.28.1
 )
 
 require (

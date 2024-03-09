@@ -1,0 +1,33 @@
+syntax = "proto3";
+package quasar.v1;
+
+option go_package = "github.com/tehsphinx/quasar/pb";
+
+message Command {
+  oneof cmd {
+    StoreValue store_value = 1;
+    LoadValue load_value = 2;
+  }
+}
+
+message CommandResponse {
+  oneof resp {
+    StoreValueResponse store_value = 1;
+    LoadValueResponse load_value = 2;
+  }
+}
+
+message StoreValue {
+  string key = 1;
+  bytes data = 2;
+}
+
+message StoreValueResponse {}
+
+message LoadValue {
+  string key = 1;
+}
+
+message LoadValueResponse {
+  bytes data = 1;
+}

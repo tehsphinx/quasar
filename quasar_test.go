@@ -1,7 +1,9 @@
 package quasar
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/matryer/is"
 )
@@ -22,11 +24,15 @@ func TestSingleCache(t *testing.T) {
 		},
 	}
 
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelMain()
+
 	asrtMain := is.New(t)
 
-	rft, err := getRaft(28224)
+	cache, err := NewCache(WithTCPRaft(28224))
 	asrtMain.NoErr(err)
-	cache, err := NewCache(rft)
+
+	err = cache.WaitReady(ctxMain)
 	asrtMain.NoErr(err)
 
 	for _, tt := range tests {
@@ -42,7 +48,7 @@ func TestSingleCache(t *testing.T) {
 				got, r := cache.Load(k)
 				asrt.NoErr(r)
 
-				asrt.Equal(got, v)
+				asrt.Equal(got, []byte(v))
 			}
 		})
 	}
