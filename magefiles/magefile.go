@@ -22,14 +22,12 @@ func Gen() error {
 		return err
 	}
 
-	fmt.Println(os.Getwd())
-
 	options := []string{
 		"--proto_path=./proto",
-		"--go_out=.",
-		"--go_opt=module=github.com/tehsphinx/quasar",
-		strings.Join(files, " "),
+		"--go_out=./pb", "--go_opt=paths=source_relative",
+		"--go-drpc_out=./pb", "--go-drpc_opt=paths=source_relative",
 	}
+	options = append(options, files...)
 	if out, err := sh.Output("protoc", options...); err != nil {
 		return fmt.Errorf("%w\n%s", err, strings.TrimSpace(out))
 	}

@@ -1,0 +1,10 @@
+syntax = "proto3";
+package quasar.v1;
+
+option go_package = "github.com/tehsphinx/quasar/pb";
+
+import "v1/cmd.proto";
+
+service QuasarService {
+  rpc Apply(Command) returns (CommandResponse);
+}

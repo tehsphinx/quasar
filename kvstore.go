@@ -5,7 +5,10 @@ import (
 	"sync"
 )
 
-var ErrNotFound = errors.New("key not found")
+var (
+	ErrNotFound = errors.New("key not found")
+	ErrNoLeader = errors.New("cluster does not have a leader")
+)
 
 type KVStore interface {
 	Store(key string, data []byte) error

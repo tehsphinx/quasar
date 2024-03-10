@@ -5,12 +5,12 @@ import (
 	"io"
 
 	"github.com/hashicorp/raft"
-	"github.com/tehsphinx/quasar/pb"
+	"github.com/tehsphinx/quasar/pb/v1"
 	"google.golang.org/protobuf/proto"
 )
 
 type FSM interface {
-	Apply(cmd *pb.Command, log *raft.Log) (*pb.CommandResponse, error)
+	Apply(cmd *pb.Command) (*pb.CommandResponse, error)
 	Snapshot() (raft.FSMSnapshot, error)
 	Restore(snapshot io.ReadCloser) error
 }
@@ -26,7 +26,7 @@ type cacheFSM struct {
 	store KVStore
 }
 
-func (s *cacheFSM) Apply(command *pb.Command, log *raft.Log) (*pb.CommandResponse, error) {
+func (s *cacheFSM) Apply(command *pb.Command) (*pb.CommandResponse, error) {
 	switch cmd := command.GetCmd().(type) {
 	case *pb.Command_StoreValue:
 		return s.Store(cmd.StoreValue)
@@ -35,18 +35,17 @@ func (s *cacheFSM) Apply(command *pb.Command, log *raft.Log) (*pb.CommandRespons
 	}
 
 	fmt.Printf("%+v\n", command)
-	fmt.Printf("%+v\n", log)
 	return nil, nil
 }
 
 func (s *cacheFSM) Store(cmd *pb.StoreValue) (*pb.CommandResponse, error) {
 	err := s.store.Store(cmd.Key, cmd.Data)
-	return respStore(), err
+	return respStore(&pb.StoreValueResponse{}), err
 }
 
 func (s *cacheFSM) Load(cmd *pb.LoadValue) (*pb.CommandResponse, error) {
 	data, err := s.store.Load(cmd.Key)
-	return respLoad(data), err
+	return respLoad(&pb.LoadValueResponse{Data: data}), err
 }
 
 func (s *cacheFSM) Snapshot() (raft.FSMSnapshot, error) {
@@ -80,7 +79,7 @@ func (s *fsmWrapper) Apply(log *raft.Log) interface{} {
 		return applyResponse{err: err}
 	}
 
-	resp, err := s.fsm.Apply(&cmd, log)
+	resp, err := s.fsm.Apply(&cmd)
 	return applyResponse{
 		resp: resp,
 		err:  err,

@@ -1,7 +1,7 @@
 package quasar
 
 import (
-	"github.com/tehsphinx/quasar/pb"
+	"github.com/tehsphinx/quasar/pb/v1"
 )
 
 func cmdStore(key string, data []byte) *pb.Command {

@@ -22,12 +22,15 @@ message StoreValue {
   bytes data = 2;
 }
 
-message StoreValueResponse {}
+message StoreValueResponse {
+  uint64 uid = 1;
+}
 
 message LoadValue {
   string key = 1;
 }
 
 message LoadValueResponse {
-  bytes data = 1;
+  uint64 uid = 1;
+  bytes data = 2;
 }

@@ -1,4 +1,4 @@
-package store
+package stores
 
 func NewStableInMemory() *StableInMemory {
 	return &StableInMemory{

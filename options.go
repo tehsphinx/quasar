@@ -1,30 +1,94 @@
 package quasar
 
 import (
+	"net"
+
+	"github.com/google/uuid"
 	"github.com/hashicorp/raft"
+	"github.com/tehsphinx/quasar/transports"
 )
 
 type Option func(*options)
 
 type options struct {
-	tcpPort int
-	raft    *raft.Raft
+	localID string
+
+	bindAddr      string
+	extAddr       net.Addr
+	raftTransport raft.Transport
+	transport     transports.Transport
+
+	raft      *raft.Raft
+	bootstrap bool
+	servers   []raft.Server
 }
 
 func getOptions(opts []Option) options {
-	cfg := options{}
+	cfg := options{
+		localID:  uuid.NewString(),
+		bindAddr: ":28224",
+		extAddr: &net.TCPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 28224,
+		},
+	}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 	return cfg
 }
 
-func WithTCPRaft(port int) Option {
+// WithLocalID sets the id of this server. If not set a random UUID is used
+// which will reset the RAFT status of this server every time.
+func WithLocalID(id string) Option {
 	return func(o *options) {
-		o.tcpPort = port
+		o.localID = id
 	}
 }
 
+// WithTCPTransport provides a simplified way to use tcp based RAFT communication.
+// See WithCustomRaft for a completely customizable option.
+func WithTCPTransport(bindAddr string, extAddr net.Addr) Option {
+	return func(o *options) {
+		o.bindAddr = bindAddr
+		o.extAddr = extAddr
+	}
+}
+
+// WithTransport provides a way to set a custom transport. Using this option
+// overrides usage of WithTCPTransport.
+func WithTransport(transport raft.Transport) Option {
+	return func(o *options) {
+		o.raftTransport = transport
+	}
+}
+
+// WithRaftTransport provides a way to set a custom raft transport only.
+// The raftPort of WithTCPTransport is ignored if this is provided.
+func WithRaftTransport(transport raft.Transport) Option {
+	return func(o *options) {
+		o.raftTransport = transport
+	}
+}
+
+// WithBootstrap bootstraps the server just with itself starting a one node
+// cluster of the cache.
+func WithBootstrap(bootstrap bool) Option {
+	return func(o *options) {
+		o.bootstrap = bootstrap
+	}
+}
+
+// WithServers can be used to bootstrap the cluster with multiple nodes.
+// See WithBootstrap for starting with a single node.
+func WithServers(servers []raft.Server) Option {
+	return func(o *options) {
+		o.servers = servers
+	}
+}
+
+// WithCustomRaft allows a completely custom configured RAFT instance to be passed in.
+// Using this option disables usage of `WithLocalID`, and `WithTCPTransport`
 func WithCustomRaft(rft *raft.Raft) Option {
 	return func(o *options) {
 		o.raft = rft
