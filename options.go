@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/raft"
+	"github.com/tehsphinx/quasar/stores"
 	"github.com/tehsphinx/quasar/transports"
 )
 
@@ -21,6 +22,8 @@ type options struct {
 	raft      *raft.Raft
 	bootstrap bool
 	servers   []raft.Server
+
+	kv stores.KVStore
 }
 
 func getOptions(opts []Option) options {
@@ -35,6 +38,9 @@ func getOptions(opts []Option) options {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if cfg.kv == nil {
+		cfg.kv = stores.NewInMemKVStore()
+	}
 	return cfg
 }
 
@@ -43,6 +49,14 @@ func getOptions(opts []Option) options {
 func WithLocalID(id string) Option {
 	return func(o *options) {
 		o.localID = id
+	}
+}
+
+// WithKVStore sets the kv store to use. If not set a new in memory kv store
+// is created with stores.NewInMemKVStore and used.
+func WithKVStore(kv stores.KVStore) Option {
+	return func(o *options) {
+		o.kv = kv
 	}
 }
 

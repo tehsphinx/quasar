@@ -2,8 +2,8 @@ package stores
 
 func NewStableInMemory() *StableInMemory {
 	return &StableInMemory{
-		store:       make(map[string][]byte),
-		storeUint64: make(map[string]uint64),
+		store:       map[string][]byte{},
+		storeUint64: map[string]uint64{},
 	}
 }
 

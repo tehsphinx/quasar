@@ -12,7 +12,7 @@ func main() {
 	// addresses := []string{
 	// 	"localhost:28224",
 	// }
-	cache, err := quasar.NewCache()
+	cache, err := quasar.NewCache(context.Background())
 	if err != nil {
 		panic(err)
 	}

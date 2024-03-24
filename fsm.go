@@ -6,6 +6,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
+	"github.com/tehsphinx/quasar/stores"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -15,15 +16,14 @@ type FSM interface {
 	Restore(snapshot io.ReadCloser) error
 }
 
-func NewFSM() FSM {
+func NewFSM(kv stores.KVStore) FSM {
 	return &cacheFSM{
-		// TODO: extract
-		store: NewInMemKVStore(),
+		store: kv,
 	}
 }
 
 type cacheFSM struct {
-	store KVStore
+	store stores.KVStore
 }
 
 func (s *cacheFSM) Apply(command *pb.Command) (*pb.CommandResponse, error) {

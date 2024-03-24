@@ -14,6 +14,8 @@ import (
 
 const applyTimout = 5 * time.Second
 
+var ErrNoLeader = errors.New("cluster does not have a leader")
+
 func NewCache(ctx context.Context, opts ...Option) (*Cache, error) {
 	cfg := getOptions(opts)
 
@@ -22,7 +24,7 @@ func NewCache(ctx context.Context, opts ...Option) (*Cache, error) {
 		return nil, err
 	}
 
-	fsm := NewFSM()
+	fsm := NewFSM(cfg.kv)
 
 	rft, err := getRaft(cfg, fsm, transport)
 	if err != nil {
