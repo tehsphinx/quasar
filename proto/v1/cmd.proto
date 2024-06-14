@@ -3,10 +3,16 @@ package quasar.v1;
 
 option go_package = "github.com/tehsphinx/quasar/pb";
 
+import "v1/raft.proto";
+
 message Command {
   oneof cmd {
     StoreValue store_value = 1;
     LoadValue load_value = 2;
+    AppendEntriesRequest append_entries = 3;
+    RequestVoteRequest request_vote = 4;
+    InstallSnapshotRequest install_snapshot = 5;
+    TimeoutNowRequest timeout_now = 6;
   }
 }
 
@@ -14,7 +20,14 @@ message CommandResponse {
   oneof resp {
     StoreValueResponse store_value = 1;
     LoadValueResponse load_value = 2;
+    AppendEntriesResponse append_entries = 3;
+    RequestVoteResponse request_vote = 4;
+    InstallSnapshotResponse install_snapshot = 5;
+    TimeoutNowResponse timeout_now = 6;
   }
+
+  // error message in case of error
+  string error = 7;
 }
 
 message StoreValue {

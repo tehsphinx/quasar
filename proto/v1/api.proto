@@ -4,7 +4,15 @@ package quasar.v1;
 option go_package = "github.com/tehsphinx/quasar/pb";
 
 import "v1/cmd.proto";
+import "v1/raft.proto";
 
 service QuasarService {
   rpc Apply(Command) returns (CommandResponse);
+
+  // RAFT commands
+
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  rpc TimeoutNow(TimeoutNowRequest) returns (TimeoutNowResponse);
 }

@@ -11,7 +11,7 @@ var (
 )
 
 // NewTCPTransport creates a tcp transport layer for the cache.
-func NewTCPTransport(bindAddr string, advertise net.Addr, opts ...TCPOption) (Transport, error) {
+func NewTCPTransport(bindAddr string, advertise net.Addr, opts ...TCPOption) (*TCPTransport, error) {
 	// Try to bind
 	list, err := net.Listen("tcp", bindAddr)
 	if err != nil {

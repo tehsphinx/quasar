@@ -39,6 +39,10 @@ type DRPCQuasarServiceClient interface {
 	DRPCConn() drpc.Conn
 
 	Apply(ctx context.Context, in *Command) (*CommandResponse, error)
+	AppendEntries(ctx context.Context, in *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	RequestVote(ctx context.Context, in *RequestVoteRequest) (*RequestVoteResponse, error)
+	InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
+	TimeoutNow(ctx context.Context, in *TimeoutNowRequest) (*TimeoutNowResponse, error)
 }
 
 type drpcQuasarServiceClient struct {
@@ -60,8 +64,48 @@ func (c *drpcQuasarServiceClient) Apply(ctx context.Context, in *Command) (*Comm
 	return out, nil
 }
 
+func (c *drpcQuasarServiceClient) AppendEntries(ctx context.Context, in *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	out := new(AppendEntriesResponse)
+	err := c.cc.Invoke(ctx, "/quasar.v1.QuasarService/AppendEntries", drpcEncoding_File_v1_api_proto{}, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *drpcQuasarServiceClient) RequestVote(ctx context.Context, in *RequestVoteRequest) (*RequestVoteResponse, error) {
+	out := new(RequestVoteResponse)
+	err := c.cc.Invoke(ctx, "/quasar.v1.QuasarService/RequestVote", drpcEncoding_File_v1_api_proto{}, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *drpcQuasarServiceClient) InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	out := new(InstallSnapshotResponse)
+	err := c.cc.Invoke(ctx, "/quasar.v1.QuasarService/InstallSnapshot", drpcEncoding_File_v1_api_proto{}, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *drpcQuasarServiceClient) TimeoutNow(ctx context.Context, in *TimeoutNowRequest) (*TimeoutNowResponse, error) {
+	out := new(TimeoutNowResponse)
+	err := c.cc.Invoke(ctx, "/quasar.v1.QuasarService/TimeoutNow", drpcEncoding_File_v1_api_proto{}, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 type DRPCQuasarServiceServer interface {
 	Apply(context.Context, *Command) (*CommandResponse, error)
+	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
+	InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
+	TimeoutNow(context.Context, *TimeoutNowRequest) (*TimeoutNowResponse, error)
 }
 
 type DRPCQuasarServiceUnimplementedServer struct{}
@@ -70,9 +114,25 @@ func (s *DRPCQuasarServiceUnimplementedServer) Apply(context.Context, *Command) 
 	return nil, drpcerr.WithCode(errors.New("Unimplemented"), drpcerr.Unimplemented)
 }
 
+func (s *DRPCQuasarServiceUnimplementedServer) AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	return nil, drpcerr.WithCode(errors.New("Unimplemented"), drpcerr.Unimplemented)
+}
+
+func (s *DRPCQuasarServiceUnimplementedServer) RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error) {
+	return nil, drpcerr.WithCode(errors.New("Unimplemented"), drpcerr.Unimplemented)
+}
+
+func (s *DRPCQuasarServiceUnimplementedServer) InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	return nil, drpcerr.WithCode(errors.New("Unimplemented"), drpcerr.Unimplemented)
+}
+
+func (s *DRPCQuasarServiceUnimplementedServer) TimeoutNow(context.Context, *TimeoutNowRequest) (*TimeoutNowResponse, error) {
+	return nil, drpcerr.WithCode(errors.New("Unimplemented"), drpcerr.Unimplemented)
+}
+
 type DRPCQuasarServiceDescription struct{}
 
-func (DRPCQuasarServiceDescription) NumMethods() int { return 1 }
+func (DRPCQuasarServiceDescription) NumMethods() int { return 5 }
 
 func (DRPCQuasarServiceDescription) Method(n int) (string, drpc.Encoding, drpc.Receiver, interface{}, bool) {
 	switch n {
@@ -85,6 +145,42 @@ func (DRPCQuasarServiceDescription) Method(n int) (string, drpc.Encoding, drpc.R
 						in1.(*Command),
 					)
 			}, DRPCQuasarServiceServer.Apply, true
+	case 1:
+		return "/quasar.v1.QuasarService/AppendEntries", drpcEncoding_File_v1_api_proto{},
+			func(srv interface{}, ctx context.Context, in1, in2 interface{}) (drpc.Message, error) {
+				return srv.(DRPCQuasarServiceServer).
+					AppendEntries(
+						ctx,
+						in1.(*AppendEntriesRequest),
+					)
+			}, DRPCQuasarServiceServer.AppendEntries, true
+	case 2:
+		return "/quasar.v1.QuasarService/RequestVote", drpcEncoding_File_v1_api_proto{},
+			func(srv interface{}, ctx context.Context, in1, in2 interface{}) (drpc.Message, error) {
+				return srv.(DRPCQuasarServiceServer).
+					RequestVote(
+						ctx,
+						in1.(*RequestVoteRequest),
+					)
+			}, DRPCQuasarServiceServer.RequestVote, true
+	case 3:
+		return "/quasar.v1.QuasarService/InstallSnapshot", drpcEncoding_File_v1_api_proto{},
+			func(srv interface{}, ctx context.Context, in1, in2 interface{}) (drpc.Message, error) {
+				return srv.(DRPCQuasarServiceServer).
+					InstallSnapshot(
+						ctx,
+						in1.(*InstallSnapshotRequest),
+					)
+			}, DRPCQuasarServiceServer.InstallSnapshot, true
+	case 4:
+		return "/quasar.v1.QuasarService/TimeoutNow", drpcEncoding_File_v1_api_proto{},
+			func(srv interface{}, ctx context.Context, in1, in2 interface{}) (drpc.Message, error) {
+				return srv.(DRPCQuasarServiceServer).
+					TimeoutNow(
+						ctx,
+						in1.(*TimeoutNowRequest),
+					)
+			}, DRPCQuasarServiceServer.TimeoutNow, true
 	default:
 		return "", nil, nil, nil, false
 	}
@@ -104,6 +200,70 @@ type drpcQuasarService_ApplyStream struct {
 }
 
 func (x *drpcQuasarService_ApplyStream) SendAndClose(m *CommandResponse) error {
+	if err := x.MsgSend(m, drpcEncoding_File_v1_api_proto{}); err != nil {
+		return err
+	}
+	return x.CloseSend()
+}
+
+type DRPCQuasarService_AppendEntriesStream interface {
+	drpc.Stream
+	SendAndClose(*AppendEntriesResponse) error
+}
+
+type drpcQuasarService_AppendEntriesStream struct {
+	drpc.Stream
+}
+
+func (x *drpcQuasarService_AppendEntriesStream) SendAndClose(m *AppendEntriesResponse) error {
+	if err := x.MsgSend(m, drpcEncoding_File_v1_api_proto{}); err != nil {
+		return err
+	}
+	return x.CloseSend()
+}
+
+type DRPCQuasarService_RequestVoteStream interface {
+	drpc.Stream
+	SendAndClose(*RequestVoteResponse) error
+}
+
+type drpcQuasarService_RequestVoteStream struct {
+	drpc.Stream
+}
+
+func (x *drpcQuasarService_RequestVoteStream) SendAndClose(m *RequestVoteResponse) error {
+	if err := x.MsgSend(m, drpcEncoding_File_v1_api_proto{}); err != nil {
+		return err
+	}
+	return x.CloseSend()
+}
+
+type DRPCQuasarService_InstallSnapshotStream interface {
+	drpc.Stream
+	SendAndClose(*InstallSnapshotResponse) error
+}
+
+type drpcQuasarService_InstallSnapshotStream struct {
+	drpc.Stream
+}
+
+func (x *drpcQuasarService_InstallSnapshotStream) SendAndClose(m *InstallSnapshotResponse) error {
+	if err := x.MsgSend(m, drpcEncoding_File_v1_api_proto{}); err != nil {
+		return err
+	}
+	return x.CloseSend()
+}
+
+type DRPCQuasarService_TimeoutNowStream interface {
+	drpc.Stream
+	SendAndClose(*TimeoutNowResponse) error
+}
+
+type drpcQuasarService_TimeoutNowStream struct {
+	drpc.Stream
+}
+
+func (x *drpcQuasarService_TimeoutNowStream) SendAndClose(m *TimeoutNowResponse) error {
 	if err := x.MsgSend(m, drpcEncoding_File_v1_api_proto{}); err != nil {
 		return err
 	}

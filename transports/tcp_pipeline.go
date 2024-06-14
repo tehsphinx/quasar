@@ -10,7 +10,7 @@ import (
 // newNetPipeline is used to construct a netPipeline from a given transport and
 // connection. It is a bug to ever call this with maxInFlight less than 2
 // (minInFlightForPipelining) and will cause a panic.
-func newNetPipeline(trans *tcpTransport, conn *netConn, maxInFlight int) *netPipeline {
+func newNetPipeline(trans *TCPTransport, conn *netConn, maxInFlight int) *netPipeline {
 	if maxInFlight < minInFlightForPipelining {
 		// Shouldn't happen (tm) since we validate this in the one call site and
 		// skip pipelining if it's lower.
@@ -34,7 +34,7 @@ func newNetPipeline(trans *tcpTransport, conn *netConn, maxInFlight int) *netPip
 
 type netPipeline struct {
 	conn  *netConn
-	trans *tcpTransport
+	trans *TCPTransport
 
 	doneCh       chan raft.AppendFuture
 	inprogressCh chan *appendFuture

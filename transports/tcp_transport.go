@@ -45,21 +45,16 @@ const (
 )
 
 // newTPCTransport creates a network transport layer for the cache.
-func newTPCTransport(stream raft.StreamLayer, opts ...TCPOption) Transport {
+func newTPCTransport(stream raft.StreamLayer, opts ...TCPOption) *TCPTransport {
 	config := getConfig(stream, getTCPOptions(opts))
 
-	maxInFlight := config.MaxRPCsInFlight
-	if maxInFlight == 0 {
-		// Default zero value
-		maxInFlight = raft.DefaultMaxRPCsInFlight
-	}
-	trans := &tcpTransport{
+	trans := &TCPTransport{
 		connPool:              make(map[raft.ServerAddress][]*netConn),
-		consumeCh:             make(chan raft.RPC),
-		consumeChCache:        make(chan raft.RPC),
+		chConsume:             make(chan raft.RPC),
+		chConsumeCache:        make(chan raft.RPC),
 		logger:                config.Logger,
 		maxPool:               config.MaxPool,
-		maxInFlight:           maxInFlight,
+		maxInFlight:           config.MaxRPCsInFlight,
 		shutdownCh:            make(chan struct{}),
 		stream:                config.Stream,
 		timeout:               config.Timeout,
@@ -75,26 +70,36 @@ func newTPCTransport(stream raft.StreamLayer, opts ...TCPOption) Transport {
 }
 
 func getConfig(stream raft.StreamLayer, cfg tcpOptions) *raft.NetworkTransportConfig {
-	if cfg.config != nil {
-		return cfg.config
+	config := cfg.config
+	if config == nil {
+		config = &raft.NetworkTransportConfig{
+			MaxPool: cfg.maxPool,
+			Timeout: cfg.timeout,
+			Logger:  cfg.logger,
+		}
 	}
 
-	if cfg.logger == nil {
-		cfg.logger = hclog.New(&hclog.LoggerOptions{
+	config.Stream = stream
+	if config.MaxRPCsInFlight == 0 {
+		config.MaxRPCsInFlight = raft.DefaultMaxRPCsInFlight
+	}
+	if config.Logger == nil {
+		config.Logger = hclog.New(&hclog.LoggerOptions{
 			Name:   "raft-net",
 			Output: cfg.output,
 			Level:  hclog.DefaultLevel,
 		})
 	}
-	return &raft.NetworkTransportConfig{Stream: stream, MaxPool: cfg.maxPool, Timeout: cfg.timeout, Logger: cfg.logger}
+
+	return config
 }
 
 var (
-	_ Transport      = (*tcpTransport)(nil)
-	_ raft.Transport = (*tcpTransport)(nil)
+	_ Transport      = (*TCPTransport)(nil)
+	_ raft.Transport = (*TCPTransport)(nil)
 )
 
-// tcpTransport provides a network based transport that can be
+// TCPTransport provides a network based transport that can be
 // used to communicate with Raft on remote machines. It requires
 // an underlying stream layer to provide a stream abstraction, which can
 // be simple TCP, TLS, etc.
@@ -109,12 +114,12 @@ var (
 // InstallSnapshot is special, in that after the RPC request we stream
 // the entire state. That socket is not re-used as the connection state
 // is not known if there is an error.
-type tcpTransport struct {
+type TCPTransport struct {
 	connPool     map[raft.ServerAddress][]*netConn
 	connPoolLock sync.Mutex
 
-	consumeCh      chan raft.RPC
-	consumeChCache chan raft.RPC
+	chConsume      chan raft.RPC
+	chConsumeCache chan raft.RPC
 
 	heartbeatFn     func(raft.RPC)
 	heartbeatFnLock sync.Mutex
@@ -141,13 +146,13 @@ type tcpTransport struct {
 	TimeoutScale int
 }
 
-func (s *tcpTransport) Store(id raft.ServerID, target raft.ServerAddress, command *pb.StoreValue) (*pb.StoreValueResponse, error) {
+func (s *TCPTransport) Store(id raft.ServerID, target raft.ServerAddress, command *pb.StoreValue) (*pb.StoreValueResponse, error) {
 	var resp pb.StoreValueResponse
 	err := s.genericRPC(id, target, rpcStore, command, &resp)
 	return &resp, err
 }
 
-func (s *tcpTransport) Load(id raft.ServerID, target raft.ServerAddress, command *pb.LoadValue) (*pb.LoadValueResponse, error) {
+func (s *TCPTransport) Load(id raft.ServerID, target raft.ServerAddress, command *pb.LoadValue) (*pb.LoadValueResponse, error) {
 	var resp pb.LoadValueResponse
 	err := s.genericRPC(id, target, rpcLoad, command, &resp)
 	return &resp, err
@@ -156,14 +161,14 @@ func (s *tcpTransport) Load(id raft.ServerID, target raft.ServerAddress, command
 // SetHeartbeatHandler is used to set up a heartbeat handler
 // as a fast-pass. This is to avoid head-of-line blocking from
 // disk IO.
-func (s *tcpTransport) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
+func (s *TCPTransport) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
 	s.heartbeatFnLock.Lock()
 	defer s.heartbeatFnLock.Unlock()
 	s.heartbeatFn = cb
 }
 
 // CloseStreams closes the current streams.
-func (s *tcpTransport) CloseStreams() {
+func (s *TCPTransport) CloseStreams() {
 	s.connPoolLock.Lock()
 	defer s.connPoolLock.Unlock()
 
@@ -188,7 +193,7 @@ func (s *tcpTransport) CloseStreams() {
 }
 
 // Close is used to stop the network transport.
-func (s *tcpTransport) Close() error {
+func (s *TCPTransport) Close() error {
 	s.shutdownLock.Lock()
 	defer s.shutdownLock.Unlock()
 
@@ -201,22 +206,22 @@ func (s *tcpTransport) Close() error {
 }
 
 // Consumer implements the raft.Transport interface.
-func (s *tcpTransport) Consumer() <-chan raft.RPC {
-	return s.consumeCh
+func (s *TCPTransport) Consumer() <-chan raft.RPC {
+	return s.chConsume
 }
 
 // CacheConsumer implements the Transport interface.
-func (s *tcpTransport) CacheConsumer() <-chan raft.RPC {
-	return s.consumeChCache
+func (s *TCPTransport) CacheConsumer() <-chan raft.RPC {
+	return s.chConsumeCache
 }
 
 // LocalAddr implements the Transport interface.
-func (s *tcpTransport) LocalAddr() raft.ServerAddress {
+func (s *TCPTransport) LocalAddr() raft.ServerAddress {
 	return raft.ServerAddress(s.stream.Addr().String())
 }
 
 // IsShutdown is used to check if the transport is shutdown.
-func (s *tcpTransport) IsShutdown() bool {
+func (s *TCPTransport) IsShutdown() bool {
 	select {
 	case <-s.shutdownCh:
 		return true
@@ -226,7 +231,7 @@ func (s *tcpTransport) IsShutdown() bool {
 }
 
 // getExistingConn is used to grab a pooled connection.
-func (s *tcpTransport) getPooledConn(target raft.ServerAddress) *netConn {
+func (s *TCPTransport) getPooledConn(target raft.ServerAddress) *netConn {
 	s.connPoolLock.Lock()
 	defer s.connPoolLock.Unlock()
 
@@ -243,12 +248,12 @@ func (s *tcpTransport) getPooledConn(target raft.ServerAddress) *netConn {
 }
 
 // getConnFromAddressProvider returns a connection from the server address provider if available, or defaults to a connection using the target server address
-func (s *tcpTransport) getConnFromAddressProvider(id raft.ServerID, target raft.ServerAddress) (*netConn, error) {
+func (s *TCPTransport) getConnFromAddressProvider(id raft.ServerID, target raft.ServerAddress) (*netConn, error) {
 	address := s.getProviderAddressOrFallback(id, target)
 	return s.getConn(address)
 }
 
-func (s *tcpTransport) getProviderAddressOrFallback(id raft.ServerID, target raft.ServerAddress) raft.ServerAddress {
+func (s *TCPTransport) getProviderAddressOrFallback(id raft.ServerID, target raft.ServerAddress) raft.ServerAddress {
 	if s.serverAddressProvider != nil {
 		serverAddressOverride, err := s.serverAddressProvider.ServerAddr(id)
 		if err != nil {
@@ -261,7 +266,7 @@ func (s *tcpTransport) getProviderAddressOrFallback(id raft.ServerID, target raf
 }
 
 // getConn is used to get a connection from the pool.
-func (s *tcpTransport) getConn(target raft.ServerAddress) (*netConn, error) {
+func (s *TCPTransport) getConn(target raft.ServerAddress) (*netConn, error) {
 	// Check for a pooled conn
 	if conn := s.getPooledConn(target); conn != nil {
 		return conn, nil
@@ -288,7 +293,7 @@ func (s *tcpTransport) getConn(target raft.ServerAddress) (*netConn, error) {
 }
 
 // returnConn returns a connection back to the pool.
-func (s *tcpTransport) returnConn(conn *netConn) {
+func (s *TCPTransport) returnConn(conn *netConn) {
 	s.connPoolLock.Lock()
 	defer s.connPoolLock.Unlock()
 
@@ -304,7 +309,7 @@ func (s *tcpTransport) returnConn(conn *netConn) {
 
 // AppendEntriesPipeline returns an interface that can be used to pipeline
 // AppendEntries requests.
-func (s *tcpTransport) AppendEntriesPipeline(id raft.ServerID, target raft.ServerAddress) (raft.AppendPipeline, error) {
+func (s *TCPTransport) AppendEntriesPipeline(id raft.ServerID, target raft.ServerAddress) (raft.AppendPipeline, error) {
 	if s.maxInFlight < minInFlightForPipelining {
 		// Pipelining is disabled since no more than one request can be outstanding
 		// at once. Skip the whole code path and use synchronous requests.
@@ -322,17 +327,17 @@ func (s *tcpTransport) AppendEntriesPipeline(id raft.ServerID, target raft.Serve
 }
 
 // AppendEntries implements the Transport interface.
-func (s *tcpTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
+func (s *TCPTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
 	return s.genericRPC(id, target, rpcAppendEntries, args, resp)
 }
 
 // RequestVote implements the Transport interface.
-func (s *tcpTransport) RequestVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
+func (s *TCPTransport) RequestVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
 	return s.genericRPC(id, target, rpcRequestVote, args, resp)
 }
 
 // genericRPC handles a simple request/response RPC.
-func (s *tcpTransport) genericRPC(id raft.ServerID, target raft.ServerAddress, rpcType uint8, args interface{}, resp interface{}) error {
+func (s *TCPTransport) genericRPC(id raft.ServerID, target raft.ServerAddress, rpcType uint8, args interface{}, resp interface{}) error {
 	// Get a conn
 	conn, err := s.getConnFromAddressProvider(id, target)
 	if err != nil {
@@ -361,7 +366,7 @@ func (s *tcpTransport) genericRPC(id raft.ServerID, target raft.ServerAddress, r
 }
 
 // InstallSnapshot implements the Transport interface.
-func (s *tcpTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
+func (s *TCPTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
 	// Get a conn, always close for InstallSnapshot
 	conn, err := s.getConnFromAddressProvider(id, target)
 	if err != nil {
@@ -399,23 +404,23 @@ func (s *tcpTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddre
 }
 
 // EncodePeer implements the Transport interface.
-func (s *tcpTransport) EncodePeer(id raft.ServerID, p raft.ServerAddress) []byte {
+func (s *TCPTransport) EncodePeer(id raft.ServerID, p raft.ServerAddress) []byte {
 	address := s.getProviderAddressOrFallback(id, p)
 	return []byte(address)
 }
 
 // DecodePeer implements the Transport interface.
-func (s *tcpTransport) DecodePeer(buf []byte) raft.ServerAddress {
+func (s *TCPTransport) DecodePeer(buf []byte) raft.ServerAddress {
 	return raft.ServerAddress(buf)
 }
 
 // TimeoutNow implements the Transport interface.
-func (s *tcpTransport) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
+func (s *TCPTransport) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
 	return s.genericRPC(id, target, rpcTimeoutNow, args, resp)
 }
 
 // listen is used to handling incoming connections.
-func (s *tcpTransport) listen() {
+func (s *TCPTransport) listen() {
 	const baseDelay = 5 * time.Millisecond
 	const maxDelay = 1 * time.Second
 
@@ -458,7 +463,7 @@ func (s *tcpTransport) listen() {
 // handleConn is used to handle an inbound connection for its lifespan. The
 // handler will exit when the passed context is cancelled or the connection is
 // closed.
-func (s *tcpTransport) handleConn(connCtx context.Context, conn net.Conn) {
+func (s *TCPTransport) handleConn(connCtx context.Context, conn net.Conn) {
 	defer conn.Close()
 	r := bufio.NewReaderSize(conn, connReceiveBufferSize)
 	w := bufio.NewWriter(conn)
@@ -487,7 +492,7 @@ func (s *tcpTransport) handleConn(connCtx context.Context, conn net.Conn) {
 }
 
 // handleCommand is used to decode and dispatch a single command.
-func (s *tcpTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *codec.Encoder) error {
+func (s *TCPTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *codec.Encoder) error {
 	getTypeStart := time.Now()
 
 	// Get the rpc type
@@ -507,7 +512,7 @@ func (s *tcpTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *c
 		RespChan: respCh,
 	}
 
-	consumeCh := s.consumeCh
+	consumeCh := s.chConsume
 
 	// Decode the command
 	isHeartbeat := false
@@ -563,7 +568,7 @@ func (s *tcpTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *c
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "Store"}}
-		consumeCh = s.consumeChCache
+		consumeCh = s.chConsumeCache
 	case rpcLoad:
 		var req pb.LoadValue
 		if err := dec.Decode(&req); err != nil {
@@ -571,7 +576,7 @@ func (s *tcpTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *c
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "Load"}}
-		consumeCh = s.consumeChCache
+		consumeCh = s.chConsumeCache
 	default:
 		return fmt.Errorf("unknown rpc type %d", rpcType)
 	}
@@ -627,14 +632,14 @@ RESP:
 
 // setupStreamContext is used to create a new stream context. This should be
 // called with the stream lock held.
-func (s *tcpTransport) setupStreamContext() {
+func (s *TCPTransport) setupStreamContext() {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.streamCtx = ctx
 	s.streamCancel = cancel
 }
 
 // getStreamContext is used retrieve the current stream context.
-func (s *tcpTransport) getStreamContext() context.Context {
+func (s *TCPTransport) getStreamContext() context.Context {
 	s.streamCtxLock.RLock()
 	defer s.streamCtxLock.RUnlock()
 	return s.streamCtx

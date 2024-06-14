@@ -71,9 +71,9 @@ func WithTCPTransport(bindAddr string, extAddr net.Addr) Option {
 
 // WithTransport provides a way to set a custom transport. Using this option
 // overrides usage of WithTCPTransport.
-func WithTransport(transport raft.Transport) Option {
+func WithTransport(transport transports.Transport) Option {
 	return func(o *options) {
-		o.raftTransport = transport
+		o.transport = transport
 	}
 }
 

@@ -1,0 +1,169 @@
+syntax = "proto3";
+package quasar.v1;
+
+option go_package = "github.com/tehsphinx/quasar/pb";
+
+import "google/protobuf/timestamp.proto";
+
+message AppendEntriesRequest {
+  RPCHeader header = 1;
+
+  // Term holds the election term of the log entries to be appended.
+  uint64 term = 2;
+  // Deprecated: use RPCHeader.Addr instead
+  bytes leader = 3;
+
+  // Provide the previous entries for integrity checking
+  uint64 prev_log_entry = 4;
+  uint64 prev_log_term = 5;
+
+  // New entries to commit
+  repeated Log entries = 6;
+
+  // Commit index on the leader
+  uint64 leader_commit_index = 7;
+}
+
+message AppendEntriesResponse {
+  RPCHeader header = 1;
+
+  // Newer term if leader is out of date
+  uint64 term = 2;
+
+  // Last Log is a hint to help accelerate rebuilding slow nodes
+  uint64 last_log = 3;
+
+  // We may not succeed if we have a conflicting entry
+  bool success = 4;
+
+  // There are scenarios where this request didn't succeed
+  // but there's no need to wait/back-off the next attempt.
+  bool no_retry_backoff = 5;
+}
+
+message RequestVoteRequest {
+  RPCHeader header = 1;
+
+  // Provide the term and our id
+  uint64 term = 2;
+
+  // Deprecated: use RPCHeader.Addr instead
+  bytes candidate = 3;
+
+  // Used to ensure safety
+  uint64 last_log_index = 4;
+  uint64 last_log_term = 5;
+
+  // Used to indicate to peers if this vote was triggered by a leadership
+  // transfer. It is required for leadership transfer to work, because servers
+  // wouldn't vote otherwise if they are aware of an existing leader.
+  bool leadership_transfer = 6;
+}
+
+message RequestVoteResponse {
+  RPCHeader header = 1;
+
+  // Newer term if leader is out of date.
+  uint64 term = 2;
+
+  // Peers is deprecated, but required by servers that only understand
+  // protocol version 0. This is not populated in protocol version 2
+  // and later.
+  bytes peers = 3;
+
+  // Is the vote granted.
+  bool granted = 4;
+}
+
+message InstallSnapshotRequest {
+  RPCHeader header = 1;
+  uint32 snapshot_version = 6;
+
+  uint64 term = 2;
+  bytes leader = 3;
+
+  // These are the last index/term included in the snapshot
+  uint64 last_log_index = 4;
+  uint64 last_log_term = 5;
+
+  // Peer Set in the snapshot.
+  // but remains here in case we receive an InstallSnapshot from a leader
+  // that's running old code.
+  // Deprecated: This is deprecated in favor of Configuration
+  bytes peers = 7;
+
+  // Cluster membership.
+  bytes configuration = 8;
+  // Log index where 'Configuration' entry was originally written.
+  uint64  configuration_index = 9;
+
+  // Size of the snapshot
+  int64 size = 10;
+}
+
+message InstallSnapshotResponse {
+  RPCHeader header = 1;
+
+  uint64 term = 2;
+  bool success = 3;
+}
+
+message TimeoutNowRequest {
+  RPCHeader header = 1;
+}
+
+message TimeoutNowResponse {
+  RPCHeader header = 1;
+}
+
+message RPCHeader {
+  // ProtocolVersion is the version of the protocol the sender is
+  // speaking.
+  uint32 protocol_version = 1;
+  // ID is the ServerID of the node sending the RPC Request or Response
+  bytes id = 2;
+  // Addr is the ServerAddr of the node sending the RPC Request or Response
+  bytes addr = 3;
+}
+
+message Log {
+  // Index holds the index of the log entry.
+  uint64 index = 1;
+
+  // Term holds the election term of the log entry.
+  uint64 term = 2;
+
+  // Type holds the type of the log entry.
+  uint32 log_type = 3;
+
+  // Data holds the log entry's type-specific data.
+  bytes data = 4;
+
+  // Extensions holds an opaque byte slice of information for middleware. It
+  // is up to the client of the library to properly modify this as it adds
+  // layers and remove those layers when appropriate. This value is a part of
+  // the log, so very large values could cause timing issues.
+  //
+  // N.B. It is _up to the client_ to handle upgrade paths. For instance if
+  // using this with go-raftchunking, the client should ensure that all Raft
+  // peers are using a version that can handle that extension before ever
+  // actually triggering chunking behavior. It is sometimes sufficient to
+  // ensure that non-leaders are upgraded first, then the current leader is
+  // upgraded, but a leader changeover during this process could lead to
+  // trouble, so gating extension behavior via some flag in the client
+  // program is also a good idea.
+  bytes extensions = 5;
+
+  // AppendedAt stores the time the leader first appended this log to it's
+  // LogStore. Followers will observe the leader's time. It is not used for
+  // coordination or as part of the replication protocol at all. It exists only
+  // to provide operational information for example how many seconds worth of
+  // logs are present on the leader which might impact follower's ability to
+  // catch up after restoring a large snapshot. We should never rely on this
+  // being in the past when appending on a follower or reading a log back since
+  // the clock skew can mean a follower could see a log with a future timestamp.
+  // In general too the leader is not required to persist the log before
+  // delivering to followers although the current implementation happens to do
+  // this.
+  google.protobuf.Timestamp appended_at = 6;
+}

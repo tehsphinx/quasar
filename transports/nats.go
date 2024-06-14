@@ -1,0 +1,335 @@
+package transports
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/raft"
+	"github.com/nats-io/nats.go"
+	"github.com/tehsphinx/quasar/pb/v1"
+	"google.golang.org/protobuf/proto"
+)
+
+func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverName string, opts ...NATSOption) (*NATSTransport, error) {
+	config := getNATSOptions(opts)
+
+	s := &NATSTransport{
+		conn:           conn,
+		logger:         config.logger,
+		serverName:     serverName,
+		cacheName:      cacheName,
+		ctx:            ctx,
+		timeout:        config.timeout,
+		chConsume:      make(chan raft.RPC),
+		chConsumeCache: make(chan raft.RPC),
+	}
+	s.listen(ctx)
+	return s, nil
+}
+
+type NATSTransport struct {
+	conn *nats.Conn
+
+	logger hclog.Logger
+
+	serverName string
+	cacheName  string
+	ctx        context.Context
+	timeout    time.Duration
+
+	chConsume      chan raft.RPC
+	chConsumeCache chan raft.RPC
+
+	heartbeatFn     func(raft.RPC)
+	heartbeatFnLock sync.Mutex
+}
+
+func (s *NATSTransport) listen(ctx context.Context) error {
+	subjPrefix := fmt.Sprintf("quasar.%s.%s", s.cacheName, s.serverName)
+	fmt.Println("server =", s.serverName, " subjPrefix =", subjPrefix)
+
+	if _, err := s.conn.Subscribe(subjPrefix+".entries.append", s.handleEntries); err != nil {
+		return err
+	}
+	if _, er := s.conn.Subscribe(subjPrefix+".request.vote", s.handleVote); er != nil {
+		return er
+	}
+	if _, err := s.conn.Subscribe(subjPrefix+".cache.store", s.handleStore); err != nil {
+		return err
+	}
+	if _, er := s.conn.Subscribe(subjPrefix+".cache.load", s.handleLoad); er != nil {
+		return er
+	}
+	return nil
+}
+
+func (s *NATSTransport) CacheConsumer() <-chan raft.RPC {
+	return s.chConsumeCache
+}
+
+func (s *NATSTransport) Store(_ raft.ServerID, address raft.ServerAddress, request *pb.StoreValue) (*pb.StoreValueResponse, error) {
+	subj := fmt.Sprintf("quasar.%s.%s.cache.store", s.cacheName, address)
+
+	var protoResp pb.CommandResponse
+	if err := s.request(subj, request, &protoResp); err != nil {
+		return nil, err
+	}
+	return protoResp.GetStoreValue(), nil
+}
+
+func (s *NATSTransport) Load(_ raft.ServerID, address raft.ServerAddress, request *pb.LoadValue) (*pb.LoadValueResponse, error) {
+	subj := fmt.Sprintf("quasar.%s.%s.cache.load", s.cacheName, address)
+
+	var protoResp pb.CommandResponse
+	if err := s.request(subj, request, &protoResp); err != nil {
+		return nil, err
+	}
+	return protoResp.GetLoadValue(), nil
+}
+
+func (s *NATSTransport) Consumer() <-chan raft.RPC {
+	return s.chConsume
+}
+
+func (s *NATSTransport) LocalAddr() raft.ServerAddress {
+	return raft.ServerAddress(s.serverName)
+}
+
+func (s *NATSTransport) AppendEntriesPipeline(_ raft.ServerID, _ raft.ServerAddress) (raft.AppendPipeline, error) {
+	return nil, raft.ErrPipelineReplicationNotSupported
+}
+
+func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddress, request *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
+	subj := fmt.Sprintf("quasar.%s.%s.entries.append", s.cacheName, address)
+
+	var protoResp pb.CommandResponse
+	if err := s.request(subj, pb.ToAppendEntriesRequest(request), &protoResp); err != nil {
+		return err
+	}
+	*resp = *protoResp.GetAppendEntries().Convert()
+	return nil
+}
+
+func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress, request *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
+	subj := fmt.Sprintf("quasar.%s.%s.request.vote", s.cacheName, address)
+
+	var protoResp pb.CommandResponse
+	if err := s.request(subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
+		return err
+	}
+
+	*resp = *protoResp.GetRequestVote().Convert()
+	return nil
+}
+
+func (s *NATSTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (s *NATSTransport) EncodePeer(_ raft.ServerID, addr raft.ServerAddress) []byte {
+	return []byte(addr)
+}
+
+func (s *NATSTransport) DecodePeer(bytes []byte) raft.ServerAddress {
+	return raft.ServerAddress(bytes)
+}
+
+func (s *NATSTransport) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
+	s.heartbeatFnLock.Lock()
+	defer s.heartbeatFnLock.Unlock()
+	s.heartbeatFn = cb
+}
+
+func (s *NATSTransport) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (s *NATSTransport) request(subj string, msg proto.Message, protoResp proto.Message) error {
+	bts, err := proto.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.TODO(), s.timeout)
+	defer cancel()
+
+	// fmt.Println("request data:", fmt.Sprintf("%+v", msg))
+	response, err := s.conn.RequestWithContext(ctx, subj, bts)
+	if err != nil {
+		return err
+	}
+
+	err = proto.Unmarshal(response.Data, protoResp)
+	// fmt.Println("response data:", fmt.Sprintf("%+v", protoResp))
+	return err
+}
+
+func (s *NATSTransport) handleVote(msg *nats.Msg) {
+	var protoMsg pb.RequestVoteRequest
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+	// fmt.Printf("incoming request: %+v\n", protoMsg)
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  protoMsg.Convert(),
+	}
+
+	s.chConsume <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		resp, _ := i.(*raft.RequestVoteResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_RequestVote{RequestVote: pb.ToRequestVoteResponse(resp)}}
+	})
+
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
+}
+
+func (s *NATSTransport) handleEntries(msg *nats.Msg) {
+	var protoMsg pb.AppendEntriesRequest
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  protoMsg.Convert(),
+	}
+
+	s.chConsume <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		resp, _ := i.(*raft.AppendEntriesResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_AppendEntries{
+			AppendEntries: pb.ToAppendEntriesResponse(resp),
+		}}
+	})
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
+}
+
+func (s *NATSTransport) handleStore(msg *nats.Msg) {
+	var protoMsg pb.StoreValue
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  &protoMsg,
+	}
+
+	s.chConsumeCache <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		resp, _ := i.(*pb.StoreValueResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_StoreValue{
+			StoreValue: resp,
+		}}
+	})
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
+}
+
+func (s *NATSTransport) handleLoad(msg *nats.Msg) {
+	var protoMsg pb.LoadValue
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  &protoMsg,
+	}
+
+	s.chConsumeCache <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		resp, _ := i.(*pb.LoadValueResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_LoadValue{
+			LoadValue: resp,
+		}}
+	})
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
+}
+
+func (s *NATSTransport) awaitResponse(ch <-chan raft.RPCResponse, toProto func(interface{}) *pb.CommandResponse) ([]byte, error) {
+	select {
+	case resp := <-ch:
+		protoResp := &pb.CommandResponse{}
+		if resp.Response != nil {
+			protoResp = toProto(resp.Response)
+		}
+		if resp.Error != nil {
+			protoResp.Error = resp.Error.Error()
+		}
+
+		// fmt.Printf("outgoing response: %+v\n", protoResp)
+		bts, err := proto.Marshal(protoResp)
+		if err != nil {
+			return nil, err
+		}
+
+		return bts, nil
+	case <-s.ctx.Done():
+		return nil, raft.ErrTransportShutdown
+	}
+}
+
+// func (s *NATSTransport) handleClusterInfoRequests(msg *nats.Msg) {
+// 	// TODO: should add the incoming server name if it does not exist to internal known server list.
+// 	// msg.Data
+// }
+
+/*
+Common subscription to find other gatexes.
+quasar.<cacheName>.servers
+
+dedicated addresses for each gatex -> gatexName
+quasar.<cacheName>.<gatexName>.message
+
+gatex1 request to quasar.<cacheName>.servers -> gatex2 from gatex2 -> gatex3 from gatex3 -> list with gatex2 and gatex3
+gatex2 request to quasar.<cacheName>.servers
+gatex3 request to quasar.<cacheName>.servers
+*/
