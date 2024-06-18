@@ -9,10 +9,7 @@ import (
 )
 
 func main() {
-	// addresses := []string{
-	// 	"localhost:28224",
-	// }
-	cache, err := quasar.NewCache(context.Background())
+	cache, err := quasar.NewKVCache(context.Background(), quasar.WithBootstrap(true))
 	if err != nil {
 		panic(err)
 	}

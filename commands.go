@@ -5,18 +5,16 @@ import (
 )
 
 func cmdStore(key string, data []byte) *pb.Command {
-	return &pb.Command{Cmd: &pb.Command_StoreValue{
-		StoreValue: &pb.StoreValue{
-			Key:  key,
+	return &pb.Command{Cmd: &pb.Command_Store{
+		Store: &pb.Store{
 			Data: data,
+			Key:  key,
 		},
 	}}
 }
 
-func cmdLoad(key string) *pb.Command {
-	return &pb.Command{Cmd: &pb.Command_LoadValue{
-		LoadValue: &pb.LoadValue{
-			Key: key,
-		},
+func cmdLatestUID() *pb.Command {
+	return &pb.Command{Cmd: &pb.Command_LatestUid{
+		LatestUid: &pb.LatestUid{},
 	}}
 }

@@ -52,18 +52,30 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	subjPrefix := fmt.Sprintf("quasar.%s.%s", s.cacheName, s.serverName)
 	fmt.Println("server =", s.serverName, " subjPrefix =", subjPrefix)
 
-	if _, err := s.conn.Subscribe(subjPrefix+".entries.append", s.handleEntries); err != nil {
+	subEntries, err := s.conn.Subscribe(subjPrefix+".entries.append", s.handleEntries)
+	if err != nil {
 		return err
 	}
-	if _, er := s.conn.Subscribe(subjPrefix+".request.vote", s.handleVote); er != nil {
-		return er
-	}
-	if _, err := s.conn.Subscribe(subjPrefix+".cache.store", s.handleStore); err != nil {
+	subVote, err := s.conn.Subscribe(subjPrefix+".request.vote", s.handleVote)
+	if err != nil {
 		return err
 	}
-	if _, er := s.conn.Subscribe(subjPrefix+".cache.load", s.handleLoad); er != nil {
-		return er
+	subStore, err := s.conn.Subscribe(subjPrefix+".cache.store", s.handleStore)
+	if err != nil {
+		return err
 	}
+	subLatestUID, err := s.conn.Subscribe(subjPrefix+".cache.uid.latest", s.handleLatestUID)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		<-ctx.Done()
+		_ = subEntries.Unsubscribe()
+		_ = subVote.Unsubscribe()
+		_ = subStore.Unsubscribe()
+		_ = subLatestUID.Unsubscribe()
+	}()
 	return nil
 }
 
@@ -71,24 +83,24 @@ func (s *NATSTransport) CacheConsumer() <-chan raft.RPC {
 	return s.chConsumeCache
 }
 
-func (s *NATSTransport) Store(_ raft.ServerID, address raft.ServerAddress, request *pb.StoreValue) (*pb.StoreValueResponse, error) {
+func (s *NATSTransport) Store(_ raft.ServerID, address raft.ServerAddress, request *pb.Store) (*pb.StoreResponse, error) {
 	subj := fmt.Sprintf("quasar.%s.%s.cache.store", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
 	if err := s.request(subj, request, &protoResp); err != nil {
 		return nil, err
 	}
-	return protoResp.GetStoreValue(), nil
+	return protoResp.GetStore(), nil
 }
 
-func (s *NATSTransport) Load(_ raft.ServerID, address raft.ServerAddress, request *pb.LoadValue) (*pb.LoadValueResponse, error) {
-	subj := fmt.Sprintf("quasar.%s.%s.cache.load", s.cacheName, address)
+func (s *NATSTransport) LatestUID(_ raft.ServerID, address raft.ServerAddress, request *pb.LatestUid) (*pb.LatestUidResponse, error) {
+	subj := fmt.Sprintf("quasar.%s.%s.cache.uid.latest", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
 	if err := s.request(subj, request, &protoResp); err != nil {
 		return nil, err
 	}
-	return protoResp.GetLoadValue(), nil
+	return protoResp.GetLatestUid(), nil
 }
 
 func (s *NATSTransport) Consumer() <-chan raft.RPC {
@@ -233,7 +245,7 @@ func (s *NATSTransport) handleEntries(msg *nats.Msg) {
 }
 
 func (s *NATSTransport) handleStore(msg *nats.Msg) {
-	var protoMsg pb.StoreValue
+	var protoMsg pb.Store
 	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
 		s.logger.Error("failed to decode incoming command", "error", r)
 		return
@@ -249,9 +261,9 @@ func (s *NATSTransport) handleStore(msg *nats.Msg) {
 	s.chConsumeCache <- rpc
 
 	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
-		resp, _ := i.(*pb.StoreValueResponse)
-		return &pb.CommandResponse{Resp: &pb.CommandResponse_StoreValue{
-			StoreValue: resp,
+		resp, _ := i.(*pb.StoreResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_Store{
+			Store: resp,
 		}}
 	})
 	if err != nil {
@@ -263,8 +275,8 @@ func (s *NATSTransport) handleStore(msg *nats.Msg) {
 	}
 }
 
-func (s *NATSTransport) handleLoad(msg *nats.Msg) {
-	var protoMsg pb.LoadValue
+func (s *NATSTransport) handleLatestUID(msg *nats.Msg) {
+	var protoMsg pb.LatestUid
 	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
 		s.logger.Error("failed to decode incoming command", "error", r)
 		return
@@ -280,9 +292,10 @@ func (s *NATSTransport) handleLoad(msg *nats.Msg) {
 	s.chConsumeCache <- rpc
 
 	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
-		resp, _ := i.(*pb.LoadValueResponse)
-		return &pb.CommandResponse{Resp: &pb.CommandResponse_LoadValue{
-			LoadValue: resp,
+		// TODO: be able to return error if type cast fails
+		resp, _ := i.(*pb.LatestUidResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_LatestUid{
+			LatestUid: resp,
 		}}
 	})
 	if err != nil {
@@ -293,6 +306,37 @@ func (s *NATSTransport) handleLoad(msg *nats.Msg) {
 		s.logger.Error("failed to send response", "error", r)
 	}
 }
+
+// func (s *NATSTransport) handleLoad(msg *nats.Msg) {
+// 	var protoMsg pb.LoadValue
+// 	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+// 		s.logger.Error("failed to decode incoming command", "error", r)
+// 		return
+// 	}
+//
+// 	// Create the RPC object
+// 	chResp := make(chan raft.RPCResponse, 1)
+// 	rpc := raft.RPC{
+// 		RespChan: chResp,
+// 		Command:  &protoMsg,
+// 	}
+//
+// 	s.chConsumeCache <- rpc
+//
+// 	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+// 		resp, _ := i.(*pb.LoadValueResponse)
+// 		return &pb.CommandResponse{Resp: &pb.CommandResponse_LoadValue{
+// 			LoadValue: resp,
+// 		}}
+// 	})
+// 	if err != nil {
+// 		s.logger.Error("failed to send response", "error", err)
+// 		return
+// 	}
+// 	if r := msg.Respond(bts); r != nil {
+// 		s.logger.Error("failed to send response", "error", r)
+// 	}
+// }
 
 func (s *NATSTransport) awaitResponse(ch <-chan raft.RPCResponse, toProto func(interface{}) *pb.CommandResponse) ([]byte, error) {
 	select {

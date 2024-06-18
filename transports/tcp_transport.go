@@ -23,7 +23,8 @@ const (
 	rpcInstallSnapshot
 	rpcTimeoutNow
 	rpcStore
-	rpcLoad
+	rpcLatestUID
+	// rpcLoad
 
 	// connReceiveBufferSize is the size of the buffer we will use for reading RPC requests into
 	// on followers
@@ -146,17 +147,23 @@ type TCPTransport struct {
 	TimeoutScale int
 }
 
-func (s *TCPTransport) Store(id raft.ServerID, target raft.ServerAddress, command *pb.StoreValue) (*pb.StoreValueResponse, error) {
-	var resp pb.StoreValueResponse
+func (s *TCPTransport) Store(id raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
+	var resp pb.StoreResponse
 	err := s.genericRPC(id, target, rpcStore, command, &resp)
 	return &resp, err
 }
 
-func (s *TCPTransport) Load(id raft.ServerID, target raft.ServerAddress, command *pb.LoadValue) (*pb.LoadValueResponse, error) {
-	var resp pb.LoadValueResponse
-	err := s.genericRPC(id, target, rpcLoad, command, &resp)
+func (s *TCPTransport) LatestUID(id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
+	var resp pb.LatestUidResponse
+	err := s.genericRPC(id, target, rpcLatestUID, command, &resp)
 	return &resp, err
 }
+
+// func (s *TCPTransport) Load(id raft.ServerID, target raft.ServerAddress, command *pb.LoadValue) (*pb.LoadValueResponse, error) {
+// 	var resp pb.LoadValueResponse
+// 	err := s.genericRPC(id, target, rpcLoad, command, &resp)
+// 	return &resp, err
+// }
 
 // SetHeartbeatHandler is used to set up a heartbeat handler
 // as a fast-pass. This is to avoid head-of-line blocking from
@@ -562,21 +569,29 @@ func (s *TCPTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *c
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "TimeoutNow"}}
 	case rpcStore:
-		var req pb.StoreValue
+		var req pb.Store
 		if err := dec.Decode(&req); err != nil {
 			return err
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "Store"}}
 		consumeCh = s.chConsumeCache
-	case rpcLoad:
-		var req pb.LoadValue
+	case rpcLatestUID:
+		var req pb.LatestUid
 		if err := dec.Decode(&req); err != nil {
 			return err
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "Load"}}
 		consumeCh = s.chConsumeCache
+	// case rpcLoad:
+	// 	var req pb.LoadValue
+	// 	if err := dec.Decode(&req); err != nil {
+	// 		return err
+	// 	}
+	// 	rpc.Command = &req
+	// 	labels = []metrics.Label{{Name: "rpcType", Value: "Load"}}
+	// 	consumeCh = s.chConsumeCache
 	default:
 		return fmt.Errorf("unknown rpc type %d", rpcType)
 	}

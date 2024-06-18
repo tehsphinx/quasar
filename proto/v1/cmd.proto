@@ -6,9 +6,13 @@ option go_package = "github.com/tehsphinx/quasar/pb";
 import "v1/raft.proto";
 
 message Command {
+  // To keep numbers in Command and CommandResponse in sync.
+  reserved 7;
+
   oneof cmd {
-    StoreValue store_value = 1;
-    LoadValue load_value = 2;
+    Store store = 1;
+    LatestUid latest_uid = 2;
+
     AppendEntriesRequest append_entries = 3;
     RequestVoteRequest request_vote = 4;
     InstallSnapshotRequest install_snapshot = 5;
@@ -17,33 +21,32 @@ message Command {
 }
 
 message CommandResponse {
+  // error message in case of error
+  string error = 7;
+
   oneof resp {
-    StoreValueResponse store_value = 1;
-    LoadValueResponse load_value = 2;
+    StoreResponse store = 1;
+    LatestUidResponse latest_uid = 2;
+
     AppendEntriesResponse append_entries = 3;
     RequestVoteResponse request_vote = 4;
     InstallSnapshotResponse install_snapshot = 5;
     TimeoutNowResponse timeout_now = 6;
   }
-
-  // error message in case of error
-  string error = 7;
 }
 
-message StoreValue {
-  string key = 1;
-  bytes data = 2;
+message Store {
+  bytes data = 1;
+  // optional key only used in case of KVCache
+  string key = 2;
 }
 
-message StoreValueResponse {
+message StoreResponse {
   uint64 uid = 1;
 }
 
-message LoadValue {
-  string key = 1;
-}
+message LatestUid {}
 
-message LoadValueResponse {
+message LatestUidResponse {
   uint64 uid = 1;
-  bytes data = 2;
 }

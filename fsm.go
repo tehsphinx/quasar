@@ -1,76 +1,47 @@
 package quasar
 
 import (
-	"fmt"
+	"errors"
 	"io"
+	"sync"
 
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
-	"github.com/tehsphinx/quasar/stores"
 	"google.golang.org/protobuf/proto"
 )
 
 type FSM interface {
-	Apply(cmd *pb.Command) (*pb.CommandResponse, error)
-	Snapshot() (raft.FSMSnapshot, error)
-	Restore(snapshot io.ReadCloser) error
+	Inject(fsm *FSMInjector)
+	ApplyCmd(cmd []byte) error
+	// Snapshot() (raft.FSMSnapshot, error)
+	// Restore(snapshot io.ReadCloser) error
 }
 
-func NewFSM(kv stores.KVStore) FSM {
-	return &cacheFSM{
-		store: kv,
-	}
+type cacheFSM interface {
+	raft.FSM
+	WaitFor(uid uint64)
 }
 
-type cacheFSM struct {
-	store stores.KVStore
-}
-
-func (s *cacheFSM) Apply(command *pb.Command) (*pb.CommandResponse, error) {
-	switch cmd := command.GetCmd().(type) {
-	case *pb.Command_StoreValue:
-		return s.Store(cmd.StoreValue)
-	case *pb.Command_LoadValue:
-		return s.Load(cmd.LoadValue)
-	}
-
-	fmt.Printf("%+v\n", command)
-	return nil, nil
-}
-
-func (s *cacheFSM) Store(cmd *pb.StoreValue) (*pb.CommandResponse, error) {
-	err := s.store.Store(cmd.Key, cmd.Data)
-	return respStore(&pb.StoreValueResponse{}), err
-}
-
-func (s *cacheFSM) Load(cmd *pb.LoadValue) (*pb.CommandResponse, error) {
-	data, err := s.store.Load(cmd.Key)
-	return respLoad(&pb.LoadValueResponse{Data: data}), err
-}
-
-func (s *cacheFSM) Snapshot() (raft.FSMSnapshot, error) {
-	// TODO implement me
-	panic("implement me")
-}
-
-func (s *cacheFSM) Restore(snapshot io.ReadCloser) error {
-	// TODO implement me
-	panic("implement me")
-}
-
-func wrapFSM(raftFSM FSM) raft.FSM {
+func wrapFSM(fsm FSM) *fsmWrapper {
+	mutex := &sync.Mutex{}
 	return &fsmWrapper{
-		fsm: raftFSM,
+		fsm:   fsm,
+		condM: mutex,
+		cond:  sync.NewCond(mutex),
 	}
+}
+
+type fsmWrapper struct {
+	fsm FSM
+
+	lastApplied uint64
+	condM       *sync.Mutex
+	cond        *sync.Cond
 }
 
 type applyResponse struct {
 	resp *pb.CommandResponse
 	err  error
-}
-
-type fsmWrapper struct {
-	fsm FSM
 }
 
 func (s *fsmWrapper) Apply(log *raft.Log) interface{} {
@@ -79,17 +50,53 @@ func (s *fsmWrapper) Apply(log *raft.Log) interface{} {
 		return applyResponse{err: err}
 	}
 
-	resp, err := s.fsm.Apply(&cmd)
+	resp, respErr := s.apply(log, &cmd)
+
+	s.uidApplied(log.Index)
+
 	return applyResponse{
 		resp: resp,
-		err:  err,
+		err:  respErr,
+	}
+}
+func (s *fsmWrapper) apply(log *raft.Log, command *pb.Command) (*pb.CommandResponse, error) {
+	switch cmd := command.GetCmd().(type) {
+	case *pb.Command_Store:
+		return s.store(log, cmd.Store)
+	default:
+		// fmt.Printf("%+v\n", command)
+		return nil, errors.New("fsmWrapper.apply: command not implemented")
 	}
 }
 
 func (s *fsmWrapper) Snapshot() (raft.FSMSnapshot, error) {
-	return s.fsm.Snapshot()
+	// TODO implement me
+	panic("implement me")
 }
 
 func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
-	return s.fsm.Restore(snapshot)
+	// TODO implement me
+	panic("implement me")
+}
+
+func (s *fsmWrapper) store(log *raft.Log, cmd *pb.Store) (*pb.CommandResponse, error) {
+	err := s.fsm.ApplyCmd(cmd.Data)
+	return respStore(&pb.StoreResponse{Uid: log.Index}), err
+}
+
+func (s *fsmWrapper) WaitFor(uid uint64) {
+	s.condM.Lock()
+	defer s.condM.Unlock()
+
+	for s.lastApplied < uid {
+		s.cond.Wait()
+	}
+}
+
+func (s *fsmWrapper) uidApplied(uid uint64) {
+	s.condM.Lock()
+	defer s.condM.Unlock()
+
+	s.lastApplied = uid
+	s.cond.Broadcast()
 }

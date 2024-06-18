@@ -12,34 +12,21 @@ import (
 	"github.com/matryer/is"
 	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar"
-	"github.com/tehsphinx/quasar/examples/generic/exampleFSM"
 	"github.com/tehsphinx/quasar/transports"
 )
 
-func TestSingleCache(t *testing.T) {
+func TestSingleKVCache(t *testing.T) {
 	type test struct {
 		name      string
-		storeVals []exampleFSM.Musician
+		storeVals map[string]string
 	}
 	tests := []test{
 		{
 			name: "sub test",
-			storeVals: []exampleFSM.Musician{
-				{
-					Name:        "Roberto",
-					Age:         43,
-					Instruments: []string{"violin", "guitar"},
-				},
-				{
-					Name:        "Angela",
-					Age:         24,
-					Instruments: []string{"piano", "flute"},
-				},
-				{
-					Name:        "Eva",
-					Age:         28,
-					Instruments: []string{"ukulele", "saxophone", "bass guitar"},
-				},
+			storeVals: map[string]string{
+				"key1": "val1",
+				"key2": "val2",
+				"key3": "val3",
 			},
 		},
 	}
@@ -49,9 +36,7 @@ func TestSingleCache(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	fsm := exampleFSM.NewInMemoryFSM()
-
-	cache, err := quasar.NewCache(ctxMain, fsm,
+	cache, err := quasar.NewKVCache(ctxMain,
 		quasar.WithBootstrap(true),
 	)
 	asrtMain.NoErr(err)
@@ -63,59 +48,40 @@ func TestSingleCache(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			asrt := asrtMain.New(t)
 
-			for _, v := range tt.storeVals {
-				r := fsm.SetMusician(v)
+			for k, v := range tt.storeVals {
+				_, r := cache.Store(k, []byte(v))
 				asrt.NoErr(r)
 			}
 
-			for _, v := range tt.storeVals {
-				got, r := fsm.GetMusicianLocal(v.Name)
+			for k, v := range tt.storeVals {
+				got, r := cache.LoadLocal(k)
 				asrt.NoErr(r)
 
-				asrt.Equal(got, v)
+				asrt.Equal(got, []byte(v))
 			}
 
-			for _, v := range tt.storeVals {
-				got, r := fsm.GetMusicianMaster(v.Name)
+			for k, v := range tt.storeVals {
+				got, r := cache.Load(k)
 				asrt.NoErr(r)
 
-				asrt.Equal(got, v)
-			}
-
-			for _, v := range tt.storeVals {
-				got, r := fsm.GetMusicianKnownLatest(v.Name)
-				asrt.NoErr(r)
-
-				asrt.Equal(got, v)
+				asrt.Equal(got, []byte(v))
 			}
 		})
 	}
 }
 
-func TestCacheClusterTCP(t *testing.T) {
+func TestKVCacheClusterTCP(t *testing.T) {
 	type test struct {
 		name      string
-		storeVals []exampleFSM.Musician
+		storeVals map[string]string
 	}
 	tests := []test{
 		{
 			name: "sub test",
-			storeVals: []exampleFSM.Musician{
-				{
-					Name:        "Roberto",
-					Age:         43,
-					Instruments: []string{"violin", "guitar"},
-				},
-				{
-					Name:        "Angela",
-					Age:         24,
-					Instruments: []string{"piano", "flute"},
-				},
-				{
-					Name:        "Eva",
-					Age:         28,
-					Instruments: []string{"ukulele", "saxophone", "bass guitar"},
-				},
+			storeVals: map[string]string{
+				"key1": "val1",
+				"key2": "val2",
+				"key3": "val3",
 			},
 		},
 	}
@@ -125,11 +91,7 @@ func TestCacheClusterTCP(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	fsm1 := exampleFSM.NewInMemoryFSM()
-	fsm2 := exampleFSM.NewInMemoryFSM()
-	fsm3 := exampleFSM.NewInMemoryFSM()
-
-	cache1, err := quasar.NewCache(ctxMain, fsm1,
+	cache1, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache1"),
 		quasar.WithTCPTransport(":28230", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28230}),
 		quasar.WithServers([]raft.Server{
@@ -140,13 +102,13 @@ func TestCacheClusterTCP(t *testing.T) {
 	)
 	asrtMain.NoErr(err)
 
-	_, err = quasar.NewCache(ctxMain, fsm2,
+	cache2, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache2"),
 		quasar.WithTCPTransport(":28231", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28231}),
 	)
 	asrtMain.NoErr(err)
 
-	_, err = quasar.NewCache(ctxMain, fsm3,
+	cache3, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache3"),
 		quasar.WithTCPTransport(":28232", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28232}),
 	)
@@ -156,42 +118,35 @@ func TestCacheClusterTCP(t *testing.T) {
 	asrtMain.NoErr(err)
 	fmt.Println("WAIT DONE")
 
-	fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
+	caches := []*quasar.KVCache{cache1, cache2, cache3}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for i, fsm := range fsms {
+			for i, cache := range caches {
 				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
 					asrtWrite := asrtMain.New(t)
 
-					for _, v := range tt.storeVals {
-						r := fsm.SetMusician(v)
+					for k, v := range tt.storeVals {
+						_, r := cache.Store(k+strconv.Itoa(i), []byte(v+strconv.Itoa(i)))
 						asrtWrite.NoErr(r)
 					}
 
-					for j, readFSM := range fsms {
+					for j, readCache := range caches {
 						t.Run("read cache "+strconv.Itoa(j), func(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
-							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianMaster(v.Name)
+							for k, v := range tt.storeVals {
+								got, r := readCache.Load(k + strconv.Itoa(i))
 								asrtRead.NoErr(r)
 
-								asrtRead.Equal(got, v)
+								asrtRead.Equal(got, []byte(v+strconv.Itoa(i)))
 							}
 
-							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianLocal(v.Name)
+							for k, v := range tt.storeVals {
+								got, r := readCache.LoadLocal(k + strconv.Itoa(i))
 								asrtRead.NoErr(r)
 
-								asrtRead.Equal(got, v)
-							}
-
-							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianKnownLatest(v.Name)
-								asrtRead.NoErr(r)
-
-								asrtRead.Equal(got, v)
+								asrtRead.Equal(got, []byte(v+strconv.Itoa(i)))
 							}
 						})
 					}
@@ -201,30 +156,18 @@ func TestCacheClusterTCP(t *testing.T) {
 	}
 }
 
-func TestCacheClusterNATS(t *testing.T) {
+func TestKVCacheClusterNATS(t *testing.T) {
 	type test struct {
 		name      string
-		storeVals []exampleFSM.Musician
+		storeVals map[string]string
 	}
 	tests := []test{
 		{
 			name: "sub test",
-			storeVals: []exampleFSM.Musician{
-				{
-					Name:        "Roberto",
-					Age:         43,
-					Instruments: []string{"violin", "guitar"},
-				},
-				{
-					Name:        "Angela",
-					Age:         24,
-					Instruments: []string{"piano", "flute"},
-				},
-				{
-					Name:        "Eva",
-					Age:         28,
-					Instruments: []string{"ukulele", "saxophone", "bass guitar"},
-				},
+			storeVals: map[string]string{
+				"key1": "val1",
+				"key2": "val2",
+				"key3": "val3",
 			},
 		},
 	}
@@ -248,11 +191,7 @@ func TestCacheClusterNATS(t *testing.T) {
 	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
 	asrtMain.NoErr(err)
 
-	fsm1 := exampleFSM.NewInMemoryFSM()
-	fsm2 := exampleFSM.NewInMemoryFSM()
-	fsm3 := exampleFSM.NewInMemoryFSM()
-
-	cache1, err := quasar.NewCache(ctxMain, fsm1,
+	cache1, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
 		quasar.WithServers([]raft.Server{
@@ -263,12 +202,12 @@ func TestCacheClusterNATS(t *testing.T) {
 	)
 	asrtMain.NoErr(err)
 
-	_, err = quasar.NewCache(ctxMain, fsm2,
+	cache2, err := quasar.NewKVCache(ctxMain,
 		quasar.WithTransport(transport2),
 	)
 	asrtMain.NoErr(err)
 
-	_, err = quasar.NewCache(ctxMain, fsm3,
+	cache3, err := quasar.NewKVCache(ctxMain,
 		quasar.WithTransport(transport3),
 	)
 	asrtMain.NoErr(err)
@@ -277,42 +216,35 @@ func TestCacheClusterNATS(t *testing.T) {
 	asrtMain.NoErr(err)
 	fmt.Println("WAIT DONE")
 
-	fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
+	caches := []*quasar.KVCache{cache1, cache2, cache3}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for i, fsm := range fsms {
+			for i, cache := range caches {
 				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
 					asrtWrite := asrtMain.New(t)
 
-					for _, v := range tt.storeVals {
-						r := fsm.SetMusician(v)
+					for k, v := range tt.storeVals {
+						_, r := cache.Store(k+strconv.Itoa(i), []byte(v+strconv.Itoa(i)))
 						asrtWrite.NoErr(r)
 					}
 
-					for j, readFSM := range fsms {
+					for j, readCache := range caches {
 						t.Run("read cache "+strconv.Itoa(j), func(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
-							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianMaster(v.Name)
+							for k, v := range tt.storeVals {
+								got, r := readCache.Load(k + strconv.Itoa(i))
 								asrtRead.NoErr(r)
 
-								asrtRead.Equal(got, v)
+								asrtRead.Equal(got, []byte(v+strconv.Itoa(i)))
 							}
 
-							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianLocal(v.Name)
+							for k, v := range tt.storeVals {
+								got, r := readCache.LoadLocal(k + strconv.Itoa(i))
 								asrtRead.NoErr(r)
 
-								asrtRead.Equal(got, v)
-							}
-
-							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianKnownLatest(v.Name)
-								asrtRead.NoErr(r)
-
-								asrtRead.Equal(got, v)
+								asrtRead.Equal(got, []byte(v+strconv.Itoa(i)))
 							}
 						})
 					}

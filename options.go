@@ -23,7 +23,8 @@ type options struct {
 	bootstrap bool
 	servers   []raft.Server
 
-	kv stores.KVStore
+	kv  stores.KVStore
+	fsm interface{}
 }
 
 func getOptions(opts []Option) options {
@@ -52,8 +53,8 @@ func WithLocalID(id string) Option {
 	}
 }
 
-// WithKVStore sets the kv store to use. If not set a new in memory kv store
-// is created with stores.NewInMemKVStore and used.
+// WithKVStore sets the kv store to use. This is only applicable for the KVCache.
+// If not set a new in memory kv store is created with stores.NewInMemKVStore and used.
 func WithKVStore(kv stores.KVStore) Option {
 	return func(o *options) {
 		o.kv = kv

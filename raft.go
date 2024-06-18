@@ -8,7 +8,7 @@ import (
 	"github.com/tehsphinx/quasar/transports"
 )
 
-func getRaft(cfg options, fsm FSM, transport transports.Transport) (*raft.Raft, error) {
+func getRaft(cfg options, fsm raft.FSM, transport transports.Transport) (*raft.Raft, error) {
 	if cfg.raft != nil {
 		return cfg.raft, nil
 	}
@@ -20,7 +20,7 @@ func getRaft(cfg options, fsm FSM, transport transports.Transport) (*raft.Raft, 
 	conf := raft.DefaultConfig()
 	conf.LocalID = raft.ServerID(cfg.localID)
 
-	rft, err := raft.NewRaft(conf, wrapFSM(fsm), logStore, stableStore, snapshotStore, transport)
+	rft, err := raft.NewRaft(conf, fsm, logStore, stableStore, snapshotStore, transport)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create raft layer: %w", err)
 	}

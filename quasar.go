@@ -16,15 +16,24 @@ const applyTimout = 5 * time.Second
 
 var ErrNoLeader = errors.New("cluster does not have a leader")
 
-func NewCache(ctx context.Context, opts ...Option) (*Cache, error) {
+func NewCache(ctx context.Context, fsm FSM, opts ...Option) (*Cache, error) {
+	cache, err := newCache(ctx, wrapFSM(fsm), opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	fsm.Inject(&FSMInjector{cache: cache})
+
+	return cache, err
+}
+
+func newCache(ctx context.Context, fsm cacheFSM, opts ...Option) (*Cache, error) {
 	cfg := getOptions(opts)
 
 	transport, err := getTransport(cfg)
 	if err != nil {
 		return nil, err
 	}
-
-	fsm := NewFSM(cfg.kv)
 
 	rft, err := getRaft(cfg, fsm, transport)
 	if err != nil {
@@ -39,49 +48,50 @@ func NewCache(ctx context.Context, opts ...Option) (*Cache, error) {
 	rft.RegisterObserver(observer)
 
 	c := &Cache{
+		localID: cfg.localID,
+		// kv:        cfg.kv,
 		fsm:       fsm,
 		raft:      rft,
 		transport: transport,
 	}
+
 	go c.consume(transport.CacheConsumer())
 	// go c.observeLeader(ctx, chLeaderChange)
 	return c, nil
 }
 
 type Cache struct {
-	fsm FSM
+	localID string
+
+	fsm cacheFSM
+	// kv  stores.KVStore
 
 	raft      *raft.Raft
 	transport transports.Transport
 }
 
-func (s *Cache) Store(key string, data []byte) (uint64, error) {
+func (s *Cache) store(key string, data []byte) (uint64, error) {
 	cmd := cmdStore(key, data)
-	_, index, err := s.apply(cmd)
-	return index, err
+	_, uid, err := s.apply(cmd)
+	return uid, err
 }
 
-func (s *Cache) Load(key string, opts ...LoadOption) ([]byte, error) {
-	cfg := getLoadOptions(opts)
-	// TODO: apply load options
-	_ = cfg
-
-	cmd := cmdLoad(key)
-	resp, _, err := s.apply(cmd)
-	return resp.GetLoadValue().GetData(), err
-}
-
-func (s *Cache) LoadLocal(key string, opts ...LoadOption) ([]byte, error) {
-	cfg := getLoadOptions(opts)
-	// TODO: apply load options
-	_ = cfg
-
-	cmd := cmdLoad(key)
-	resp, err := s.fsm.Apply(cmd)
-	if err != nil {
-		return nil, err
+func (s *Cache) masterLastIndex() (uint64, error) {
+	if s.isLeader() {
+		return s.localLastIndex(), nil
 	}
-	return resp.GetLoadValue().GetData(), err
+
+	cmd := cmdLatestUID()
+	_, uid, err := s.apply(cmd)
+	if err != nil {
+		return 0, err
+	}
+
+	return uid, nil
+}
+
+func (s *Cache) localLastIndex() uint64 {
+	return s.raft.LastIndex()
 }
 
 func (s *Cache) apply(cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
@@ -108,6 +118,8 @@ func (s *Cache) applyLocal(cmd *pb.Command) (*pb.CommandResponse, uint64, error)
 		return nil, 0, fmt.Errorf("apply function returned error: %w", r)
 	}
 
+	// TODO: apply to persistent storage if one is set
+
 	return resp.resp, index, nil
 }
 
@@ -118,12 +130,12 @@ func (s *Cache) applyRemote(command *pb.Command) (*pb.CommandResponse, uint64, e
 	}
 
 	switch cmd := command.GetCmd().(type) {
-	case *pb.Command_StoreValue:
-		resp, err := s.transport.Store(id, addr, cmd.StoreValue)
+	case *pb.Command_Store:
+		resp, err := s.transport.Store(id, addr, cmd.Store)
 		return respStore(resp), resp.Uid, err
-	case *pb.Command_LoadValue:
-		resp, err := s.transport.Load(id, addr, cmd.LoadValue)
-		return respLoad(resp), resp.Uid, err
+	case *pb.Command_LatestUid:
+		resp, err := s.transport.LatestUID(id, addr, cmd.LatestUid)
+		return respLatestUID(resp), resp.Uid, err
 	}
 
 	return nil, 0, errors.New("leader request type not implemented")
@@ -159,14 +171,13 @@ func (s *Cache) consume(ch <-chan raft.RPC) {
 			err  error
 		)
 		switch cmd := rpc.Command.(type) {
-		case *pb.StoreValue:
+		case *pb.Store:
 			var uid uint64
-			uid, err = s.Store(cmd.Key, cmd.Data)
-			resp = &pb.StoreValueResponse{Uid: uid}
-		case *pb.LoadValue:
-			var data []byte
-			data, err = s.Load(cmd.Key)
-			resp = &pb.LoadValueResponse{Data: data}
+			uid, err = s.store(cmd.Key, cmd.Data)
+			resp = &pb.StoreResponse{Uid: uid}
+		case *pb.LatestUid:
+			uid := s.localLastIndex()
+			resp = &pb.LatestUidResponse{Uid: uid}
 		}
 		fmt.Printf("%+v\n", rpc)
 		rpc.RespChan <- raft.RPCResponse{
