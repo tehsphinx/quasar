@@ -1,0 +1,18 @@
+syntax = "proto3";
+package quasar.v1;
+
+option go_package = "github.com/tehsphinx/quasar/pb";
+
+message ServerInfo {
+  string server_id = 1;
+  string server_address = 2;
+  bool voter = 3;
+}
+
+message DiscoverPing {
+  ServerInfo sender = 1;
+}
+
+message DiscoverPong {
+  string error = 2;
+}

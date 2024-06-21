@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar/pb/v1"
 	"github.com/tehsphinx/quasar/transports"
 	"google.golang.org/protobuf/proto"
@@ -30,15 +32,30 @@ func NewCache(ctx context.Context, fsm FSM, opts ...Option) (*Cache, error) {
 func newCache(ctx context.Context, fsm cacheFSM, opts ...Option) (*Cache, error) {
 	cfg := getOptions(opts)
 
+	c := &Cache{
+		name:    cfg.cacheName,
+		localID: cfg.localID,
+		// kv:        cfg.kv,
+		fsm:       fsm,
+		discovery: cfg.discovery,
+		isVoter:   cfg.isVoter,
+	}
+
+	if c.discovery != nil {
+		c.discovery.Inject(&DiscoveryInjector{cache: c})
+	}
+
 	transport, err := getTransport(cfg)
 	if err != nil {
 		return nil, err
 	}
+	c.transport = transport
 
-	rft, err := getRaft(cfg, fsm, transport)
+	rft, err := getRaft(ctx, cfg, fsm, transport)
 	if err != nil {
 		return nil, err
 	}
+	c.raft = rft
 
 	chLeaderChange := make(chan raft.Observation, 3)
 	observer := raft.NewObserver(chLeaderChange, true, func(o *raft.Observation) bool {
@@ -47,12 +64,10 @@ func newCache(ctx context.Context, fsm cacheFSM, opts ...Option) (*Cache, error)
 	})
 	rft.RegisterObserver(observer)
 
-	c := &Cache{
-		localID: cfg.localID,
-		// kv:        cfg.kv,
-		fsm:       fsm,
-		raft:      rft,
-		transport: transport,
+	if c.discovery != nil {
+		if e := cfg.discovery.Run(ctx); e != nil {
+			return nil, e
+		}
 	}
 
 	go c.consume(transport.CacheConsumer())
@@ -61,11 +76,13 @@ func newCache(ctx context.Context, fsm cacheFSM, opts ...Option) (*Cache, error)
 }
 
 type Cache struct {
+	name    string
 	localID string
 
 	fsm cacheFSM
 	// kv  stores.KVStore
-
+	discovery Discovery
+	isVoter   bool
 	raft      *raft.Raft
 	transport transports.Transport
 }
@@ -186,6 +203,50 @@ func (s *Cache) consume(ch <-chan raft.RPC) {
 		}
 	}
 }
+
+func (s *Cache) listen(ctx context.Context) {
+	const (
+		minWait = 3 * time.Second
+		maxWait = 10 * time.Second
+	)
+
+	for {
+		randWait := minWait + time.Duration(rand.Intn(int(maxWait-minWait)))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(randWait):
+		}
+
+		if err := s.pingCluster(ctx); err != nil {
+			// TODO: maybe log the error?
+		}
+	}
+}
+
+func (s *Cache) pingCluster(ctx context.Context) error {
+	if e := s.discovery.PingCluster(ctx, raft.ServerID(s.localID), s.transport.LocalAddr(), s.isVoter); e != nil {
+		if errors.Is(e, nats.ErrNoResponders) {
+			// no responders -> no other servers
+			return nil
+		}
+		if errors.Is(e, context.DeadlineExceeded) {
+			// no response -> no other servers
+			return nil
+		}
+		// other failure
+		return fmt.Errorf("failed to ping cluster: %w", e)
+	}
+	return nil
+}
+
+// TODO: remove
+// func (s *Cache) fdsfds() {
+// 	s.raft.AddVoter()
+// 	s.raft.AddNonvoter()
+// 	s.raft.RemoveServer()
+// 	s.raft.BootstrapCluster()
+// }
 
 // func (s *Cache) observeLeader(ctx context.Context, change chan raft.Observation) {
 // 	var obs raft.Observation
