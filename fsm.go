@@ -1,6 +1,7 @@
 package quasar
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
@@ -13,8 +14,8 @@ import (
 type FSM interface {
 	Inject(fsm *FSMInjector)
 	ApplyCmd(cmd []byte) error
-	// Snapshot() (raft.FSMSnapshot, error)
-	// Restore(snapshot io.ReadCloser) error
+	Snapshot() (raft.FSMSnapshot, error)
+	Restore(snapshot io.ReadCloser) error
 }
 
 type cacheFSM interface {
@@ -70,13 +71,37 @@ func (s *fsmWrapper) apply(log *raft.Log, command *pb.Command) (*pb.CommandRespo
 }
 
 func (s *fsmWrapper) Snapshot() (raft.FSMSnapshot, error) {
-	// TODO implement me
-	panic("implement me")
+	snapshot, err := s.fsm.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+
+	return &snapshotWrapper{
+		snapshot:    snapshot,
+		lastApplied: s.lastApplied,
+	}, nil
 }
 
 func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
-	// TODO implement me
-	panic("implement me")
+	s.lastApplied = 0
+
+	bts := make([]byte, 8)
+	n, err := snapshot.Read(bts)
+	if err != nil {
+		return err
+	}
+	if n != len(bts) {
+		return errors.New("failed to parse lastApplied: not enough bytes found")
+	}
+	uid := uint64FromBytes(bts)
+
+	if r := s.fsm.Restore(snapshot); r != nil {
+		return r
+	}
+
+	s.lastApplied = uid
+	s.cond.Broadcast()
+	return nil
 }
 
 func (s *fsmWrapper) store(log *raft.Log, cmd *pb.Store) (*pb.CommandResponse, error) {
@@ -99,4 +124,31 @@ func (s *fsmWrapper) uidApplied(uid uint64) {
 
 	s.lastApplied = uid
 	s.cond.Broadcast()
+}
+
+type snapshotWrapper struct {
+	snapshot    raft.FSMSnapshot
+	lastApplied uint64
+}
+
+func (s *snapshotWrapper) Persist(sink raft.SnapshotSink) error {
+	// write lastApplied to sink before writing other data
+	lastAppliedBts := uint64ToBytes(s.lastApplied)
+	if _, err := sink.Write(lastAppliedBts); err != nil {
+		return err
+	}
+
+	return s.snapshot.Persist(sink)
+}
+
+func (s *snapshotWrapper) Release() {}
+
+func uint64ToBytes(val uint64) []byte {
+	bts := make([]byte, 8)
+	binary.LittleEndian.PutUint64(bts, val)
+	return bts
+}
+
+func uint64FromBytes(val []byte) uint64 {
+	return binary.LittleEndian.Uint64(val)
 }

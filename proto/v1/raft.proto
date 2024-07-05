@@ -101,6 +101,12 @@ message InstallSnapshotRequest {
   int64 size = 10;
 }
 
+// InstallSnapshotChannel informs the sender of the snapshot about the subject
+// the receiver is listening on to receive the snapshot packages.
+message InstallSnapshotChannel {
+  string subject = 1;
+}
+
 message InstallSnapshotResponse {
   RPCHeader header = 1;
 

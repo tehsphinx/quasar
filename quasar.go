@@ -164,6 +164,13 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 	}
 }
 
+// ForceSnapshot triggers the underlying raft library to take a snapshot.
+// Mostly used for testing purposes.
+func (s *Cache) ForceSnapshot() error {
+	future := s.raft.Snapshot()
+	return future.Error()
+}
+
 func (s *Cache) consume(ch <-chan raft.RPC) {
 	for rpc := range ch {
 		var (

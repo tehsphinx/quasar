@@ -1,11 +1,15 @@
 package exampleFSM
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
+	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar"
+	"golang.org/x/exp/maps"
 )
 
 type Musician struct {
@@ -38,6 +42,8 @@ func NewInMemoryFSM() *InMemoryFSM {
 		cities:    map[string]City{},
 	}
 }
+
+var _ quasar.FSM = (*InMemoryFSM)(nil)
 
 type InMemoryFSM struct {
 	fsm *quasar.FSMInjector
@@ -103,13 +109,6 @@ func (s *InMemoryFSM) GetCityLocal(name string) (City, error) {
 	return city, nil
 }
 
-// Inject must be implemented to receive the FSMInjector object. It provides the necessary
-// functions to call into the cache without cluttering the Cache API. It is called in the
-// quasar.NewCache function.
-func (s *InMemoryFSM) Inject(fsm *quasar.FSMInjector) {
-	s.fsm = fsm
-}
-
 // ApplyCmd unmarshalls incoming changes and stores the data in its native types.
 func (s *InMemoryFSM) ApplyCmd(cmd []byte) error {
 	var change Change
@@ -135,4 +134,110 @@ func (s *InMemoryFSM) ApplyCmd(cmd []byte) error {
 	default:
 		return errors.New("unknown apply type")
 	}
+}
+
+// Inject must be implemented to receive the FSMInjector object. It provides the necessary
+// functions to call into the cache without cluttering the Cache API. It is called in the
+// quasar.NewCache function.
+func (s *InMemoryFSM) Inject(fsm *quasar.FSMInjector) {
+	s.fsm = fsm
+}
+
+type snapshot struct {
+	musicians []Musician
+	cities    []City
+}
+
+func (s *InMemoryFSM) Snapshot() (raft.FSMSnapshot, error) {
+	return &snapshot{
+		musicians: maps.Values(s.musicians),
+		cities:    maps.Values(s.cities),
+	}, nil
+}
+
+const (
+	sectMusicians = "--> musicians <--"
+	sectCities    = "--> cities <--"
+)
+
+func (s *snapshot) Persist(sink raft.SnapshotSink) error {
+	if err := s.newSection(sink, sectMusicians); err != nil {
+		return err
+	}
+	for _, musician := range s.musicians {
+		if err := s.writeValue(sink, musician); err != nil {
+			return err
+		}
+	}
+
+	if err := s.newSection(sink, sectCities); err != nil {
+		return err
+	}
+	for _, city := range s.cities {
+		if err := s.writeValue(sink, city); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *InMemoryFSM) Restore(reader io.ReadCloser) error {
+	scanner := bufio.NewScanner(reader)
+	var dataType string
+	for scanner.Scan() {
+		bts := scanner.Bytes()
+		switch string(bts) {
+		case sectMusicians:
+			dataType = sectMusicians
+			continue
+		case sectCities:
+			dataType = sectCities
+			continue
+		}
+
+		switch dataType {
+		case sectMusicians:
+			var musician Musician
+			if err := json.Unmarshal(bts, &musician); err != nil {
+				return err
+			}
+			s.musicians[musician.Name] = musician
+		case sectCities:
+			var city City
+			if err := json.Unmarshal(bts, &city); err != nil {
+				return err
+			}
+			s.cities[city.Name] = city
+		}
+	}
+	return nil
+}
+
+func (s *snapshot) newSection(sink raft.SnapshotSink, section string) error {
+	if _, err := sink.Write([]byte(section)); err != nil {
+		return err
+	}
+	_, err := sink.Write([]byte{'\n'})
+	return err
+}
+
+func (s *snapshot) writeValue(sink raft.SnapshotSink, value any) error {
+	const newline = "\n"
+
+	bts, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if _, r := sink.Write(bts); r != nil {
+		return r
+	}
+	if _, r := sink.Write([]byte(newline)); r != nil {
+		return r
+	}
+	return nil
+}
+
+func (s *snapshot) Release() {
+	s.musicians = nil
+	s.cities = nil
 }

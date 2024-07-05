@@ -19,9 +19,9 @@ type options struct {
 	raftTransport raft.Transport
 	transport     transports.Transport
 
-	raft      *raft.Raft
-	bootstrap bool
-	servers   []raft.Server
+	raftConfig *raft.Config
+	bootstrap  bool
+	servers    []raft.Server
 
 	kv  stores.KVStore
 	fsm interface{}
@@ -102,11 +102,11 @@ func WithServers(servers []raft.Server) Option {
 	}
 }
 
-// WithCustomRaft allows a completely custom configured RAFT instance to be passed in.
-// Using this option disables usage of `WithLocalID`, and `WithTCPTransport`
-func WithCustomRaft(rft *raft.Raft) Option {
+// WithRaftConfig allows passing in a custom raft configuration. Only the LocalID will
+// still be overwritten which can be set WithLocalID.
+func WithRaftConfig(cfg *raft.Config) Option {
 	return func(o *options) {
-		o.raft = rft
+		o.raftConfig = cfg
 	}
 }
 

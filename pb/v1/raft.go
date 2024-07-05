@@ -105,6 +105,52 @@ func (x *RequestVoteResponse) Convert() *raft.RequestVoteResponse {
 	}
 }
 
+func ToInstallSnapshotRequest(in *raft.InstallSnapshotRequest) *InstallSnapshotRequest {
+	return &InstallSnapshotRequest{
+		Header:             ToRPCHeader(in.GetRPCHeader()),
+		SnapshotVersion:    uint32(in.SnapshotVersion),
+		Term:               in.Term,
+		Leader:             in.Leader,
+		LastLogIndex:       in.LastLogIndex,
+		LastLogTerm:        in.LastLogTerm,
+		Peers:              in.Peers,
+		Configuration:      in.Configuration,
+		ConfigurationIndex: in.ConfigurationIndex,
+		Size:               in.Size,
+	}
+}
+
+func (x *InstallSnapshotRequest) Convert() *raft.InstallSnapshotRequest {
+	return &raft.InstallSnapshotRequest{
+		RPCHeader:          x.GetHeader().Convert(),
+		SnapshotVersion:    raft.SnapshotVersion(x.GetSnapshotVersion()),
+		Term:               x.GetTerm(),
+		Leader:             x.GetLeader(),
+		LastLogIndex:       x.GetLastLogIndex(),
+		LastLogTerm:        x.GetLastLogTerm(),
+		Peers:              x.GetPeers(),
+		Configuration:      x.GetConfiguration(),
+		ConfigurationIndex: x.GetConfigurationIndex(),
+		Size:               x.GetSize(),
+	}
+}
+
+func ToInstallSnapshotResponse(in *raft.InstallSnapshotResponse) *InstallSnapshotResponse {
+	return &InstallSnapshotResponse{
+		Header:  ToRPCHeader(in.GetRPCHeader()),
+		Term:    in.Term,
+		Success: in.Success,
+	}
+}
+
+func (x *InstallSnapshotResponse) Convert() *raft.InstallSnapshotResponse {
+	return &raft.InstallSnapshotResponse{
+		RPCHeader: x.GetHeader().Convert(),
+		Term:      x.GetTerm(),
+		Success:   x.GetSuccess(),
+	}
+}
+
 func FromLogs(in []*Log) []*raft.Log {
 	logs := make([]*raft.Log, 0, len(in))
 	for _, l := range in {

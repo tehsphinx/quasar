@@ -9,15 +9,14 @@ import (
 )
 
 func getRaft(cfg options, fsm raft.FSM, transport transports.Transport) (*raft.Raft, error) {
-	if cfg.raft != nil {
-		return cfg.raft, nil
-	}
-
-	snapshotStore := raft.NewDiscardSnapshotStore()
+	snapshotStore := raft.NewInmemSnapshotStore()
 	logStore := raft.NewInmemStore()
 	stableStore := stores.NewStableInMemory()
 
-	conf := raft.DefaultConfig()
+	conf := cfg.raftConfig
+	if conf == nil {
+		conf = raft.DefaultConfig()
+	}
 	conf.LocalID = raft.ServerID(cfg.localID)
 
 	rft, err := raft.NewRaft(conf, fsm, logStore, stableStore, snapshotStore, transport)

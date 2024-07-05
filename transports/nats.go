@@ -3,7 +3,6 @@ package transports
 import (
 	"context"
 	"fmt"
-	"io"
 	"sync"
 	"time"
 
@@ -12,6 +11,11 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar/pb/v1"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	maxPkgSize        = 900 * 1024 // 900KB
+	snapshotPkgTimout = 5 * time.Second
 )
 
 func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverName string, opts ...NATSOption) (*NATSTransport, error) {
@@ -27,7 +31,9 @@ func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverNam
 		chConsume:      make(chan raft.RPC),
 		chConsumeCache: make(chan raft.RPC),
 	}
-	s.listen(ctx)
+	if err := s.listen(ctx); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -68,6 +74,10 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	subInstallSnapshot, err := s.conn.Subscribe(subjPrefix+".install.snapshot", s.handleInstallSnapshot)
+	if err != nil {
+		return err
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -75,6 +85,7 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 		_ = subVote.Unsubscribe()
 		_ = subStore.Unsubscribe()
 		_ = subLatestUID.Unsubscribe()
+		_ = subInstallSnapshot.Unsubscribe()
 	}()
 	return nil
 }
@@ -138,9 +149,35 @@ func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress,
 	return nil
 }
 
-func (s *NATSTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
-	// TODO implement me
-	panic("implement me")
+func (s *NATSTransport) handleVote(msg *nats.Msg) {
+	var protoMsg pb.RequestVoteRequest
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+	// fmt.Printf("incoming request: %+v\n", protoMsg)
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  protoMsg.Convert(),
+	}
+
+	s.chConsume <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		resp, _ := i.(*raft.RequestVoteResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_RequestVote{RequestVote: pb.ToRequestVoteResponse(resp)}}
+	})
+
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
 }
 
 func (s *NATSTransport) EncodePeer(_ raft.ServerID, addr raft.ServerAddress) []byte {
@@ -180,37 +217,6 @@ func (s *NATSTransport) request(subj string, msg proto.Message, protoResp proto.
 	err = proto.Unmarshal(response.Data, protoResp)
 	// fmt.Println("response data:", fmt.Sprintf("%+v", protoResp))
 	return err
-}
-
-func (s *NATSTransport) handleVote(msg *nats.Msg) {
-	var protoMsg pb.RequestVoteRequest
-	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-		s.logger.Error("failed to decode incoming command", "error", r)
-		return
-	}
-	// fmt.Printf("incoming request: %+v\n", protoMsg)
-
-	// Create the RPC object
-	chResp := make(chan raft.RPCResponse, 1)
-	rpc := raft.RPC{
-		RespChan: chResp,
-		Command:  protoMsg.Convert(),
-	}
-
-	s.chConsume <- rpc
-
-	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
-		resp, _ := i.(*raft.RequestVoteResponse)
-		return &pb.CommandResponse{Resp: &pb.CommandResponse_RequestVote{RequestVote: pb.ToRequestVoteResponse(resp)}}
-	})
-
-	if err != nil {
-		s.logger.Error("failed to send response", "error", err)
-		return
-	}
-	if r := msg.Respond(bts); r != nil {
-		s.logger.Error("failed to send response", "error", r)
-	}
 }
 
 func (s *NATSTransport) handleEntries(msg *nats.Msg) {
