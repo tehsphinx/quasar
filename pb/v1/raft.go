@@ -151,6 +151,30 @@ func (x *InstallSnapshotResponse) Convert() *raft.InstallSnapshotResponse {
 	}
 }
 
+func ToTimeoutNowRequest(in *raft.TimeoutNowRequest) *TimeoutNowRequest {
+	return &TimeoutNowRequest{
+		Header: ToRPCHeader(in.GetRPCHeader()),
+	}
+}
+
+func (x *TimeoutNowRequest) Convert() *raft.TimeoutNowRequest {
+	return &raft.TimeoutNowRequest{
+		RPCHeader: x.GetHeader().Convert(),
+	}
+}
+
+func ToTimeoutNowResponse(in *raft.TimeoutNowResponse) *TimeoutNowResponse {
+	return &TimeoutNowResponse{
+		Header: ToRPCHeader(in.GetRPCHeader()),
+	}
+}
+
+func (x *TimeoutNowResponse) Convert() *raft.TimeoutNowResponse {
+	return &raft.TimeoutNowResponse{
+		RPCHeader: x.GetHeader().Convert(),
+	}
+}
+
 func FromLogs(in []*Log) []*raft.Log {
 	logs := make([]*raft.Log, 0, len(in))
 	for _, l := range in {

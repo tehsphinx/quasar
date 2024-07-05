@@ -78,6 +78,10 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	subTimeoutNow, err := s.conn.Subscribe(subjPrefix+".timeout.now", s.handleTimeoutNow)
+	if err != nil {
+		return err
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -86,6 +90,7 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 		_ = subStore.Unsubscribe()
 		_ = subLatestUID.Unsubscribe()
 		_ = subInstallSnapshot.Unsubscribe()
+		_ = subTimeoutNow.Unsubscribe()
 	}()
 	return nil
 }
@@ -104,6 +109,37 @@ func (s *NATSTransport) Store(_ raft.ServerID, address raft.ServerAddress, reque
 	return protoResp.GetStore(), nil
 }
 
+func (s *NATSTransport) handleStore(msg *nats.Msg) {
+	var protoMsg pb.Store
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  &protoMsg,
+	}
+
+	s.chConsumeCache <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		resp, _ := i.(*pb.StoreResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_Store{
+			Store: resp,
+		}}
+	})
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
+}
+
 func (s *NATSTransport) LatestUID(_ raft.ServerID, address raft.ServerAddress, request *pb.LatestUid) (*pb.LatestUidResponse, error) {
 	subj := fmt.Sprintf("quasar.%s.%s.cache.uid.latest", s.cacheName, address)
 
@@ -112,6 +148,38 @@ func (s *NATSTransport) LatestUID(_ raft.ServerID, address raft.ServerAddress, r
 		return nil, err
 	}
 	return protoResp.GetLatestUid(), nil
+}
+
+func (s *NATSTransport) handleLatestUID(msg *nats.Msg) {
+	var protoMsg pb.LatestUid
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  &protoMsg,
+	}
+
+	s.chConsumeCache <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		// TODO: be able to return error if type cast fails
+		resp, _ := i.(*pb.LatestUidResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_LatestUid{
+			LatestUid: resp,
+		}}
+	})
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
 }
 
 func (s *NATSTransport) Consumer() <-chan raft.RPC {
@@ -135,6 +203,37 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 	}
 	*resp = *protoResp.GetAppendEntries().Convert()
 	return nil
+}
+
+func (s *NATSTransport) handleEntries(msg *nats.Msg) {
+	var protoMsg pb.AppendEntriesRequest
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  protoMsg.Convert(),
+	}
+
+	s.chConsume <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		resp, _ := i.(*raft.AppendEntriesResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_AppendEntries{
+			AppendEntries: pb.ToAppendEntriesResponse(resp),
+		}}
+	})
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
 }
 
 func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress, request *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
@@ -194,9 +293,47 @@ func (s *NATSTransport) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
 	s.heartbeatFn = cb
 }
 
-func (s *NATSTransport) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
-	// TODO implement me
-	panic("implement me")
+func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, request *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
+	subj := fmt.Sprintf("quasar.%s.%s.timeout.now", s.cacheName, address)
+
+	var protoResp pb.CommandResponse
+	if err := s.request(subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
+		return err
+	}
+
+	*resp = *protoResp.GetTimeoutNow().Convert()
+	return nil
+}
+
+func (s *NATSTransport) handleTimeoutNow(msg *nats.Msg) {
+	var protoMsg pb.TimeoutNowRequest
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		s.logger.Error("failed to decode incoming command", "error", r)
+		return
+	}
+
+	// Create the RPC object
+	chResp := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{
+		RespChan: chResp,
+		Command:  protoMsg.Convert(),
+	}
+
+	s.chConsume <- rpc
+
+	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
+		resp, _ := i.(*raft.TimeoutNowResponse)
+		return &pb.CommandResponse{Resp: &pb.CommandResponse_TimeoutNow{
+			TimeoutNow: pb.ToTimeoutNowResponse(resp),
+		}}
+	})
+	if err != nil {
+		s.logger.Error("failed to send response", "error", err)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
 }
 
 func (s *NATSTransport) request(subj string, msg proto.Message, protoResp proto.Message) error {
@@ -218,131 +355,6 @@ func (s *NATSTransport) request(subj string, msg proto.Message, protoResp proto.
 	// fmt.Println("response data:", fmt.Sprintf("%+v", protoResp))
 	return err
 }
-
-func (s *NATSTransport) handleEntries(msg *nats.Msg) {
-	var protoMsg pb.AppendEntriesRequest
-	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-		s.logger.Error("failed to decode incoming command", "error", r)
-		return
-	}
-
-	// Create the RPC object
-	chResp := make(chan raft.RPCResponse, 1)
-	rpc := raft.RPC{
-		RespChan: chResp,
-		Command:  protoMsg.Convert(),
-	}
-
-	s.chConsume <- rpc
-
-	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
-		resp, _ := i.(*raft.AppendEntriesResponse)
-		return &pb.CommandResponse{Resp: &pb.CommandResponse_AppendEntries{
-			AppendEntries: pb.ToAppendEntriesResponse(resp),
-		}}
-	})
-	if err != nil {
-		s.logger.Error("failed to send response", "error", err)
-		return
-	}
-	if r := msg.Respond(bts); r != nil {
-		s.logger.Error("failed to send response", "error", r)
-	}
-}
-
-func (s *NATSTransport) handleStore(msg *nats.Msg) {
-	var protoMsg pb.Store
-	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-		s.logger.Error("failed to decode incoming command", "error", r)
-		return
-	}
-
-	// Create the RPC object
-	chResp := make(chan raft.RPCResponse, 1)
-	rpc := raft.RPC{
-		RespChan: chResp,
-		Command:  &protoMsg,
-	}
-
-	s.chConsumeCache <- rpc
-
-	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
-		resp, _ := i.(*pb.StoreResponse)
-		return &pb.CommandResponse{Resp: &pb.CommandResponse_Store{
-			Store: resp,
-		}}
-	})
-	if err != nil {
-		s.logger.Error("failed to send response", "error", err)
-		return
-	}
-	if r := msg.Respond(bts); r != nil {
-		s.logger.Error("failed to send response", "error", r)
-	}
-}
-
-func (s *NATSTransport) handleLatestUID(msg *nats.Msg) {
-	var protoMsg pb.LatestUid
-	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-		s.logger.Error("failed to decode incoming command", "error", r)
-		return
-	}
-
-	// Create the RPC object
-	chResp := make(chan raft.RPCResponse, 1)
-	rpc := raft.RPC{
-		RespChan: chResp,
-		Command:  &protoMsg,
-	}
-
-	s.chConsumeCache <- rpc
-
-	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
-		// TODO: be able to return error if type cast fails
-		resp, _ := i.(*pb.LatestUidResponse)
-		return &pb.CommandResponse{Resp: &pb.CommandResponse_LatestUid{
-			LatestUid: resp,
-		}}
-	})
-	if err != nil {
-		s.logger.Error("failed to send response", "error", err)
-		return
-	}
-	if r := msg.Respond(bts); r != nil {
-		s.logger.Error("failed to send response", "error", r)
-	}
-}
-
-// func (s *NATSTransport) handleLoad(msg *nats.Msg) {
-// 	var protoMsg pb.LoadValue
-// 	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-// 		s.logger.Error("failed to decode incoming command", "error", r)
-// 		return
-// 	}
-//
-// 	// Create the RPC object
-// 	chResp := make(chan raft.RPCResponse, 1)
-// 	rpc := raft.RPC{
-// 		RespChan: chResp,
-// 		Command:  &protoMsg,
-// 	}
-//
-// 	s.chConsumeCache <- rpc
-//
-// 	bts, err := s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
-// 		resp, _ := i.(*pb.LoadValueResponse)
-// 		return &pb.CommandResponse{Resp: &pb.CommandResponse_LoadValue{
-// 			LoadValue: resp,
-// 		}}
-// 	})
-// 	if err != nil {
-// 		s.logger.Error("failed to send response", "error", err)
-// 		return
-// 	}
-// 	if r := msg.Respond(bts); r != nil {
-// 		s.logger.Error("failed to send response", "error", r)
-// 	}
-// }
 
 func (s *NATSTransport) awaitResponse(ch <-chan raft.RPCResponse, toProto func(interface{}) *pb.CommandResponse) ([]byte, error) {
 	select {
@@ -366,20 +378,3 @@ func (s *NATSTransport) awaitResponse(ch <-chan raft.RPCResponse, toProto func(i
 		return nil, raft.ErrTransportShutdown
 	}
 }
-
-// func (s *NATSTransport) handleClusterInfoRequests(msg *nats.Msg) {
-// 	// TODO: should add the incoming server name if it does not exist to internal known server list.
-// 	// msg.Data
-// }
-
-/*
-Common subscription to find other gatexes.
-quasar.<cacheName>.servers
-
-dedicated addresses for each gatex -> gatexName
-quasar.<cacheName>.<gatexName>.message
-
-gatex1 request to quasar.<cacheName>.servers -> gatex2 from gatex2 -> gatex3 from gatex3 -> list with gatex2 and gatex3
-gatex2 request to quasar.<cacheName>.servers
-gatex3 request to quasar.<cacheName>.servers
-*/
