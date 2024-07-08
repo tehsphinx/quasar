@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
@@ -18,26 +19,38 @@ type FSM interface {
 	Restore(snapshot io.ReadCloser) error
 }
 
-type cacheFSM interface {
-	raft.FSM
-	WaitFor(uid uint64)
+type logApplier interface {
+	Apply(log *raft.Log) interface{}
 }
 
 func wrapFSM(fsm FSM) *fsmWrapper {
 	mutex := &sync.Mutex{}
-	return &fsmWrapper{
+	s := &fsmWrapper{
 		fsm:   fsm,
 		condM: mutex,
 		cond:  sync.NewCond(mutex),
 	}
+	if _, ok := fsm.(logApplier); ok {
+		s.isLogApplier = true
+	}
+	return s
 }
 
 type fsmWrapper struct {
-	fsm FSM
+	fsm  FSM
+	raft *raft.Raft
 
 	lastApplied uint64
+	sysUIDsM    sync.Mutex
+	sysUIDs     []uint64
 	condM       *sync.Mutex
 	cond        *sync.Cond
+
+	isLogApplier bool
+}
+
+func (s *fsmWrapper) SetRaft(rft *raft.Raft) {
+	s.raft = rft
 }
 
 type applyResponse struct {
@@ -46,14 +59,20 @@ type applyResponse struct {
 }
 
 func (s *fsmWrapper) Apply(log *raft.Log) interface{} {
+	defer s.uidApplied(log.Index)
+
+	if s.isLogApplier {
+		if fsm, ok := s.fsm.(logApplier); ok {
+			return fsm.Apply(log)
+		}
+	}
+
 	var cmd pb.Command
 	if err := proto.Unmarshal(log.Data, &cmd); err != nil {
 		return applyResponse{err: err}
 	}
 
 	resp, respErr := s.apply(log, &cmd)
-
-	s.uidApplied(log.Index)
 
 	return applyResponse{
 		resp: resp,
@@ -78,12 +97,12 @@ func (s *fsmWrapper) Snapshot() (raft.FSMSnapshot, error) {
 
 	return &snapshotWrapper{
 		snapshot:    snapshot,
-		lastApplied: s.lastApplied,
+		lastApplied: s.getLastApplied(),
 	}, nil
 }
 
 func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
-	s.lastApplied = 0
+	s.setLastApplied(0)
 
 	bts := make([]byte, 8)
 	n, err := snapshot.Read(bts)
@@ -99,7 +118,7 @@ func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
 		return r
 	}
 
-	s.lastApplied = uid
+	s.setLastApplied(uid)
 	s.cond.Broadcast()
 	return nil
 }
@@ -113,17 +132,77 @@ func (s *fsmWrapper) WaitFor(uid uint64) {
 	s.condM.Lock()
 	defer s.condM.Unlock()
 
-	for s.lastApplied < uid {
+	for s.getLastApplied() < uid {
 		s.cond.Wait()
 	}
 }
 
 func (s *fsmWrapper) uidApplied(uid uint64) {
+	s.setLastApplied(uid)
+
+	s.applySysUIDs()
+
 	s.condM.Lock()
 	defer s.condM.Unlock()
 
-	s.lastApplied = uid
 	s.cond.Broadcast()
+}
+
+func (s *fsmWrapper) regSystemUID(uid uint64) {
+	if applied := s.applySysUID(uid); applied {
+		return
+	}
+
+	s.queueSysUID(uid)
+}
+
+func (s *fsmWrapper) queueSysUID(uid uint64) {
+	s.sysUIDsM.Lock()
+	defer s.sysUIDsM.Unlock()
+
+	s.sysUIDs = append(s.sysUIDs, uid)
+}
+
+func (s *fsmWrapper) popSysUID(apply func(uid uint64) bool) bool {
+	s.sysUIDsM.Lock()
+	defer s.sysUIDsM.Unlock()
+
+	if len(s.sysUIDs) == 0 {
+		return false
+	}
+
+	uid := s.sysUIDs[0]
+	if !apply(uid) {
+		return false
+	}
+	s.sysUIDs = s.sysUIDs[1:]
+
+	return true
+}
+
+func (s *fsmWrapper) applySysUID(uid uint64) bool {
+	if applied := s.incrLastAppliedTo(uid); applied {
+		return true
+	}
+	if uid <= s.getLastApplied() {
+		return true
+	}
+	return false
+}
+
+func (s *fsmWrapper) applySysUIDs() {
+	for s.popSysUID(s.applySysUID) {
+	}
+}
+
+func (s *fsmWrapper) getLastApplied() uint64 {
+	return atomic.LoadUint64(&s.lastApplied)
+}
+func (s *fsmWrapper) setLastApplied(uid uint64) {
+	atomic.StoreUint64(&s.lastApplied, uid)
+}
+func (s *fsmWrapper) incrLastAppliedTo(uid uint64) bool {
+	return atomic.CompareAndSwapUint64(&s.lastApplied, uid-1, uid)
 }
 
 type snapshotWrapper struct {

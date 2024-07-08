@@ -1,0 +1,22 @@
+syntax = "proto3";
+package quasar.v1;
+
+option go_package = "github.com/tehsphinx/quasar/pb";
+
+message DiscoverPing {
+  ServerInfo sender = 1;
+  bool is_response = 2;
+}
+
+message ServerInfo {
+  string server_id = 1;
+  string server_address = 2;
+  ServerSuffrage suffrage = 3;
+}
+
+enum ServerSuffrage {
+  VOTER = 0;
+  NONVOTER = 1;
+  // Deprecated
+  STAGING = 2;
+}

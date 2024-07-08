@@ -3,7 +3,6 @@ package quasar
 import (
 	"errors"
 	"io"
-	"sync"
 
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
@@ -12,20 +11,26 @@ import (
 )
 
 func newKeyValueFSM(kv stores.KVStore) *kvFSM {
-	mutex := &sync.Mutex{}
 	return &kvFSM{
 		KVStore: kv,
-		condM:   mutex,
-		cond:    sync.NewCond(mutex),
 	}
 }
 
+var _ FSM = (*kvFSM)(nil)
+var _ logApplier = (*kvFSM)(nil)
+
 type kvFSM struct {
 	stores.KVStore
+	fsm *FSMInjector
+}
 
-	lastApplied uint64
-	condM       *sync.Mutex
-	cond        *sync.Cond
+func (s *kvFSM) Inject(fsm *FSMInjector) {
+	s.fsm = fsm
+}
+
+func (s *kvFSM) ApplyCmd([]byte) error {
+	// should never be called as we implement Apply function.
+	return nil
 }
 
 func (s *kvFSM) Apply(log *raft.Log) interface{} {
@@ -35,8 +40,6 @@ func (s *kvFSM) Apply(log *raft.Log) interface{} {
 	}
 
 	resp, respErr := s.apply(log, &cmd)
-
-	s.uidApplied(log.Index)
 
 	return applyResponse{
 		resp: resp,
@@ -66,21 +69,4 @@ func (s *kvFSM) Restore(snapshot io.ReadCloser) error {
 func (s *kvFSM) store(uid uint64, cmd *pb.Store) (*pb.CommandResponse, error) {
 	err := s.Store(cmd.Key, cmd.Data)
 	return respStore(&pb.StoreResponse{Uid: uid}), err
-}
-
-func (s *kvFSM) WaitFor(uid uint64) {
-	s.condM.Lock()
-	defer s.condM.Unlock()
-
-	for s.lastApplied < uid {
-		s.cond.Wait()
-	}
-}
-
-func (s *kvFSM) uidApplied(uid uint64) {
-	s.condM.Lock()
-	defer s.condM.Unlock()
-
-	s.lastApplied = uid
-	s.cond.Broadcast()
 }

@@ -9,16 +9,16 @@ func NewKVCache(ctx context.Context, opts ...Option) (*KVCache, error) {
 
 	fsm := newKeyValueFSM(cfg.kv)
 
-	cache, err := newCache(ctx, fsm, opts...)
+	cache, err := newCache(ctx, wrapFSM(fsm), opts...)
 	if err != nil {
 		return nil, err
 	}
+	fsm.Inject(&FSMInjector{cache: cache})
 
-	c := &KVCache{
+	return &KVCache{
 		Cache: cache,
 		fsm:   fsm,
-	}
-	return c, nil
+	}, nil
 }
 
 type KVCache struct {
@@ -42,7 +42,7 @@ func (s *KVCache) Load(key string, opts ...LoadOption) ([]byte, error) {
 		}
 		uid = id
 	}
-	s.fsm.WaitFor(uid)
+	s.Cache.fsm.WaitFor(uid)
 
 	return s.fsm.Load(key)
 }
@@ -51,27 +51,8 @@ func (s *KVCache) LoadLocal(key string, opts ...LoadOption) ([]byte, error) {
 	cfg := getLoadOptions(opts)
 
 	if cfg.waitFor != 0 {
-		s.fsm.WaitFor(cfg.waitFor)
+		s.Cache.fsm.WaitFor(cfg.waitFor)
 	}
 
 	return s.fsm.Load(key)
 }
-
-// func (s *KVCache) observeLeader(ctx context.Context, change chan raft.Observation) {
-// 	var obs raft.Observation
-// 	for {
-// 		select {
-// 		case <-ctx.Done():
-// 			return
-// 		case obs = <-change:
-// 		}
-//
-// 		leaderObs, ok := obs.Data.(raft.LeaderObservation)
-// 		if !ok {
-// 			continue
-// 		}
-// 		_ = leaderObs
-//
-// 		s.transport.SetLeader(leaderObs.LeaderID, leaderObs.LeaderAddr)
-// 	}
-// }

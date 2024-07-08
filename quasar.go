@@ -27,47 +27,64 @@ func NewCache(ctx context.Context, fsm FSM, opts ...Option) (*Cache, error) {
 	return cache, err
 }
 
-func newCache(ctx context.Context, fsm cacheFSM, opts ...Option) (*Cache, error) {
+func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, error) {
 	cfg := getOptions(opts)
+
+	c := &Cache{
+		name:     cfg.cacheName,
+		localID:  cfg.localID,
+		fsm:      fsm,
+		suffrage: cfg.suffrage,
+	}
 
 	transport, err := getTransport(cfg)
 	if err != nil {
 		return nil, err
 	}
+	c.transport = transport
 
-	rft, err := getRaft(cfg, fsm, transport)
+	discovery := newDiscoveryInjector(c)
+	c.discovery = discovery
+	if cfg.discovery != nil {
+		cfg.discovery.Inject(discovery)
+		if e := cfg.discovery.Run(ctx); e != nil {
+			return nil, e
+		}
+	}
+
+	logStore := wrapStore(raft.NewInmemStore(), fsm)
+
+	rft, err := getRaft(cfg, fsm, logStore, transport, discovery)
 	if err != nil {
 		return nil, err
 	}
-
-	chLeaderChange := make(chan raft.Observation, 3)
-	observer := raft.NewObserver(chLeaderChange, true, func(o *raft.Observation) bool {
-		_, ok := o.Data.(raft.LeaderObservation)
-		return ok
-	})
-	rft.RegisterObserver(observer)
-
-	c := &Cache{
-		localID: cfg.localID,
-		// kv:        cfg.kv,
-		fsm:       fsm,
-		raft:      rft,
-		transport: transport,
-	}
+	c.raft = rft
+	fsm.SetRaft(rft)
+	discovery.regObservation(rft)
 
 	go c.consume(transport.CacheConsumer())
-	// go c.observeLeader(ctx, chLeaderChange)
 	return c, nil
 }
 
 type Cache struct {
+	name    string
 	localID string
 
-	fsm cacheFSM
+	fsm *fsmWrapper
 	// kv  stores.KVStore
 
 	raft      *raft.Raft
 	transport transports.Transport
+	discovery *DiscoveryInjector
+	suffrage  raft.ServerSuffrage
+}
+
+func (s *Cache) serverInfo() raft.Server {
+	return raft.Server{
+		ID:       raft.ServerID(s.localID),
+		Address:  s.transport.LocalAddr(),
+		Suffrage: s.suffrage,
+	}
 }
 
 func (s *Cache) store(key string, data []byte) (uint64, error) {
@@ -156,6 +173,7 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 			return ctx.Err()
 		default:
 		}
+		time.Sleep(10 * time.Millisecond)
 
 		_, id := s.raft.LeaderWithID()
 		if id != "" {

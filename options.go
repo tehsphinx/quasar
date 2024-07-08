@@ -12,7 +12,8 @@ import (
 type Option func(*options)
 
 type options struct {
-	localID string
+	cacheName string
+	localID   string
 
 	bindAddr      string
 	extAddr       net.Addr
@@ -20,21 +21,24 @@ type options struct {
 	transport     transports.Transport
 
 	raftConfig *raft.Config
+	suffrage   raft.ServerSuffrage
 	bootstrap  bool
 	servers    []raft.Server
+	discovery  Discovery
 
-	kv  stores.KVStore
-	fsm interface{}
+	kv stores.KVStore
 }
 
 func getOptions(opts []Option) options {
 	cfg := options{
-		localID:  uuid.NewString(),
-		bindAddr: ":28224",
+		cacheName: "default",
+		localID:   uuid.NewString(),
+		bindAddr:  ":28224",
 		extAddr: &net.TCPAddr{
 			IP:   net.ParseIP("127.0.0.1"),
 			Port: 28224,
 		},
+		suffrage: raft.Voter,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -43,6 +47,15 @@ func getOptions(opts []Option) options {
 		cfg.kv = stores.NewInMemKVStore()
 	}
 	return cfg
+}
+
+// WithName sets the name of the cache. This can be important for distinguishing
+// traffic of multiple caches in the same network, but might not be needed for all
+// transports or discoveries.
+func WithName(name string) Option {
+	return func(o *options) {
+		o.cacheName = name
+	}
 }
 
 // WithLocalID sets the id of this server. If not set a random UUID is used
@@ -86,6 +99,14 @@ func WithRaftTransport(transport raft.Transport) Option {
 	}
 }
 
+// WithSuffrage can be used to configure a cache instance to be a raft.Nonvoter.
+// If not set, it defaults to being a raft.Voter.
+func WithSuffrage(suffrage raft.ServerSuffrage) Option {
+	return func(o *options) {
+		o.suffrage = suffrage
+	}
+}
+
 // WithBootstrap bootstraps the server just with itself starting a one node
 // cluster of the cache.
 func WithBootstrap(bootstrap bool) Option {
@@ -99,6 +120,14 @@ func WithBootstrap(bootstrap bool) Option {
 func WithServers(servers []raft.Server) Option {
 	return func(o *options) {
 		o.servers = servers
+	}
+}
+
+// WithDiscovery can be used to pass in a server discovery. It's the discoveries
+// job to find existing services, add new ones and potentially remove lost ones.
+func WithDiscovery(discovery Discovery) Option {
+	return func(opt *options) {
+		opt.discovery = discovery
 	}
 }
 
