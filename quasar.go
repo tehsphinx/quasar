@@ -28,6 +28,7 @@ func NewCache(ctx context.Context, fsm FSM, opts ...Option) (*Cache, error) {
 }
 
 func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, error) {
+	ctx, closeCache := context.WithCancel(ctx)
 	cfg := getOptions(opts)
 
 	c := &Cache{
@@ -35,6 +36,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		localID:  cfg.localID,
 		fsm:      fsm,
 		suffrage: cfg.suffrage,
+		close:    closeCache,
 	}
 
 	transport, err := getTransport(cfg)
@@ -60,9 +62,9 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 	}
 	c.raft = rft
 	fsm.SetRaft(rft)
-	discovery.regObservation(rft)
+	discovery.regObservation(ctx, rft)
 
-	go c.consume(transport.CacheConsumer())
+	go c.consume(ctx, transport.CacheConsumer())
 	return c, nil
 }
 
@@ -77,6 +79,8 @@ type Cache struct {
 	transport transports.Transport
 	discovery *DiscoveryInjector
 	suffrage  raft.ServerSuffrage
+
+	close context.CancelFunc
 }
 
 func (s *Cache) serverInfo() raft.Server {
@@ -189,27 +193,38 @@ func (s *Cache) ForceSnapshot() error {
 	return future.Error()
 }
 
-func (s *Cache) consume(ch <-chan raft.RPC) {
-	for rpc := range ch {
-		var (
-			resp interface{}
-			err  error
-		)
-		switch cmd := rpc.Command.(type) {
-		case *pb.Store:
-			var uid uint64
-			uid, err = s.store(cmd.Key, cmd.Data)
-			resp = &pb.StoreResponse{Uid: uid}
-		case *pb.LatestUid:
-			uid := s.localLastIndex()
-			resp = &pb.LatestUidResponse{Uid: uid}
-		}
-		fmt.Printf("%+v\n", rpc)
-		rpc.RespChan <- raft.RPCResponse{
-			Response: resp,
-			Error:    err,
+func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case rpc := <-ch:
+			var (
+				resp interface{}
+				err  error
+			)
+			switch cmd := rpc.Command.(type) {
+			case *pb.Store:
+				var uid uint64
+				uid, err = s.store(cmd.Key, cmd.Data)
+				resp = &pb.StoreResponse{Uid: uid}
+			case *pb.LatestUid:
+				uid := s.localLastIndex()
+				resp = &pb.LatestUidResponse{Uid: uid}
+			}
+
+			rpc.RespChan <- raft.RPCResponse{
+				Response: resp,
+				Error:    err,
+			}
 		}
 	}
+}
+
+func (s *Cache) Shutdown() error {
+	s.close()
+
+	return s.raft.Shutdown().Error()
 }
 
 // func (s *Cache) observeLeader(ctx context.Context, change chan raft.Observation) {

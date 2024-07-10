@@ -15,6 +15,7 @@ import (
 	"github.com/tehsphinx/quasar/discoveries"
 	"github.com/tehsphinx/quasar/examples/generic/exampleFSM"
 	"github.com/tehsphinx/quasar/transports"
+	"go.uber.org/goleak"
 )
 
 func TestSingleCache(t *testing.T) {
@@ -580,4 +581,160 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 			}
 		})
 	}
+
+	err = cache1.Shutdown()
+	asrtMain.NoErr(err)
+	err = cache2.Shutdown()
+	asrtMain.NoErr(err)
+	err = cache3.Shutdown()
+	asrtMain.NoErr(err)
+	time.Sleep(100 * time.Millisecond)
+}
+
+func TestCacheDiscoveryRestart(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	type test struct {
+		name      string
+		storeVals []exampleFSM.Musician
+	}
+	tests := []test{
+		{
+			name: "sub test",
+			storeVals: []exampleFSM.Musician{
+				{
+					Name:        "Roberto",
+					Age:         43,
+					Instruments: []string{"violin", "guitar"},
+				},
+				{
+					Name:        "Angela",
+					Age:         24,
+					Instruments: []string{"piano", "flute"},
+				},
+				{
+					Name:        "Eva",
+					Age:         28,
+					Instruments: []string{"ukulele", "saxophone", "bass guitar"},
+				},
+			},
+		},
+	}
+
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelMain()
+
+	asrtMain := is.New(t)
+
+	nc1, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc2, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc3, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+	defer nc3.Close()
+
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
+	asrtMain.NoErr(err)
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
+	asrtMain.NoErr(err)
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
+	asrtMain.NoErr(err)
+
+	fsm1 := exampleFSM.NewInMemoryFSM()
+	fsm2 := exampleFSM.NewInMemoryFSM()
+	fsm3 := exampleFSM.NewInMemoryFSM()
+
+	discovery1 := discoveries.NewNATSDiscovery(nc1)
+	discovery2 := discoveries.NewNATSDiscovery(nc2)
+	discovery3 := discoveries.NewNATSDiscovery(nc3)
+
+	cache1, err := quasar.NewCache(ctxMain, fsm1,
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport1),
+		quasar.WithDiscovery(discovery1),
+	)
+	asrtMain.NoErr(err)
+
+	r := cache1.WaitReady(ctxMain)
+	asrtMain.NoErr(r)
+
+	for age := 0; age < 20; age++ {
+		cache2, e := quasar.NewCache(ctxMain, fsm2,
+			quasar.WithLocalID("cache2"),
+			quasar.WithTransport(transport2),
+			quasar.WithDiscovery(discovery2),
+		)
+		asrtMain.NoErr(e)
+
+		cache3, e := quasar.NewCache(ctxMain, fsm3,
+			quasar.WithTransport(transport3),
+			quasar.WithDiscovery(discovery3),
+		)
+		asrtMain.NoErr(e)
+
+		r = cache2.WaitReady(ctxMain)
+		asrtMain.NoErr(r)
+		e = cache3.WaitReady(ctxMain)
+		asrtMain.NoErr(e)
+		fmt.Println("WAIT DONE")
+
+		fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				for i, fsm := range fsms {
+					t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
+						asrtWrite := asrtMain.New(t)
+
+						for _, v := range tt.storeVals {
+							v.Age = age
+							r := fsm.SetMusician(v)
+							asrtWrite.NoErr(r)
+						}
+
+						for j, readFSM := range fsms {
+							t.Run("read cache "+strconv.Itoa(j), func(t *testing.T) {
+								asrtRead := asrtWrite.New(t)
+
+								for _, v := range tt.storeVals {
+									got, r := readFSM.GetMusicianMaster(v.Name)
+									asrtRead.NoErr(r)
+
+									v.Age = age
+									asrtRead.Equal(got, v)
+								}
+
+								for _, v := range tt.storeVals {
+									got, r := readFSM.GetMusicianLocal(v.Name)
+									asrtRead.NoErr(r)
+
+									v.Age = age
+									asrtRead.Equal(got, v)
+								}
+
+								for _, v := range tt.storeVals {
+									got, r := readFSM.GetMusicianKnownLatest(v.Name)
+									asrtRead.NoErr(r)
+
+									v.Age = age
+									asrtRead.Equal(got, v)
+								}
+							})
+						}
+					})
+				}
+			})
+		}
+		e = cache3.Shutdown()
+		asrtMain.NoErr(e)
+		e = cache2.Shutdown()
+		asrtMain.NoErr(e)
+	}
+
+	err = cache1.Shutdown()
+	asrtMain.NoErr(err)
+	time.Sleep(100 * time.Millisecond)
 }

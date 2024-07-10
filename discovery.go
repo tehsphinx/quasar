@@ -70,7 +70,7 @@ func (s *DiscoveryInjector) getAddServerFunc(voter bool) addServerFunc {
 	return s.cache.raft.AddNonvoter
 }
 
-func (s *DiscoveryInjector) regObservation(rft *raft.Raft) {
+func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) {
 	chPeerChange := make(chan raft.Observation, 5)
 	observer := raft.NewObserver(chPeerChange, true, func(o *raft.Observation) bool {
 		if _, ok := o.Data.(raft.PeerObservation); ok {
@@ -84,20 +84,24 @@ func (s *DiscoveryInjector) regObservation(rft *raft.Raft) {
 	rft.RegisterObserver(observer)
 
 	go func() {
-		// TODO: handle shutdown
-		for observation := range chPeerChange {
-			switch obs := observation.Data.(type) {
-			case raft.PeerObservation:
-				if obs.Removed {
-					s.removeApplied(obs.Peer.ID)
-					continue
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case observation := <-chPeerChange:
+				switch obs := observation.Data.(type) {
+				case raft.PeerObservation:
+					if obs.Removed {
+						s.removeApplied(obs.Peer.ID)
+						continue
+					}
+					s.setApplied(obs.Peer.ID)
+				case raft.LeaderObservation:
+					if obs.LeaderID != raft.ServerID(s.cache.localID) {
+						continue
+					}
+					go s.addMissingServers()
 				}
-				s.setApplied(obs.Peer.ID)
-			case raft.LeaderObservation:
-				if obs.LeaderID != raft.ServerID(s.cache.localID) {
-					continue
-				}
-				go s.addMissingServers()
 			}
 		}
 	}()
