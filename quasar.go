@@ -169,19 +169,33 @@ func (s *Cache) isLeader() bool {
 // WaitReady is a helper function to wait for the raft cluster to be ready.
 // Specifically it waits for a leader to be elected. The context can be used
 // to add a timeout or cancel waiting.
-// TODO: optimize e.g. based on observeLeader. Only recheck if there is a change.
 func (s *Cache) WaitReady(ctx context.Context) error {
+	if _, id := s.raft.LeaderWithID(); id != "" {
+		return nil
+	}
+
+	chChange := make(chan raft.Observation, 1)
+	observer := raft.NewObserver(chChange, true, func(o *raft.Observation) bool {
+		if _, ok := o.Data.(raft.LeaderObservation); ok {
+			return true
+		}
+		return false
+	})
+	s.raft.RegisterObserver(observer)
+	defer s.raft.DeregisterObserver(observer)
+
+	if _, id := s.raft.LeaderWithID(); id != "" {
+		return nil
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-		}
-		time.Sleep(10 * time.Millisecond)
-
-		_, id := s.raft.LeaderWithID()
-		if id != "" {
-			return nil
+		case <-chChange:
+			if _, id := s.raft.LeaderWithID(); id != "" {
+				return nil
+			}
 		}
 	}
 }
