@@ -1,6 +1,7 @@
 package quasar
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/hashicorp/raft"
@@ -45,9 +46,12 @@ func getRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, transport transp
 	return rft, nil
 }
 
-func getTransport(cfg options) (transports.Transport, error) {
+func getTransport(ctx context.Context, cfg options) (transports.Transport, error) {
 	if cfg.transport != nil {
 		return cfg.transport, nil
+	}
+	if cfg.nc != nil {
+		return transports.NewNATSTransport(ctx, cfg.nc, cfg.cacheName, cfg.localID)
 	}
 
 	return transports.NewTCPTransport(cfg.bindAddr, cfg.extAddr)

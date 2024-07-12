@@ -39,7 +39,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		close:    closeCache,
 	}
 
-	transport, err := getTransport(cfg)
+	transport, err := getTransport(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}

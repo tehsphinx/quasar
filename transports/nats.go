@@ -18,7 +18,6 @@ const (
 	snapshotPkgTimout = 5 * time.Second
 )
 
-// TODO: cacheName and serverName should be set by the cache
 func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverName string, opts ...NATSOption) (*NATSTransport, error) {
 	config := getNATSOptions(opts)
 

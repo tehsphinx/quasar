@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/raft"
+	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar/stores"
 	"github.com/tehsphinx/quasar/transports"
 )
@@ -15,10 +16,10 @@ type options struct {
 	cacheName string
 	localID   string
 
-	bindAddr      string
-	extAddr       net.Addr
-	raftTransport raft.Transport
-	transport     transports.Transport
+	bindAddr  string
+	extAddr   net.Addr
+	nc        *nats.Conn
+	transport transports.Transport
 
 	raftConfig *raft.Config
 	suffrage   raft.ServerSuffrage
@@ -74,28 +75,27 @@ func WithKVStore(kv stores.KVStore) Option {
 	}
 }
 
-// WithTCPTransport provides a simplified way to use tcp based RAFT communication.
-// See WithCustomRaft for a completely customizable option.
-func WithTCPTransport(bindAddr string, extAddr net.Addr) Option {
-	return func(o *options) {
-		o.bindAddr = bindAddr
-		o.extAddr = extAddr
-	}
-}
-
 // WithTransport provides a way to set a custom transport. Using this option
-// overrides usage of WithTCPTransport.
+// ignores usage of WithTCPTransport and WithNatsTransport.
 func WithTransport(transport transports.Transport) Option {
 	return func(o *options) {
 		o.transport = transport
 	}
 }
 
-// WithRaftTransport provides a way to set a custom raft transport only.
-// The raftPort of WithTCPTransport is ignored if this is provided.
-func WithRaftTransport(transport raft.Transport) Option {
+// WithNatsTransport provides a simplified way to use NATS based RAFT communication.
+// Using this option ignores usage of WithTCPTransport.
+func WithNatsTransport(nc *nats.Conn) Option {
 	return func(o *options) {
-		o.raftTransport = transport
+		o.nc = nc
+	}
+}
+
+// WithTCPTransport provides a simplified way to use tcp based RAFT communication.
+func WithTCPTransport(bindAddr string, extAddr net.Addr) Option {
+	return func(o *options) {
+		o.bindAddr = bindAddr
+		o.extAddr = extAddr
 	}
 }
 
