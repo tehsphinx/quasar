@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -237,6 +238,10 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 
 func (s *Cache) Shutdown() error {
 	s.close()
+
+	if trans, ok := s.transport.(io.Closer); ok {
+		_ = trans.Close()
+	}
 
 	return s.raft.Shutdown().Error()
 }

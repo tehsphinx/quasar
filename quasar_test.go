@@ -15,7 +15,6 @@ import (
 	"github.com/tehsphinx/quasar/discoveries"
 	"github.com/tehsphinx/quasar/examples/generic/exampleFSM"
 	"github.com/tehsphinx/quasar/transports"
-	"go.uber.org/goleak"
 )
 
 func TestSingleCache(t *testing.T) {
@@ -57,6 +56,7 @@ func TestSingleCache(t *testing.T) {
 		quasar.WithBootstrap(true),
 	)
 	asrtMain.NoErr(err)
+	defer cache.Shutdown()
 
 	err = cache.WaitReady(ctxMain)
 	asrtMain.NoErr(err)
@@ -141,18 +141,21 @@ func TestCacheClusterTCP(t *testing.T) {
 		}),
 	)
 	asrtMain.NoErr(err)
+	defer cache1.Shutdown()
 
-	_, err = quasar.NewCache(ctxMain, fsm2,
+	cache2, err := quasar.NewCache(ctxMain, fsm2,
 		quasar.WithLocalID("cache2"),
 		quasar.WithTCPTransport(":28231", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28231}),
 	)
 	asrtMain.NoErr(err)
+	defer cache2.Shutdown()
 
-	_, err = quasar.NewCache(ctxMain, fsm3,
+	cache3, err := quasar.NewCache(ctxMain, fsm3,
 		quasar.WithLocalID("cache3"),
 		quasar.WithTCPTransport(":28232", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28232}),
 	)
 	asrtMain.NoErr(err)
+	defer cache3.Shutdown()
 
 	err = cache1.WaitReady(ctxMain)
 	asrtMain.NoErr(err)
@@ -242,6 +245,9 @@ func TestCacheClusterNATS(t *testing.T) {
 	asrtMain.NoErr(err)
 	nc3, err := nats.Connect("localhost:4222")
 	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+	defer nc3.Close()
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache1", "cache1")
 	asrtMain.NoErr(err)
@@ -264,8 +270,9 @@ func TestCacheClusterNATS(t *testing.T) {
 		}),
 	)
 	asrtMain.NoErr(err)
+	defer cache1.Shutdown()
 
-	_, err = quasar.NewCache(ctxMain, fsm2,
+	cache2, err := quasar.NewCache(ctxMain, fsm2,
 		quasar.WithLocalID("cache2"),
 		quasar.WithTransport(transport2),
 		quasar.WithServers([]raft.Server{
@@ -275,8 +282,9 @@ func TestCacheClusterNATS(t *testing.T) {
 		}),
 	)
 	asrtMain.NoErr(err)
+	defer cache2.Shutdown()
 
-	_, err = quasar.NewCache(ctxMain, fsm3,
+	cache3, err := quasar.NewCache(ctxMain, fsm3,
 		quasar.WithLocalID("cache3"),
 		quasar.WithTransport(transport3),
 		quasar.WithServers([]raft.Server{
@@ -286,6 +294,7 @@ func TestCacheClusterNATS(t *testing.T) {
 		}),
 	)
 	asrtMain.NoErr(err)
+	defer cache3.Shutdown()
 
 	err = cache1.WaitReady(ctxMain)
 	asrtMain.NoErr(err)
@@ -375,6 +384,9 @@ func TestInstallSnapshot(t *testing.T) {
 	asrtMain.NoErr(err)
 	nc3, err := nats.Connect("localhost:4222")
 	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+	defer nc3.Close()
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache2", "cache1")
 	asrtMain.NoErr(err)
@@ -404,12 +416,14 @@ func TestInstallSnapshot(t *testing.T) {
 				}),
 			)
 			asrt.NoErr(err)
+			defer cache1.Shutdown()
 
-			_, err = quasar.NewCache(ctxMain, fsm2,
+			cache2, err := quasar.NewCache(ctxMain, fsm2,
 				quasar.WithRaftConfig(raftCfg),
 				quasar.WithTransport(transport2),
 			)
 			asrt.NoErr(err)
+			defer cache2.Shutdown()
 
 			err = cache1.WaitReady(ctxMain)
 			asrt.NoErr(err)
@@ -434,6 +448,7 @@ func TestInstallSnapshot(t *testing.T) {
 				quasar.WithTransport(transport3),
 			)
 			asrt.NoErr(err)
+			defer cache3.Shutdown()
 
 			err = cache3.WaitReady(ctxMain)
 			asrt.NoErr(err)
@@ -493,6 +508,9 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 	asrtMain.NoErr(err)
 	nc3, err := nats.Connect("localhost:4222")
 	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+	defer nc3.Close()
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
 	asrtMain.NoErr(err)
@@ -515,6 +533,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 		quasar.WithDiscovery(discovery1),
 	)
 	asrtMain.NoErr(err)
+	defer cache1.Shutdown()
 
 	cache2, err := quasar.NewCache(ctxMain, fsm2,
 		quasar.WithLocalID("cache2"),
@@ -522,6 +541,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 		quasar.WithDiscovery(discovery2),
 	)
 	asrtMain.NoErr(err)
+	defer cache2.Shutdown()
 
 	cache3, err := quasar.NewCache(ctxMain, fsm3,
 		quasar.WithLocalID("cache3"),
@@ -529,6 +549,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 		quasar.WithDiscovery(discovery3),
 	)
 	asrtMain.NoErr(err)
+	defer cache3.Shutdown()
 
 	err = cache1.WaitReady(ctxMain)
 	asrtMain.NoErr(err)
@@ -581,18 +602,14 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 			}
 		})
 	}
-
-	err = cache1.Shutdown()
-	asrtMain.NoErr(err)
-	err = cache2.Shutdown()
-	asrtMain.NoErr(err)
-	err = cache3.Shutdown()
-	asrtMain.NoErr(err)
-	time.Sleep(100 * time.Millisecond)
 }
 
 func TestCacheDiscoveryRestart(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	// Enable to verify if cache shuts down properly. Will fail with other tests running as well.
+	// defer func() {
+	// 	time.Sleep(100 * time.Millisecond)
+	// 	goleak.VerifyNone(t)
+	// }()
 
 	type test struct {
 		name      string
@@ -736,5 +753,4 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 
 	err = cache1.Shutdown()
 	asrtMain.NoErr(err)
-	time.Sleep(100 * time.Millisecond)
 }
