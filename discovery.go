@@ -2,6 +2,7 @@ package quasar
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -52,7 +53,10 @@ func (s *DiscoveryInjector) ProcessServer(srv raft.Server) {
 }
 
 func (s *DiscoveryInjector) addServer(srv raft.Server) error {
-	addServerFn := s.getAddServerFunc(srv.Suffrage == raft.Voter)
+	addServerFn, err := s.getAddServerFunc(srv.Suffrage == raft.Voter)
+	if err != nil {
+		return err
+	}
 
 	fut := addServerFn(srv.ID, srv.Address, 0, 0)
 	if err := fut.Error(); err != nil {
@@ -63,11 +67,14 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 
 type addServerFunc func(id raft.ServerID, address raft.ServerAddress, prevIndex uint64, timeout time.Duration) raft.IndexFuture
 
-func (s *DiscoveryInjector) getAddServerFunc(voter bool) addServerFunc {
-	if voter {
-		return s.cache.raft.AddVoter
+func (s *DiscoveryInjector) getAddServerFunc(voter bool) (addServerFunc, error) {
+	if s.cache.raft == nil {
+		return nil, errors.New("raft not set (yet)")
 	}
-	return s.cache.raft.AddNonvoter
+	if voter {
+		return s.cache.raft.AddVoter, nil
+	}
+	return s.cache.raft.AddNonvoter, nil
 }
 
 func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) {
@@ -108,7 +115,7 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 }
 
 func (s *DiscoveryInjector) addMissingServers() {
-	for _, srv := range s.servers {
+	for _, srv := range s.getServers() {
 		if s.hasApplied(srv.ID) {
 			continue
 		}
