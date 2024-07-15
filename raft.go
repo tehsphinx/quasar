@@ -54,5 +54,10 @@ func getTransport(ctx context.Context, cfg options) (transports.Transport, error
 		return transports.NewNATSTransport(ctx, cfg.nc, cfg.cacheName, cfg.localID)
 	}
 
-	return transports.NewTCPTransport(cfg.bindAddr, cfg.extAddr)
+	if cfg.bindAddr != "" {
+		return transports.NewTCPTransport(cfg.bindAddr, cfg.extAddr)
+	}
+
+	_, inMemTransport := transports.NewInmemTransport("")
+	return inMemTransport, nil
 }

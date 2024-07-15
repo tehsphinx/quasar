@@ -34,12 +34,7 @@ func getOptions(opts []Option) options {
 	cfg := options{
 		cacheName: "default",
 		localID:   uuid.NewString(),
-		bindAddr:  ":28224",
-		extAddr: &net.TCPAddr{
-			IP:   net.ParseIP("127.0.0.1"),
-			Port: 28224,
-		},
-		suffrage: raft.Voter,
+		suffrage:  raft.Voter,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -93,6 +88,15 @@ func WithNatsTransport(nc *nats.Conn) Option {
 
 // WithTCPTransport provides a simplified way to use tcp based RAFT communication.
 func WithTCPTransport(bindAddr string, extAddr net.Addr) Option {
+	if bindAddr == "" {
+		bindAddr = ":28224"
+	}
+	if extAddr == nil {
+		extAddr = &net.TCPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 28224,
+		}
+	}
 	return func(o *options) {
 		o.bindAddr = bindAddr
 		o.extAddr = extAddr
