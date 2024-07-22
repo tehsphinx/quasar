@@ -93,24 +93,24 @@ func TestKVCacheClusterTCP(t *testing.T) {
 
 	cache1, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache1"),
-		quasar.WithTCPTransport(":28230", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28230}),
+		quasar.WithTCPTransport(":28233", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28233}),
 		quasar.WithServers([]raft.Server{
-			{ID: "cache1", Address: "localhost:28230"},
-			{ID: "cache2", Address: "localhost:28231"},
-			{ID: "cache3", Address: "localhost:28232"},
+			{ID: "cache1", Address: "localhost:28233"},
+			{ID: "cache2", Address: "localhost:28234"},
+			{ID: "cache3", Address: "localhost:28235"},
 		}),
 	)
 	asrtMain.NoErr(err)
 
 	cache2, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache2"),
-		quasar.WithTCPTransport(":28231", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28231}),
+		quasar.WithTCPTransport(":28234", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28234}),
 	)
 	asrtMain.NoErr(err)
 
 	cache3, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache3"),
-		quasar.WithTCPTransport(":28232", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28232}),
+		quasar.WithTCPTransport(":28235", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28235}),
 	)
 	asrtMain.NoErr(err)
 
