@@ -56,7 +56,7 @@ type NATSTransport struct {
 
 func (s *NATSTransport) listen(ctx context.Context) error {
 	subjPrefix := fmt.Sprintf("quasar.%s.%s", s.cacheName, s.serverName)
-	fmt.Println("server =", s.serverName, " subjPrefix =", subjPrefix)
+	// fmt.Println("server =", s.serverName, " subjPrefix =", subjPrefix)
 
 	subEntries, err := s.conn.Subscribe(subjPrefix+".entries.append", s.handleEntries)
 	if err != nil {

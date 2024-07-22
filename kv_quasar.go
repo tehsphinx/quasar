@@ -42,7 +42,8 @@ func (s *KVCache) Load(key string, opts ...LoadOption) ([]byte, error) {
 		}
 		uid = id
 	}
-	s.Cache.fsm.WaitFor(uid)
+	// TODO: expose context as LoadOption
+	s.Cache.fsm.WaitFor(context.TODO(), uid)
 
 	return s.fsm.Load(key)
 }
@@ -51,7 +52,8 @@ func (s *KVCache) LoadLocal(key string, opts ...LoadOption) ([]byte, error) {
 	cfg := getLoadOptions(opts)
 
 	if cfg.waitFor != 0 {
-		s.Cache.fsm.WaitFor(cfg.waitFor)
+		// TODO: expose context as LoadOption
+		s.Cache.fsm.WaitFor(context.TODO(), cfg.waitFor)
 	}
 
 	return s.fsm.Load(key)

@@ -1,28 +1,29 @@
 package quasar
 
+import (
+	"context"
+)
+
 type FSMInjector struct {
 	cache *Cache
 }
 
-// TODO: add a context and apply a possible timeout being set.
-func (s *FSMInjector) WaitFor(uid uint64) {
-	s.cache.fsm.WaitFor(uid)
+func (s *FSMInjector) WaitFor(ctx context.Context, uid uint64) error {
+	return s.cache.fsm.WaitFor(ctx, uid)
 }
 
-// TODO: add a context and apply a possible timeout being set.
-func (s *FSMInjector) WaitForMasterLatest() error {
+func (s *FSMInjector) WaitForMasterLatest(ctx context.Context) error {
+	// TODO: add context to masterLastIndex
 	uid, err := s.cache.masterLastIndex()
 	if err != nil {
 		return err
 	}
-	s.cache.fsm.WaitFor(uid)
-	return nil
+	return s.cache.fsm.WaitFor(ctx, uid)
 }
 
-// TODO: add a context and apply a possible timeout being set.
-func (s *FSMInjector) WaitForKnownLatest() {
+func (s *FSMInjector) WaitForKnownLatest(ctx context.Context) error {
 	uid := s.cache.raft.LastIndex()
-	s.cache.fsm.WaitFor(uid)
+	return s.cache.fsm.WaitFor(ctx, uid)
 }
 
 func (s *FSMInjector) Store(bts []byte) (uint64, error) {

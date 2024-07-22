@@ -1,6 +1,7 @@
 package quasar
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/hashicorp/raft"
+	"github.com/tehsphinx/quasar/cond"
 	"github.com/tehsphinx/quasar/pb/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -28,7 +30,7 @@ func wrapFSM(fsm FSM) *fsmWrapper {
 	s := &fsmWrapper{
 		fsm:   fsm,
 		condM: mutex,
-		cond:  sync.NewCond(mutex),
+		cond:  cond.New(mutex),
 	}
 	if _, ok := fsm.(logApplier); ok {
 		s.isLogApplier = true
@@ -44,7 +46,7 @@ type fsmWrapper struct {
 	sysUIDsM    sync.Mutex
 	sysUIDs     []uint64
 	condM       *sync.Mutex
-	cond        *sync.Cond
+	cond        *cond.Cond
 
 	isLogApplier bool
 }
@@ -112,14 +114,14 @@ func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
 	if n != len(bts) {
 		return errors.New("failed to parse lastApplied: not enough bytes found")
 	}
-	uid := uint64FromBytes(bts)
+	// uuid from snapshot + 1 for restore operation
+	uid := uint64FromBytes(bts) + 1
 
 	if r := s.fsm.Restore(snapshot); r != nil {
 		return r
 	}
 
-	s.setLastApplied(uid)
-	s.cond.Broadcast()
+	s.uidApplied(uid)
 	return nil
 }
 
@@ -128,13 +130,31 @@ func (s *fsmWrapper) store(log *raft.Log, cmd *pb.Store) (*pb.CommandResponse, e
 	return respStore(&pb.StoreResponse{Uid: log.Index}), err
 }
 
-func (s *fsmWrapper) WaitFor(uid uint64) {
+func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		<-ctx.Done()
+		if err := ctx.Err(); err != nil {
+			// wake up condition to be able to abort
+			s.cond.Broadcast()
+		}
+	}()
+
 	s.condM.Lock()
 	defer s.condM.Unlock()
 
 	for s.getLastApplied() < uid {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		s.cond.Wait()
 	}
+	return nil
 }
 
 func (s *fsmWrapper) uidApplied(uid uint64) {
@@ -150,6 +170,10 @@ func (s *fsmWrapper) uidApplied(uid uint64) {
 
 func (s *fsmWrapper) regSystemUID(uid uint64) {
 	if applied := s.applySysUID(uid); applied {
+		s.condM.Lock()
+		defer s.condM.Unlock()
+
+		s.cond.Broadcast()
 		return
 	}
 

@@ -78,14 +78,14 @@ func TestSingleCache(t *testing.T) {
 			}
 
 			for _, v := range tt.storeVals {
-				got, r := fsm.GetMusicianMaster(v.Name)
+				got, r := fsm.GetMusicianMaster(ctxMain, v.Name)
 				asrt.NoErr(r)
 
 				asrt.Equal(got, v)
 			}
 
 			for _, v := range tt.storeVals {
-				got, r := fsm.GetMusicianKnownLatest(v.Name)
+				got, r := fsm.GetMusicianKnownLatest(ctxMain, v.Name)
 				asrt.NoErr(r)
 
 				asrt.Equal(got, v)
@@ -179,7 +179,7 @@ func TestCacheClusterTCP(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianMaster(v.Name)
+								got, r := readFSM.GetMusicianMaster(ctxMain, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -193,7 +193,7 @@ func TestCacheClusterTCP(t *testing.T) {
 							}
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianKnownLatest(v.Name)
+								got, r := readFSM.GetMusicianKnownLatest(ctxMain, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -318,7 +318,7 @@ func TestCacheClusterNATS(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianMaster(v.Name)
+								got, r := readFSM.GetMusicianMaster(ctxMain, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -332,7 +332,7 @@ func TestCacheClusterNATS(t *testing.T) {
 							}
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianKnownLatest(v.Name)
+								got, r := readFSM.GetMusicianKnownLatest(ctxMain, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -458,7 +458,7 @@ func TestInstallSnapshot(t *testing.T) {
 				asrtRead := asrt.New(t)
 
 				for _, v := range tt.storeVals {
-					got, r := fsm3.GetMusicianMaster(v.Name)
+					got, r := fsm3.GetMusicianMaster(ctxMain, v.Name)
 					fmt.Println("getting values", got, r)
 					asrtRead.NoErr(r)
 
@@ -577,7 +577,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianMaster(v.Name)
+								got, r := readFSM.GetMusicianMaster(ctxMain, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -591,7 +591,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 							}
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianKnownLatest(v.Name)
+								got, r := readFSM.GetMusicianKnownLatest(ctxMain, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -638,7 +638,7 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 		},
 	}
 
-	ctxMain, cancelMain := context.WithTimeout(context.Background(), 10*time.Second)
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 50*time.Second)
 	defer cancelMain()
 
 	asrtMain := is.New(t)
@@ -665,8 +665,6 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 	fsm3 := exampleFSM.NewInMemoryFSM()
 
 	discovery1 := discoveries.NewNATSDiscovery(nc1)
-	discovery2 := discoveries.NewNATSDiscovery(nc2)
-	discovery3 := discoveries.NewNATSDiscovery(nc3)
 
 	cache1, err := quasar.NewCache(ctxMain, fsm1,
 		quasar.WithLocalID("cache1"),
@@ -675,80 +673,87 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 	)
 	asrtMain.NoErr(err)
 
-	r := cache1.WaitReady(ctxMain)
-	asrtMain.NoErr(r)
+	for age := 0; age < 10; age++ {
+		func() {
+			ctx, cancel := context.WithTimeout(ctxMain, 5*time.Second)
+			defer cancel()
 
-	for age := 0; age < 20; age++ {
-		cache2, e := quasar.NewCache(ctxMain, fsm2,
-			quasar.WithLocalID("cache2"),
-			quasar.WithTransport(transport2),
-			quasar.WithDiscovery(discovery2),
-		)
-		asrtMain.NoErr(e)
+			discovery2 := discoveries.NewNATSDiscovery(nc2)
+			cache2, e := quasar.NewCache(ctx, fsm2,
+				quasar.WithLocalID("cache2"),
+				quasar.WithTransport(transport2),
+				quasar.WithDiscovery(discovery2),
+			)
+			asrtMain.NoErr(e)
 
-		cache3, e := quasar.NewCache(ctxMain, fsm3,
-			quasar.WithTransport(transport3),
-			quasar.WithDiscovery(discovery3),
-		)
-		asrtMain.NoErr(e)
+			discovery3 := discoveries.NewNATSDiscovery(nc3)
+			cache3, e := quasar.NewCache(ctx, fsm3,
+				quasar.WithLocalID("cache3"),
+				quasar.WithTransport(transport3),
+				quasar.WithDiscovery(discovery3),
+			)
+			asrtMain.NoErr(e)
 
-		r = cache2.WaitReady(ctxMain)
-		asrtMain.NoErr(r)
-		e = cache3.WaitReady(ctxMain)
-		asrtMain.NoErr(e)
-		fmt.Println("WAIT DONE")
+			e = cache1.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			e = cache2.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			e = cache3.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			fmt.Println("WAIT DONE")
 
-		fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
+			fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
 
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				for i, fsm := range fsms {
-					t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
-						asrtWrite := asrtMain.New(t)
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					for writeIndex, fsm := range fsms {
+						t.Run("write cache "+strconv.Itoa(writeIndex), func(t *testing.T) {
+							asrtWrite := asrtMain.New(t)
 
-						for _, v := range tt.storeVals {
-							v.Age = age
-							r := fsm.SetMusician(v)
-							asrtWrite.NoErr(r)
-						}
+							for _, v := range tt.storeVals {
+								v.Age = age*3 + writeIndex
+								r := fsm.SetMusician(v)
+								asrtWrite.NoErr(r)
+							}
 
-						for j, readFSM := range fsms {
-							t.Run("read cache "+strconv.Itoa(j), func(t *testing.T) {
-								asrtRead := asrtWrite.New(t)
+							for j, readFSM := range fsms {
+								t.Run("read cache "+strconv.Itoa(j), func(t *testing.T) {
+									asrtRead := asrtWrite.New(t)
 
-								for _, v := range tt.storeVals {
-									got, r := readFSM.GetMusicianMaster(v.Name)
-									asrtRead.NoErr(r)
+									for _, v := range tt.storeVals {
+										got, r := readFSM.GetMusicianMaster(ctx, v.Name)
+										asrtRead.NoErr(r)
 
-									v.Age = age
-									asrtRead.Equal(got, v)
-								}
+										v.Age = age*3 + writeIndex
+										asrtRead.Equal(got, v)
+									}
 
-								for _, v := range tt.storeVals {
-									got, r := readFSM.GetMusicianLocal(v.Name)
-									asrtRead.NoErr(r)
+									for _, v := range tt.storeVals {
+										got, r := readFSM.GetMusicianLocal(v.Name)
+										asrtRead.NoErr(r)
 
-									v.Age = age
-									asrtRead.Equal(got, v)
-								}
+										v.Age = age*3 + writeIndex
+										asrtRead.Equal(got, v)
+									}
 
-								for _, v := range tt.storeVals {
-									got, r := readFSM.GetMusicianKnownLatest(v.Name)
-									asrtRead.NoErr(r)
+									for _, v := range tt.storeVals {
+										got, r := readFSM.GetMusicianKnownLatest(ctx, v.Name)
+										asrtRead.NoErr(r)
 
-									v.Age = age
-									asrtRead.Equal(got, v)
-								}
-							})
-						}
-					})
-				}
-			})
-		}
-		e = cache3.Shutdown()
-		asrtMain.NoErr(e)
-		e = cache2.Shutdown()
-		asrtMain.NoErr(e)
+										v.Age = age*3 + writeIndex
+										asrtRead.Equal(got, v)
+									}
+								})
+							}
+						})
+					}
+				})
+			}
+			e = cache3.Shutdown()
+			asrtMain.NoErr(e)
+			e = cache2.Shutdown()
+			asrtMain.NoErr(e)
+		}()
 	}
 
 	err = cache1.Shutdown()

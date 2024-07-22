@@ -2,6 +2,7 @@ package exampleFSM
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,8 +75,8 @@ func (s *InMemoryFSM) SetMusician(musician Musician) error {
 // first to get the latest uid the master has accepted and then waits for that uid to be applied
 // locally. Only then it uses GetMusicianLocal to read the value from local cache. This way
 // it makes sure that the node is properly connected to the RAFT network and not behind.
-func (s *InMemoryFSM) GetMusicianMaster(name string) (Musician, error) {
-	if err := s.fsm.WaitForMasterLatest(); err != nil {
+func (s *InMemoryFSM) GetMusicianMaster(ctx context.Context, name string) (Musician, error) {
+	if err := s.fsm.WaitForMasterLatest(ctx); err != nil {
 		return Musician{}, err
 	}
 	return s.GetMusicianLocal(name)
@@ -86,8 +87,10 @@ func (s *InMemoryFSM) GetMusicianMaster(name string) (Musician, error) {
 // to read the value from local cache. This way it makes sure that all known uids are applied first
 // before reading. It does not however make sure the node is properly connected. It might not receive
 // updates from the master anymore.
-func (s *InMemoryFSM) GetMusicianKnownLatest(name string) (Musician, error) {
-	s.fsm.WaitForKnownLatest()
+func (s *InMemoryFSM) GetMusicianKnownLatest(ctx context.Context, name string) (Musician, error) {
+	if err := s.fsm.WaitForKnownLatest(ctx); err != nil {
+		return Musician{}, err
+	}
 	return s.GetMusicianLocal(name)
 }
 

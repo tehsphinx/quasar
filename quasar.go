@@ -48,12 +48,6 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 
 	discovery := newDiscoveryInjector(c)
 	c.discovery = discovery
-	if cfg.discovery != nil {
-		cfg.discovery.Inject(discovery)
-		if e := cfg.discovery.Run(ctx); e != nil {
-			return nil, e
-		}
-	}
 
 	logStore := wrapStore(raft.NewInmemStore(), fsm)
 
@@ -64,6 +58,13 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 	c.raft = rft
 	fsm.SetRaft(rft)
 	discovery.regObservation(ctx, rft)
+
+	if cfg.discovery != nil {
+		cfg.discovery.Inject(discovery)
+		if e := cfg.discovery.Run(ctx); e != nil {
+			return nil, e
+		}
+	}
 
 	go c.consume(ctx, transport.CacheConsumer())
 	return c, nil
@@ -154,9 +155,15 @@ func (s *Cache) applyRemote(command *pb.Command) (*pb.CommandResponse, uint64, e
 	switch cmd := command.GetCmd().(type) {
 	case *pb.Command_Store:
 		resp, err := s.transport.Store(id, addr, cmd.Store)
+		if err != nil {
+			return nil, 0, err
+		}
 		return respStore(resp), resp.Uid, err
 	case *pb.Command_LatestUid:
 		resp, err := s.transport.LatestUID(id, addr, cmd.LatestUid)
+		if err != nil {
+			return nil, 0, err
+		}
 		return respLatestUID(resp), resp.Uid, err
 	}
 
@@ -171,6 +178,32 @@ func (s *Cache) isLeader() bool {
 // Specifically it waits for a leader to be elected. The context can be used
 // to add a timeout or cancel waiting.
 func (s *Cache) WaitReady(ctx context.Context) error {
+	if err := s.waitForLeader(ctx); err != nil {
+		return err
+	}
+
+	if s.isLeader() {
+		// If we ourselves became leader, attempt leadership transfer.
+		// This way we avoid new cache taking leadership of older instances.
+		fut := s.raft.LeadershipTransfer()
+		if r := fut.Error(); r != nil {
+			// log error
+		}
+
+		if err := s.waitForLeader(ctx); err != nil {
+			return err
+		}
+	}
+
+	// wait for master index to be applied locally
+	uid, err := s.masterLastIndex()
+	if err != nil {
+		return err
+	}
+	return s.fsm.WaitFor(ctx, uid)
+}
+
+func (s *Cache) waitForLeader(ctx context.Context) error {
 	if _, id := s.raft.LeaderWithID(); id != "" {
 		return nil
 	}
@@ -186,6 +219,7 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 	defer s.raft.DeregisterObserver(observer)
 
 	if _, id := s.raft.LeaderWithID(); id != "" {
+		// leader elected while starting to observe
 		return nil
 	}
 
@@ -232,6 +266,7 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 	for {
 		select {
 		case <-ctx.Done():
+			_ = s.shutdown()
 			return
 		case rpc := <-ch:
 			var (
@@ -259,6 +294,10 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 func (s *Cache) Shutdown() error {
 	s.close()
 
+	return s.shutdown()
+}
+
+func (s *Cache) shutdown() error {
 	if trans, ok := s.transport.(io.Closer); ok {
 		_ = trans.Close()
 	}

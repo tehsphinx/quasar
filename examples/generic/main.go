@@ -41,14 +41,14 @@ func main() {
 	}
 
 	// get a value
-	musician, err := fsm.GetMusicianMaster("Roberto")
+	musician, err := fsm.GetMusicianMaster(ctx, "Roberto")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println(musician)
 
 	// get a value
-	musician, err = fsm.GetMusicianKnownLatest("Roberto")
+	musician, err = fsm.GetMusicianKnownLatest(ctx, "Roberto")
 	if err != nil {
 		panic(err)
 	}
