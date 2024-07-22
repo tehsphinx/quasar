@@ -201,6 +201,26 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 	}
 }
 
+func (s *Cache) Snapshot() (*raft.SnapshotMeta, io.ReadCloser, error) {
+	fut := s.raft.Snapshot()
+	if err := fut.Error(); err != nil {
+		return nil, nil, err
+	}
+	return fut.Open()
+}
+
+func (s *Cache) Restore(ctx context.Context, meta *raft.SnapshotMeta, reader io.Reader) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var timeout time.Duration
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+	return s.raft.Restore(meta, reader, timeout)
+}
+
 // ForceSnapshot triggers the underlying raft library to take a snapshot.
 // Mostly used for testing purposes.
 func (s *Cache) ForceSnapshot() error {
