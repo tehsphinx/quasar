@@ -158,13 +158,13 @@ func (s *Cache) applyRemote(command *pb.Command) (*pb.CommandResponse, uint64, e
 		if err != nil {
 			return nil, 0, err
 		}
-		return respStore(resp), resp.Uid, err
+		return respStore(resp), resp.Uid, nil
 	case *pb.Command_LatestUid:
 		resp, err := s.transport.LatestUID(id, addr, cmd.LatestUid)
 		if err != nil {
 			return nil, 0, err
 		}
-		return respLatestUID(resp), resp.Uid, err
+		return respLatestUID(resp), resp.Uid, nil
 	}
 
 	return nil, 0, errors.New("leader request type not implemented")

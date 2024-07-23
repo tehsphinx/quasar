@@ -32,7 +32,7 @@ func TestStableNatsKV(t *testing.T) {
 		Bucket: "quasar_test",
 	})
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	defer func() {
 		if r := js.DeleteKeyValue("quasar_test"); r != nil {

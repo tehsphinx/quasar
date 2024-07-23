@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar"
@@ -49,8 +50,10 @@ var _ quasar.FSM = (*InMemoryFSM)(nil)
 type InMemoryFSM struct {
 	fsm *quasar.FSMInjector
 
-	musicians map[string]Musician
-	cities    map[string]City
+	musiciansM sync.RWMutex
+	musicians  map[string]Musician
+	citiesM    sync.RWMutex
+	cities     map[string]City
 }
 
 func (s *InMemoryFSM) SetMusician(musician Musician) error {
@@ -96,6 +99,9 @@ func (s *InMemoryFSM) GetMusicianKnownLatest(ctx context.Context, name string) (
 
 // GetMusicianLocal gets a value from the local cache. There is no consistency guarantee here.
 func (s *InMemoryFSM) GetMusicianLocal(name string) (Musician, error) {
+	s.musiciansM.RLock()
+	defer s.musiciansM.RUnlock()
+
 	musician, ok := s.musicians[name]
 	if !ok {
 		return Musician{}, fmt.Errorf("musician %s not found", name)
@@ -125,18 +131,32 @@ func (s *InMemoryFSM) ApplyCmd(cmd []byte) error {
 		if err := json.Unmarshal(change.Data, &musician); err != nil {
 			return err
 		}
-		s.musicians[musician.Name] = musician
+		s.setMusician(musician)
 		return nil
 	case TypeCity:
 		var city City
 		if err := json.Unmarshal(change.Data, &city); err != nil {
 			return err
 		}
-		s.cities[city.Name] = city
+		s.setCity(city)
 		return nil
 	default:
 		return errors.New("unknown apply type")
 	}
+}
+
+func (s *InMemoryFSM) setMusician(musician Musician) {
+	s.musiciansM.Lock()
+	defer s.musiciansM.Unlock()
+
+	s.musicians[musician.Name] = musician
+}
+
+func (s *InMemoryFSM) setCity(city City) {
+	s.citiesM.Lock()
+	defer s.citiesM.RUnlock()
+
+	s.cities[city.Name] = city
 }
 
 // Inject must be implemented to receive the FSMInjector object. It provides the necessary
@@ -152,6 +172,13 @@ type snapshot struct {
 }
 
 func (s *InMemoryFSM) Snapshot() (raft.FSMSnapshot, error) {
+	s.musiciansM.RLock()
+	s.citiesM.RLock()
+	defer func() {
+		s.citiesM.RUnlock()
+		s.musiciansM.RUnlock()
+	}()
+
 	return &snapshot{
 		musicians: maps.Values(s.musicians),
 		cities:    maps.Values(s.cities),
@@ -204,13 +231,13 @@ func (s *InMemoryFSM) Restore(reader io.ReadCloser) error {
 			if err := json.Unmarshal(bts, &musician); err != nil {
 				return err
 			}
-			s.musicians[musician.Name] = musician
+			s.setMusician(musician)
 		case sectCities:
 			var city City
 			if err := json.Unmarshal(bts, &city); err != nil {
 				return err
 			}
-			s.cities[city.Name] = city
+			s.setCity(city)
 		}
 	}
 	return nil
