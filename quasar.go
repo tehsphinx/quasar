@@ -93,19 +93,19 @@ func (s *Cache) serverInfo() raft.Server {
 	}
 }
 
-func (s *Cache) store(key string, data []byte) (uint64, error) {
+func (s *Cache) store(ctx context.Context, key string, data []byte) (uint64, error) {
 	cmd := cmdStore(key, data)
-	_, uid, err := s.apply(cmd)
+	_, uid, err := s.apply(ctx, cmd)
 	return uid, err
 }
 
-func (s *Cache) masterLastIndex() (uint64, error) {
-	if s.isLeader() {
+func (s *Cache) masterLastIndex(ctx context.Context) (uint64, error) {
+	if s.IsLeader() {
 		return s.localLastIndex(), nil
 	}
 
 	cmd := cmdLatestUID()
-	_, uid, err := s.apply(cmd)
+	_, uid, err := s.apply(ctx, cmd)
 	if err != nil {
 		return 0, err
 	}
@@ -117,20 +117,20 @@ func (s *Cache) localLastIndex() uint64 {
 	return s.raft.LastIndex()
 }
 
-func (s *Cache) apply(cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
-	if s.isLeader() {
-		return s.applyLocal(cmd)
+func (s *Cache) apply(ctx context.Context, cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
+	if s.IsLeader() {
+		return s.applyLocal(ctx, cmd)
 	}
-	return s.applyRemote(cmd)
+	return s.applyRemote(ctx, cmd)
 }
 
-func (s *Cache) applyLocal(cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
+func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
 	bts, err := proto.Marshal(cmd)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to marshal command: %w", err)
 	}
 
-	fut := s.raft.Apply(bts, applyTimout)
+	fut := s.raft.Apply(bts, getTimeout(ctx, applyTimout))
 	if r := fut.Error(); r != nil {
 		return nil, 0, fmt.Errorf("applying failed with: %w", r)
 	}
@@ -146,7 +146,20 @@ func (s *Cache) applyLocal(cmd *pb.Command) (*pb.CommandResponse, uint64, error)
 	return resp.resp, index, nil
 }
 
-func (s *Cache) applyRemote(command *pb.Command) (*pb.CommandResponse, uint64, error) {
+func getTimeout(ctx context.Context, timeout time.Duration) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return timeout
+	}
+
+	timeout = time.Until(deadline)
+	if timeout <= 0 {
+		return 1
+	}
+	return timeout
+}
+
+func (s *Cache) applyRemote(ctx context.Context, command *pb.Command) (*pb.CommandResponse, uint64, error) {
 	addr, id := s.raft.LeaderWithID()
 	if id == "" {
 		return nil, 0, ErrNoLeader
@@ -154,13 +167,13 @@ func (s *Cache) applyRemote(command *pb.Command) (*pb.CommandResponse, uint64, e
 
 	switch cmd := command.GetCmd().(type) {
 	case *pb.Command_Store:
-		resp, err := s.transport.Store(id, addr, cmd.Store)
+		resp, err := s.transport.Store(ctx, id, addr, cmd.Store)
 		if err != nil {
 			return nil, 0, err
 		}
 		return respStore(resp), resp.Uid, nil
 	case *pb.Command_LatestUid:
-		resp, err := s.transport.LatestUID(id, addr, cmd.LatestUid)
+		resp, err := s.transport.LatestUID(ctx, id, addr, cmd.LatestUid)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -170,7 +183,10 @@ func (s *Cache) applyRemote(command *pb.Command) (*pb.CommandResponse, uint64, e
 	return nil, 0, errors.New("leader request type not implemented")
 }
 
-func (s *Cache) isLeader() bool {
+// IsLeader returns if the cache is the current leader. This is not a verified
+// check, so it might be that it looses leadership soon or is not able to do leadership
+// actions.
+func (s *Cache) IsLeader() bool {
 	return s.raft.State() == raft.Leader
 }
 
@@ -182,7 +198,7 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 		return err
 	}
 
-	if s.isLeader() {
+	if s.IsLeader() {
 		// If we ourselves became leader, attempt leadership transfer.
 		// This way we avoid new cache taking leadership of older instances.
 		fut := s.raft.LeadershipTransfer()
@@ -196,7 +212,7 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 	}
 
 	// wait for master index to be applied locally
-	uid, err := s.masterLastIndex()
+	uid, err := s.masterLastIndex(ctx)
 	if err != nil {
 		return err
 	}
@@ -276,7 +292,7 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 			switch cmd := rpc.Command.(type) {
 			case *pb.Store:
 				var uid uint64
-				uid, err = s.store(cmd.Key, cmd.Data)
+				uid, err = s.store(ctx, cmd.Key, cmd.Data)
 				resp = &pb.StoreResponse{Uid: uid}
 			case *pb.LatestUid:
 				uid := s.localLastIndex()

@@ -56,7 +56,7 @@ type InMemoryFSM struct {
 	cities     map[string]City
 }
 
-func (s *InMemoryFSM) SetMusician(musician Musician) error {
+func (s *InMemoryFSM) SetMusician(ctx context.Context, musician Musician) error {
 	bts, err := json.Marshal(musician)
 	if err != nil {
 		return err
@@ -70,7 +70,7 @@ func (s *InMemoryFSM) SetMusician(musician Musician) error {
 		return err
 	}
 
-	_, err = s.fsm.Store(bts)
+	_, err = s.fsm.Store(ctx, bts)
 	return err
 }
 

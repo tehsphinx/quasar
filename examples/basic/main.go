@@ -23,27 +23,27 @@ func main() {
 	// Wait for cluster to be up and running. (Elected a leader.)
 
 	// set a value
-	uid, err := cache.Store("key1", []byte("abc"))
+	uid, err := cache.Store(ctx, "key1", []byte("abc"))
 	if err != nil {
 		panic(err)
 	}
 
 	// get a value
-	data, err := cache.Load("key1")
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(string(data))
-
-	// get a value
-	data, err = cache.LoadLocal("key1")
+	data, err := cache.Load(ctx, "key1")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println(string(data))
 
 	// get a value
-	data, err = cache.LoadLocal("key1", quasar.WaitForUID(uid))
+	data, err = cache.LoadLocal(ctx, "key1")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(data))
+
+	// get a value
+	data, err = cache.LoadLocal(ctx, "key1", quasar.WaitForUID(uid))
 	if err != nil {
 		panic(err)
 	}

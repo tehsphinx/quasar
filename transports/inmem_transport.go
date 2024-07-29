@@ -1,6 +1,7 @@
 package transports
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sync"
@@ -59,8 +60,14 @@ func (i *InmemTransport) CacheConsumer() <-chan raft.RPC {
 	return i.chConsumeCache
 }
 
-func (i *InmemTransport) Store(id raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
-	rpcResp, err := i.makeRPC(target, command, nil, consumeCache, i.timeout)
+func (i *InmemTransport) Store(ctx context.Context, _ raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, i.timeout)
+		defer cancel()
+	}
+
+	rpcResp, err := i.makeRPC(ctx, target, command, nil, consumeCache)
 	if err != nil {
 		return nil, err
 	}
@@ -68,8 +75,14 @@ func (i *InmemTransport) Store(id raft.ServerID, target raft.ServerAddress, comm
 	return rpcResp.Response.(*pb.StoreResponse), nil
 }
 
-func (i *InmemTransport) LatestUID(id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
-	rpcResp, err := i.makeRPC(target, command, nil, consumeCache, i.timeout)
+func (i *InmemTransport) LatestUID(ctx context.Context, _ raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, i.timeout)
+		defer cancel()
+	}
+
+	rpcResp, err := i.makeRPC(ctx, target, command, nil, consumeCache)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +149,10 @@ func (i *InmemTransport) AppendEntriesPipeline(id raft.ServerID, target raft.Ser
 
 // AppendEntries implements the Transport interface.
 func (i *InmemTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, consumeRaft, i.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), i.timeout)
+	defer cancel()
+
+	rpcResp, err := i.makeRPC(ctx, target, args, nil, consumeRaft)
 	if err != nil {
 		return err
 	}
@@ -148,8 +164,11 @@ func (i *InmemTransport) AppendEntries(id raft.ServerID, target raft.ServerAddre
 }
 
 // RequestVote implements the Transport interface.
-func (i *InmemTransport) RequestVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, consumeRaft, i.timeout)
+func (i *InmemTransport) RequestVote(_ raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
+	ctx, cancel := context.WithTimeout(context.Background(), i.timeout)
+	defer cancel()
+
+	rpcResp, err := i.makeRPC(ctx, target, args, nil, consumeRaft)
 	if err != nil {
 		return err
 	}
@@ -161,8 +180,11 @@ func (i *InmemTransport) RequestVote(id raft.ServerID, target raft.ServerAddress
 }
 
 // InstallSnapshot implements the Transport interface.
-func (i *InmemTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
-	rpcResp, err := i.makeRPC(target, args, data, consumeRaft, 10*i.timeout)
+func (i *InmemTransport) InstallSnapshot(_ raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*i.timeout)
+	defer cancel()
+
+	rpcResp, err := i.makeRPC(ctx, target, args, data, consumeRaft)
 	if err != nil {
 		return err
 	}
@@ -174,8 +196,11 @@ func (i *InmemTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAdd
 }
 
 // TimeoutNow implements the Transport interface.
-func (i *InmemTransport) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, consumeRaft, 10*i.timeout)
+func (i *InmemTransport) TimeoutNow(_ raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*i.timeout)
+	defer cancel()
+
+	rpcResp, err := i.makeRPC(ctx, target, args, nil, consumeRaft)
 	if err != nil {
 		return err
 	}
@@ -186,7 +211,7 @@ func (i *InmemTransport) TimeoutNow(id raft.ServerID, target raft.ServerAddress,
 	return nil
 }
 
-func (i *InmemTransport) makeRPC(target raft.ServerAddress, args interface{}, r io.Reader, cType consumeType, timeout time.Duration) (rpcResp raft.RPCResponse, err error) {
+func (i *InmemTransport) makeRPC(ctx context.Context, target raft.ServerAddress, args interface{}, r io.Reader, cType consumeType) (rpcResp raft.RPCResponse, err error) {
 	i.RLock()
 	peer, ok := i.peers[target]
 	i.RUnlock()
@@ -206,7 +231,7 @@ func (i *InmemTransport) makeRPC(target raft.ServerAddress, args interface{}, r 
 	chConsume := getConsumeChan(peer, cType)
 	select {
 	case chConsume <- req:
-	case <-time.After(timeout):
+	case <-ctx.Done():
 		err = fmt.Errorf("send timed out")
 		return
 	}
@@ -217,7 +242,7 @@ func (i *InmemTransport) makeRPC(target raft.ServerAddress, args interface{}, r 
 		if rpcResp.Error != nil {
 			err = rpcResp.Error
 		}
-	case <-time.After(timeout):
+	case <-ctx.Done():
 		err = fmt.Errorf("command timed out")
 	}
 	return

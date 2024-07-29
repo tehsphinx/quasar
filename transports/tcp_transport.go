@@ -147,15 +147,27 @@ type TCPTransport struct {
 	TimeoutScale int
 }
 
-func (s *TCPTransport) Store(id raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
+func (s *TCPTransport) Store(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+
 	var resp pb.StoreResponse
-	err := s.genericRPC(id, target, rpcStore, command, &resp)
+	err := s.genericRPC(ctx, id, target, rpcStore, command, &resp)
 	return &resp, err
 }
 
-func (s *TCPTransport) LatestUID(id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
+func (s *TCPTransport) LatestUID(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+
 	var resp pb.LatestUidResponse
-	err := s.genericRPC(id, target, rpcLatestUID, command, &resp)
+	err := s.genericRPC(ctx, id, target, rpcLatestUID, command, &resp)
 	return &resp, err
 }
 
@@ -335,25 +347,30 @@ func (s *TCPTransport) AppendEntriesPipeline(id raft.ServerID, target raft.Serve
 
 // AppendEntries implements the Transport interface.
 func (s *TCPTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
-	return s.genericRPC(id, target, rpcAppendEntries, args, resp)
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
+	return s.genericRPC(ctx, id, target, rpcAppendEntries, args, resp)
 }
 
 // RequestVote implements the Transport interface.
 func (s *TCPTransport) RequestVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
-	return s.genericRPC(id, target, rpcRequestVote, args, resp)
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
+	return s.genericRPC(ctx, id, target, rpcRequestVote, args, resp)
 }
 
 // genericRPC handles a simple request/response RPC.
-func (s *TCPTransport) genericRPC(id raft.ServerID, target raft.ServerAddress, rpcType uint8, args interface{}, resp interface{}) error {
+func (s *TCPTransport) genericRPC(ctx context.Context, id raft.ServerID, target raft.ServerAddress, rpcType uint8, args interface{}, resp interface{}) error {
 	// Get a conn
 	conn, err := s.getConnFromAddressProvider(id, target)
 	if err != nil {
 		return err
 	}
 
-	// Set a deadline
-	if s.timeout > 0 {
-		_ = conn.conn.SetDeadline(time.Now().Add(s.timeout))
+	if deadline, ok := getDeadline(ctx, s.timeout); ok {
+		_ = conn.conn.SetDeadline(deadline)
 	}
 
 	// Send the RPC
@@ -423,7 +440,10 @@ func (s *TCPTransport) DecodePeer(buf []byte) raft.ServerAddress {
 
 // TimeoutNow implements the Transport interface.
 func (s *TCPTransport) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
-	return s.genericRPC(id, target, rpcTimeoutNow, args, resp)
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
+	return s.genericRPC(ctx, id, target, rpcTimeoutNow, args, resp)
 }
 
 // listen is used to handling incoming connections.
@@ -658,6 +678,16 @@ func (s *TCPTransport) getStreamContext() context.Context {
 	s.streamCtxLock.RLock()
 	defer s.streamCtxLock.RUnlock()
 	return s.streamCtx
+}
+
+func getDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline, true
+	}
+	if timeout != 0 {
+		return time.Now().Add(timeout), true
+	}
+	return time.Time{}, false
 }
 
 // decodeResponse is used to decode an RPC response and reports whether

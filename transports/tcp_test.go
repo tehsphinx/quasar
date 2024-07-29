@@ -830,6 +830,8 @@ func TestNetworkTransport_PooledConn(t *testing.T) {
 }
 
 func makeTransport(t *testing.T, useAddrProvider bool, addressOverride string) (*TCPTransport, error) {
+	t.Helper()
+
 	config := &raft.NetworkTransportConfig{
 		MaxPool: 2,
 		// Setting this because older tests for pipelining were written when this
@@ -875,6 +877,7 @@ func (a *testLoggerAdapter) Write(d []byte) (int, error) {
 }
 
 func newTestLogger(tb testing.TB) hclog.Logger {
+	tb.Helper()
 	return newTestLoggerWithPrefix(tb, "")
 }
 
@@ -891,6 +894,7 @@ func newTestLogger(tb testing.TB) hclog.Logger {
 // example and then close the transport at the end of the test because an error
 // is logged after the test is complete.
 func newTestLoggerWithPrefix(tb testing.TB, prefix string) hclog.Logger {
+	tb.Helper()
 	if testing.Verbose() {
 		return hclog.New(&hclog.LoggerOptions{Name: prefix})
 	}

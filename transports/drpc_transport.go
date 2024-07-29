@@ -108,12 +108,12 @@ func (s *DRPCTransport) CacheConsumer() <-chan raft.RPC {
 	return s.chConsumeCache
 }
 
-func (s *DRPCTransport) Store(id raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
+func (s *DRPCTransport) Store(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
 	// TODO implement me
 	panic("implement me")
 }
 
-func (s *DRPCTransport) LatestUID(id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
+func (s *DRPCTransport) LatestUID(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
 	// TODO implement me
 	panic("implement me")
 }

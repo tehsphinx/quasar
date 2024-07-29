@@ -46,22 +46,25 @@ func TestSingleKVCache(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+			defer cancel()
+
 			asrt := asrtMain.New(t)
 
 			for k, v := range tt.storeVals {
-				_, r := cache.Store(k, []byte(v))
+				_, r := cache.Store(ctx, k, []byte(v))
 				asrt.NoErr(r)
 			}
 
 			for k, v := range tt.storeVals {
-				got, r := cache.LoadLocal(k)
+				got, r := cache.LoadLocal(ctx, k)
 				asrt.NoErr(r)
 
 				asrt.Equal(got, []byte(v))
 			}
 
 			for k, v := range tt.storeVals {
-				got, r := cache.Load(k)
+				got, r := cache.Load(ctx, k)
 				asrt.NoErr(r)
 
 				asrt.Equal(got, []byte(v))
@@ -122,12 +125,16 @@ func TestKVCacheClusterTCP(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+
 			for i, cache := range caches {
 				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+					defer cancel()
+
 					asrtWrite := asrtMain.New(t)
 
 					for k, v := range tt.storeVals {
-						_, r := cache.Store(k+strconv.Itoa(i), []byte(v+strconv.Itoa(i)))
+						_, r := cache.Store(ctx, k+strconv.Itoa(i), []byte(v+strconv.Itoa(i)))
 						asrtWrite.NoErr(r)
 					}
 
@@ -136,14 +143,14 @@ func TestKVCacheClusterTCP(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
 							for k, v := range tt.storeVals {
-								got, r := readCache.Load(k + strconv.Itoa(i))
+								got, r := readCache.Load(ctx, k+strconv.Itoa(i))
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, []byte(v+strconv.Itoa(i)))
 							}
 
 							for k, v := range tt.storeVals {
-								got, r := readCache.LoadLocal(k + strconv.Itoa(i))
+								got, r := readCache.LoadLocal(ctx, k+strconv.Itoa(i))
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, []byte(v+strconv.Itoa(i)))
@@ -222,10 +229,13 @@ func TestKVCacheClusterNATS(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for i, cache := range caches {
 				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+					defer cancel()
+
 					asrtWrite := asrtMain.New(t)
 
 					for k, v := range tt.storeVals {
-						_, r := cache.Store(k+strconv.Itoa(i), []byte(v+strconv.Itoa(i)))
+						_, r := cache.Store(ctx, k+strconv.Itoa(i), []byte(v+strconv.Itoa(i)))
 						asrtWrite.NoErr(r)
 					}
 
@@ -234,14 +244,14 @@ func TestKVCacheClusterNATS(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
 							for k, v := range tt.storeVals {
-								got, r := readCache.Load(k + strconv.Itoa(i))
+								got, r := readCache.Load(ctx, k+strconv.Itoa(i))
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, []byte(v+strconv.Itoa(i)))
 							}
 
 							for k, v := range tt.storeVals {
-								got, r := readCache.LoadLocal(k + strconv.Itoa(i))
+								got, r := readCache.LoadLocal(ctx, k+strconv.Itoa(i))
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, []byte(v+strconv.Itoa(i)))

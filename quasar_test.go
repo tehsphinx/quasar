@@ -63,10 +63,13 @@ func TestSingleCache(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+			defer cancel()
+
 			asrt := asrtMain.New(t)
 
 			for _, v := range tt.storeVals {
-				r := fsm.SetMusician(v)
+				r := fsm.SetMusician(ctx, v)
 				asrt.NoErr(r)
 			}
 
@@ -78,14 +81,14 @@ func TestSingleCache(t *testing.T) {
 			}
 
 			for _, v := range tt.storeVals {
-				got, r := fsm.GetMusicianMaster(ctxMain, v.Name)
+				got, r := fsm.GetMusicianMaster(ctx, v.Name)
 				asrt.NoErr(r)
 
 				asrt.Equal(got, v)
 			}
 
 			for _, v := range tt.storeVals {
-				got, r := fsm.GetMusicianKnownLatest(ctxMain, v.Name)
+				got, r := fsm.GetMusicianKnownLatest(ctx, v.Name)
 				asrt.NoErr(r)
 
 				asrt.Equal(got, v)
@@ -167,10 +170,13 @@ func TestCacheClusterTCP(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for i, fsm := range fsms {
 				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+					defer cancel()
+
 					asrtWrite := asrtMain.New(t)
 
 					for _, v := range tt.storeVals {
-						r := fsm.SetMusician(v)
+						r := fsm.SetMusician(ctx, v)
 						asrtWrite.NoErr(r)
 					}
 
@@ -179,7 +185,7 @@ func TestCacheClusterTCP(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianMaster(ctxMain, v.Name)
+								got, r := readFSM.GetMusicianMaster(ctx, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -193,7 +199,7 @@ func TestCacheClusterTCP(t *testing.T) {
 							}
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianKnownLatest(ctxMain, v.Name)
+								got, r := readFSM.GetMusicianKnownLatest(ctx, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -306,10 +312,13 @@ func TestCacheClusterNATS(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for i, fsm := range fsms {
 				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+					defer cancel()
+
 					asrtWrite := asrtMain.New(t)
 
 					for _, v := range tt.storeVals {
-						r := fsm.SetMusician(v)
+						r := fsm.SetMusician(ctx, v)
 						asrtWrite.NoErr(r)
 					}
 
@@ -318,7 +327,7 @@ func TestCacheClusterNATS(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianMaster(ctxMain, v.Name)
+								got, r := readFSM.GetMusicianMaster(ctx, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -332,7 +341,7 @@ func TestCacheClusterNATS(t *testing.T) {
 							}
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianKnownLatest(ctxMain, v.Name)
+								got, r := readFSM.GetMusicianKnownLatest(ctx, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -400,12 +409,15 @@ func TestInstallSnapshot(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(ctxMain, 10*time.Second)
+			defer cancel()
+
 			asrt := asrtMain.New(t)
 			fsm1 := exampleFSM.NewInMemoryFSM()
 			fsm2 := exampleFSM.NewInMemoryFSM()
 			fsm3 := exampleFSM.NewInMemoryFSM()
 
-			cache1, err := quasar.NewCache(ctxMain, fsm1,
+			cache1, err := quasar.NewCache(ctx, fsm1,
 				quasar.WithLocalID("cache1"),
 				quasar.WithRaftConfig(raftCfg),
 				quasar.WithTransport(transport1),
@@ -418,14 +430,14 @@ func TestInstallSnapshot(t *testing.T) {
 			asrt.NoErr(err)
 			defer cache1.Shutdown()
 
-			cache2, err := quasar.NewCache(ctxMain, fsm2,
+			cache2, err := quasar.NewCache(ctx, fsm2,
 				quasar.WithRaftConfig(raftCfg),
 				quasar.WithTransport(transport2),
 			)
 			asrt.NoErr(err)
 			defer cache2.Shutdown()
 
-			err = cache1.WaitReady(ctxMain)
+			err = cache1.WaitReady(ctx)
 			asrt.NoErr(err)
 			fmt.Println("WAIT DONE")
 
@@ -434,7 +446,7 @@ func TestInstallSnapshot(t *testing.T) {
 
 				for i := 0; i < 100; i++ {
 					for _, v := range tt.storeVals {
-						r := fsm1.SetMusician(v)
+						r := fsm1.SetMusician(ctx, v)
 						asrtWrite.NoErr(r)
 					}
 				}
@@ -443,14 +455,14 @@ func TestInstallSnapshot(t *testing.T) {
 			err = cache1.ForceSnapshot()
 			asrt.NoErr(err)
 
-			cache3, err := quasar.NewCache(ctxMain, fsm3,
+			cache3, err := quasar.NewCache(ctx, fsm3,
 				quasar.WithRaftConfig(raftCfg),
 				quasar.WithTransport(transport3),
 			)
 			asrt.NoErr(err)
 			defer cache3.Shutdown()
 
-			err = cache3.WaitReady(ctxMain)
+			err = cache3.WaitReady(ctx)
 			asrt.NoErr(err)
 			fmt.Println("3rd cache is up")
 
@@ -458,7 +470,7 @@ func TestInstallSnapshot(t *testing.T) {
 				asrtRead := asrt.New(t)
 
 				for _, v := range tt.storeVals {
-					got, r := fsm3.GetMusicianMaster(ctxMain, v.Name)
+					got, r := fsm3.GetMusicianMaster(ctx, v.Name)
 					fmt.Println("getting values", got, r)
 					asrtRead.NoErr(r)
 
@@ -563,12 +575,15 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+			defer cancel()
+
 			for i, fsm := range fsms {
 				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
 					asrtWrite := asrtMain.New(t)
 
 					for _, v := range tt.storeVals {
-						r := fsm.SetMusician(v)
+						r := fsm.SetMusician(ctx, v)
 						asrtWrite.NoErr(r)
 					}
 
@@ -577,7 +592,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 							asrtRead := asrtWrite.New(t)
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianMaster(ctxMain, v.Name)
+								got, r := readFSM.GetMusicianMaster(ctx, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -591,7 +606,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 							}
 
 							for _, v := range tt.storeVals {
-								got, r := readFSM.GetMusicianKnownLatest(ctxMain, v.Name)
+								got, r := readFSM.GetMusicianKnownLatest(ctx, v.Name)
 								asrtRead.NoErr(r)
 
 								asrtRead.Equal(got, v)
@@ -712,7 +727,7 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 
 							for _, v := range tt.storeVals {
 								v.Age = age*3 + writeIndex
-								r := fsm.SetMusician(v)
+								r := fsm.SetMusician(ctx, v)
 								asrtWrite.NoErr(r)
 							}
 

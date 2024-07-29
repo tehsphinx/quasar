@@ -27,33 +27,35 @@ type KVCache struct {
 	fsm *kvFSM
 }
 
-func (s *KVCache) Store(key string, data []byte) (uint64, error) {
-	return s.store(key, data)
+func (s *KVCache) Store(ctx context.Context, key string, data []byte) (uint64, error) {
+	return s.store(ctx, key, data)
 }
 
-func (s *KVCache) Load(key string, opts ...LoadOption) ([]byte, error) {
+func (s *KVCache) Load(ctx context.Context, key string, opts ...LoadOption) ([]byte, error) {
 	cfg := getLoadOptions(opts)
 
 	uid := cfg.waitFor
 	if uid == 0 {
-		id, err := s.masterLastIndex()
+		id, err := s.masterLastIndex(ctx)
 		if err != nil {
 			return nil, err
 		}
 		uid = id
 	}
-	// TODO: expose context as LoadOption
-	s.Cache.fsm.WaitFor(context.TODO(), uid)
+	if err := s.Cache.fsm.WaitFor(ctx, uid); err != nil {
+		return nil, err
+	}
 
 	return s.fsm.Load(key)
 }
 
-func (s *KVCache) LoadLocal(key string, opts ...LoadOption) ([]byte, error) {
+func (s *KVCache) LoadLocal(ctx context.Context, key string, opts ...LoadOption) ([]byte, error) {
 	cfg := getLoadOptions(opts)
 
 	if cfg.waitFor != 0 {
-		// TODO: expose context as LoadOption
-		s.Cache.fsm.WaitFor(context.TODO(), cfg.waitFor)
+		if err := s.Cache.fsm.WaitFor(ctx, cfg.waitFor); err != nil {
+			return nil, err
+		}
 	}
 
 	return s.fsm.Load(key)

@@ -69,6 +69,7 @@ func (s *NATSDiscovery) runPinging(ctx context.Context) {
 	for {
 		select {
 		case <-tick.C:
+			//nolint:staticcheck // empty branch to be filled later
 			if r := s.ping(); r != nil {
 				// TODO: log?
 			}

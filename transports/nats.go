@@ -99,11 +99,17 @@ func (s *NATSTransport) CacheConsumer() <-chan raft.RPC {
 	return s.chConsumeCache
 }
 
-func (s *NATSTransport) Store(_ raft.ServerID, address raft.ServerAddress, request *pb.Store) (*pb.StoreResponse, error) {
+func (s *NATSTransport) Store(ctx context.Context, _ raft.ServerID, address raft.ServerAddress, request *pb.Store) (*pb.StoreResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+
 	subj := fmt.Sprintf("quasar.%s.%s.cache.store", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(subj, request, &protoResp); err != nil {
+	if err := s.request(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	return protoResp.GetStore(), nil
@@ -140,11 +146,17 @@ func (s *NATSTransport) handleStore(msg *nats.Msg) {
 	}
 }
 
-func (s *NATSTransport) LatestUID(_ raft.ServerID, address raft.ServerAddress, request *pb.LatestUid) (*pb.LatestUidResponse, error) {
+func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address raft.ServerAddress, request *pb.LatestUid) (*pb.LatestUidResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+
 	subj := fmt.Sprintf("quasar.%s.%s.cache.uid.latest", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(subj, request, &protoResp); err != nil {
+	if err := s.request(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	return protoResp.GetLatestUid(), nil
@@ -195,10 +207,13 @@ func (s *NATSTransport) AppendEntriesPipeline(_ raft.ServerID, _ raft.ServerAddr
 }
 
 func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddress, request *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
 	subj := fmt.Sprintf("quasar.%s.%s.entries.append", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(subj, pb.ToAppendEntriesRequest(request), &protoResp); err != nil {
+	if err := s.request(ctx, subj, pb.ToAppendEntriesRequest(request), &protoResp); err != nil {
 		return err
 	}
 	*resp = *protoResp.GetAppendEntries().Convert()
@@ -237,10 +252,13 @@ func (s *NATSTransport) handleEntries(msg *nats.Msg) {
 }
 
 func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress, request *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
 	subj := fmt.Sprintf("quasar.%s.%s.request.vote", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
+	if err := s.request(ctx, subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -294,10 +312,13 @@ func (s *NATSTransport) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
 }
 
 func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, request *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
 	subj := fmt.Sprintf("quasar.%s.%s.timeout.now", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
+	if err := s.request(ctx, subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -336,14 +357,11 @@ func (s *NATSTransport) handleTimeoutNow(msg *nats.Msg) {
 	}
 }
 
-func (s *NATSTransport) request(subj string, msg proto.Message, protoResp proto.Message) error {
+func (s *NATSTransport) request(ctx context.Context, subj string, msg proto.Message, protoResp proto.Message) error {
 	bts, err := proto.Marshal(msg)
 	if err != nil {
 		return err
 	}
-
-	ctx, cancel := context.WithTimeout(context.TODO(), s.timeout)
-	defer cancel()
 
 	// fmt.Println("request data:", fmt.Sprintf("%+v", msg))
 	response, err := s.conn.RequestWithContext(ctx, subj, bts)

@@ -1,0 +1,153 @@
+linters-settings:
+  depguard:
+    rules:
+      main:
+        deny:
+          - pkg: github.com/bmizerany/assert
+            desc: "Use github.com/matryer/is or github.com/stretchr/testify/assert instead."
+  exhaustive:
+    default-signifies-exhaustive: true
+  funlen:
+    lines: 70
+    statements: 40
+  gci:
+    sections:
+      - standard
+      - default
+      - prefix(gitlab.adeya.ch)
+  govet:
+    enable-all: true
+  gocritic:
+    enabled-tags:
+      - performance
+      - style
+    disabled-checks:
+      - hugeParam
+      - unnamedResult
+      - rangeValCopy
+  lll:
+    line-length: 150
+  maintidx:
+    under: 40
+  nakedret:
+    max-func-lines: 0
+  nolintlint:
+    require-specific: true
+  revive:
+    confidence: 0.1
+    rules:
+      - name: exported
+        severity: warning
+        disabled: false
+  stylecheck:
+    http-status-code-whitelist: []
+  usestdlibvars:
+    time-month: true
+    time-layout: true
+    crypto-hash: true
+    default-rpc-path: true
+    sql-isolation-level: true
+    tls-signature-scheme: true
+    constant-kind: true
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - containedctx
+    - contextcheck
+    - decorder
+    - depguard
+    - dogsled
+    - durationcheck
+    - err113
+    - errcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    - exportloopref
+    - forbidigo
+    - forcetypeassert
+    - funlen
+    - gci
+    - gocheckcompilerdirectives
+    - gochecknoglobals
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - godot
+    - gofmt
+    - gofumpt
+    - goimports
+    - gomoddirectives
+    - gomodguard
+    - goprintffuncname
+    - gosec
+    - gosimple
+    - gosmopolitan
+    - govet
+    - importas
+    - ineffassign
+    - lll
+    - maintidx
+    - makezero
+    - mirror
+    - misspell
+    - mnd
+    - musttag
+    - nakedret
+    - nestif
+    - nilerr
+    - nilnil
+    - noctx
+    - nolintlint
+    - nosprintfhostport
+    - prealloc
+    - predeclared
+    - reassign
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - stylecheck
+    - tenv
+    - testableexamples
+    - thelper
+    - tparallel
+    - typecheck
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - wastedassign
+    - whitespace
+
+issues:
+  exclude-rules:
+    - path: test
+      linters:
+        - forbidigo
+        - mnd
+    - path: _test\.go
+      linters:
+        - errcheck
+        - forcetypeassert
+        - funlen
+        - gochecknoglobals
+        - gocritic
+        - gosec
+        - govet
+        - lll
+        - maintidx
+        - prealloc
+
+  exclude-use-default: false
+  exclude:
+    # errcheck: Almost all programs ignore errors on these functions and in most cases it's ok
+    - Error return value of .((os\.)?std(out|err)\..*|.*Close|.*Flush|os\.Remove(All)?|.*printf?|os\.(Un)?Setenv). is not checked

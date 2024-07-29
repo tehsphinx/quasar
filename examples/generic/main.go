@@ -32,7 +32,7 @@ func main() {
 	// Wait for cluster to be up and running. (Elected a leader.)
 
 	// set a value
-	if r := fsm.SetMusician(exampleFSM.Musician{
+	if r := fsm.SetMusician(ctx, exampleFSM.Musician{
 		Name:        "Roberto",
 		Age:         32,
 		Instruments: []string{"guitar"},

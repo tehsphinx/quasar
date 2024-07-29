@@ -24,7 +24,7 @@ func (s *FSMInjector) WaitForMasterLatest(ctx context.Context) error {
 	defer cancel()
 
 	// TODO: add context to masterLastIndex
-	uid, err := s.cache.masterLastIndex()
+	uid, err := s.cache.masterLastIndex(ctx)
 	if err != nil {
 		return err
 	}
@@ -39,8 +39,8 @@ func (s *FSMInjector) WaitForKnownLatest(ctx context.Context) error {
 	return s.cache.fsm.WaitFor(ctx, uid)
 }
 
-func (s *FSMInjector) Store(bts []byte) (uint64, error) {
-	return s.cache.store("", bts)
+func (s *FSMInjector) Store(ctx context.Context, bts []byte) (uint64, error) {
+	return s.cache.store(ctx, "", bts)
 }
 
 func getWaitCtx(ctx context.Context) (context.Context, context.CancelFunc) {

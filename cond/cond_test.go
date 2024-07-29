@@ -130,6 +130,8 @@ func BenchmarkBroad128(b *testing.B) {
 }
 
 func benchmarkBroad(b *testing.B, waiters int) {
+	b.Helper()
+
 	c := cond.New(&sync.Mutex{})
 	done := make(chan bool)
 	id := 0
@@ -164,6 +166,8 @@ func benchmarkBroad(b *testing.B, waiters int) {
 }
 
 func benchmarkSync(b *testing.B, waiters int) {
+	b.Helper()
+
 	c := sync.NewCond(&sync.Mutex{})
 	done := make(chan bool)
 	id := 0
