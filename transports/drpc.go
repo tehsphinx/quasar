@@ -10,7 +10,7 @@ import (
 )
 
 // NewDRPCTransport creates a drpc (grpc drop-in replacement) transport layer for the cache.
-// The context can be used to shut the server down.s
+// The context can be used to shut the server down.
 func NewDRPCTransport(ctx context.Context, bindAddr string, advertise net.Addr) (*DRPCTransport, error) {
 	// TODO: Implement a TLS option
 
@@ -38,6 +38,7 @@ func NewDRPCTransport(ctx context.Context, bindAddr string, advertise net.Addr) 
 	server := newDRPCServer(trans)
 
 	// TODO: use advertise addr
+	_ = advertise
 
 	mux := drpcmux.New()
 	if r := pb.DRPCRegisterQuasarService(mux, server); r != nil {

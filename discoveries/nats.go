@@ -15,6 +15,7 @@ import (
 
 const discoverySubj = "raft.%s.discovery.ping"
 
+// NewNATSDiscovery creates a new NATSDiscovery.
 func NewNATSDiscovery(nc *nats.Conn) *NATSDiscovery {
 	return &NATSDiscovery{
 		nc: nc,
@@ -23,6 +24,8 @@ func NewNATSDiscovery(nc *nats.Conn) *NATSDiscovery {
 
 var _ quasar.Discovery = (*NATSDiscovery)(nil)
 
+// NATSDiscovery is a type that represents a discovery mechanism using NATS messaging system.
+// It implements the quasar.Discovery interface.
 type NATSDiscovery struct {
 	nc    *nats.Conn
 	cache *quasar.DiscoveryInjector
@@ -31,12 +34,16 @@ type NATSDiscovery struct {
 	serverInfo raft.Server
 }
 
+// Inject is used by the cache to inject access to internal functionality into the discovery.
+// Implements quasar.Discovery.
 func (s *NATSDiscovery) Inject(cache *quasar.DiscoveryInjector) {
 	s.cache = cache
 	s.subj = fmt.Sprintf(discoverySubj, cache.Name())
 	s.serverInfo = cache.ServerInfo()
 }
 
+// Run starts the NATSDiscovery service. This is a non-blocking call.
+// Implements quasar.Discovery.
 func (s *NATSDiscovery) Run(ctx context.Context) error {
 	discoverySub, err := s.nc.Subscribe(s.subj, s.discoveryHandler)
 	if err != nil {
@@ -61,6 +68,7 @@ func (s *NATSDiscovery) runPinging(ctx context.Context) {
 	const maxInterval = 5 * time.Second
 
 	// pseudo random interval
+	//nolint:gosec // math/rand is fine here
 	interval := minInterval + time.Duration(rand.Int63n(int64(maxInterval-minInterval)))
 
 	tick := time.NewTicker(interval)

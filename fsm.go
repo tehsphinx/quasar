@@ -14,6 +14,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const uint64Bytes = 8
+
+// FSM defines the fsm to be implemented for the quasar cache.
 type FSM interface {
 	Inject(fsm *FSMInjector)
 	ApplyCmd(cmd []byte) error
@@ -38,6 +41,7 @@ func wrapFSM(fsm FSM) *fsmWrapper {
 	return s
 }
 
+//nolint:govet // struct optimization not worth it. Is not created often. Optimized for readability.
 type fsmWrapper struct {
 	fsm  FSM
 	raft *raft.Raft
@@ -81,6 +85,7 @@ func (s *fsmWrapper) Apply(log *raft.Log) interface{} {
 		err:  respErr,
 	}
 }
+
 func (s *fsmWrapper) apply(log *raft.Log, command *pb.Command) (*pb.CommandResponse, error) {
 	switch cmd := command.GetCmd().(type) {
 	case *pb.Command_Store:
@@ -106,7 +111,7 @@ func (s *fsmWrapper) Snapshot() (raft.FSMSnapshot, error) {
 func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
 	s.setLastApplied(0)
 
-	bts := make([]byte, 8)
+	bts := make([]byte, uint64Bytes)
 	n, err := snapshot.Read(bts)
 	if err != nil {
 		return err
@@ -131,28 +136,13 @@ func (s *fsmWrapper) store(log *raft.Log, cmd *pb.Store) (*pb.CommandResponse, e
 }
 
 func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go func() {
-		<-ctx.Done()
-		if err := ctx.Err(); err != nil {
-			// wake up condition to be able to abort
-			s.cond.Broadcast()
-		}
-	}()
-
 	s.condM.Lock()
 	defer s.condM.Unlock()
 
 	for s.getLastApplied() < uid {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if err := s.cond.WaitContext(ctx); err != nil {
+			return err
 		}
-
-		s.cond.Wait()
 	}
 	return nil
 }
@@ -222,9 +212,11 @@ func (s *fsmWrapper) applySysUIDs() {
 func (s *fsmWrapper) getLastApplied() uint64 {
 	return atomic.LoadUint64(&s.lastApplied)
 }
+
 func (s *fsmWrapper) setLastApplied(uid uint64) {
 	atomic.StoreUint64(&s.lastApplied, uid)
 }
+
 func (s *fsmWrapper) incrLastAppliedTo(uid uint64) bool {
 	return atomic.CompareAndSwapUint64(&s.lastApplied, uid-1, uid)
 }
@@ -247,7 +239,7 @@ func (s *snapshotWrapper) Persist(sink raft.SnapshotSink) error {
 func (s *snapshotWrapper) Release() {}
 
 func uint64ToBytes(val uint64) []byte {
-	bts := make([]byte, 8)
+	bts := make([]byte, uint64Bytes)
 	binary.LittleEndian.PutUint64(bts, val)
 	return bts
 }

@@ -2,6 +2,7 @@ package quasar
 
 import (
 	"net"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/raft"
@@ -10,8 +11,10 @@ import (
 	"github.com/tehsphinx/quasar/transports"
 )
 
+// Option defines a functional option to be applied to a cache instantiation.
 type Option func(*options)
 
+//nolint:govet // struct optimization not worth it. Is not created often. Optimized for readability.
 type options struct {
 	cacheName string
 	localID   string
@@ -88,13 +91,15 @@ func WithNatsTransport(nc *nats.Conn) Option {
 
 // WithTCPTransport provides a simplified way to use tcp based RAFT communication.
 func WithTCPTransport(bindAddr string, extAddr net.Addr) Option {
+	const defaultPort = 28224
+
 	if bindAddr == "" {
-		bindAddr = ":28224"
+		bindAddr = ":" + strconv.Itoa(defaultPort)
 	}
 	if extAddr == nil {
 		extAddr = &net.TCPAddr{
 			IP:   net.ParseIP("127.0.0.1"),
-			Port: 28224,
+			Port: defaultPort,
 		}
 	}
 	return func(o *options) {
@@ -143,6 +148,7 @@ func WithRaftConfig(cfg *raft.Config) Option {
 	}
 }
 
+// LoadOption defines functional option to be applied to load functions.
 type LoadOption func(*loadOptions)
 
 func getLoadOptions(opts []LoadOption) loadOptions {
@@ -157,6 +163,7 @@ type loadOptions struct {
 	waitFor uint64
 }
 
+// WaitForUID adds a raft uid to be applied before reading a value.
 func WaitForUID(uid uint64) LoadOption {
 	return func(opt *loadOptions) {
 		opt.waitFor = uid

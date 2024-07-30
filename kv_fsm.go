@@ -16,8 +16,10 @@ func newKeyValueFSM(kv stores.KVStore) *kvFSM {
 	}
 }
 
-var _ FSM = (*kvFSM)(nil)
-var _ logApplier = (*kvFSM)(nil)
+var (
+	_ FSM        = (*kvFSM)(nil)
+	_ logApplier = (*kvFSM)(nil)
+)
 
 type kvFSM struct {
 	stores.KVStore
@@ -46,6 +48,7 @@ func (s *kvFSM) Apply(log *raft.Log) interface{} {
 		err:  respErr,
 	}
 }
+
 func (s *kvFSM) apply(log *raft.Log, command *pb.Command) (*pb.CommandResponse, error) {
 	switch cmd := command.GetCmd().(type) {
 	case *pb.Command_Store:

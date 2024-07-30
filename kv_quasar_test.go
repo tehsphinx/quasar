@@ -125,7 +125,6 @@ func TestKVCacheClusterTCP(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-
 			for i, cache := range caches {
 				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
 					ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)

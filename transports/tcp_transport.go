@@ -3,6 +3,7 @@ package transports
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,10 +25,9 @@ const (
 	rpcTimeoutNow
 	rpcStore
 	rpcLatestUID
-	// rpcLoad
 
 	// connReceiveBufferSize is the size of the buffer we will use for reading RPC requests into
-	// on followers
+	// on followers.
 	connReceiveBufferSize = 256 * 1024 // 256KB
 
 	// connSendBufferSize is the size of the buffer we will use for sending RPC request data from
@@ -46,13 +46,14 @@ const (
 )
 
 // newTPCTransport creates a network transport layer for the cache.
-func newTPCTransport(stream raft.StreamLayer, opts ...TCPOption) *TCPTransport {
+func newTPCTransport(ctx context.Context, stream raft.StreamLayer, opts ...TCPOption) *TCPTransport {
 	config := getConfig(stream, getTCPOptions(opts))
 
 	trans := &TCPTransport{
+		origCtx:               ctx,
 		connPool:              make(map[raft.ServerAddress][]*netConn),
-		chConsume:             make(chan raft.RPC),
-		chConsumeCache:        make(chan raft.RPC),
+		chConsume:             make(chan raft.RPC, consumerChanSize),
+		chConsumeCache:        make(chan raft.RPC, consumerChanSize),
 		logger:                config.Logger,
 		maxPool:               config.MaxPool,
 		maxInFlight:           config.MaxRPCsInFlight,
@@ -64,7 +65,8 @@ func newTPCTransport(stream raft.StreamLayer, opts ...TCPOption) *TCPTransport {
 	}
 
 	// Create the connection context and then start our listener.
-	trans.setupStreamContext()
+	trans.setupStreamContext(ctx)
+	//nolint:contextcheck // context is passed via setupStreamContext here.
 	go trans.listen()
 
 	return trans
@@ -115,6 +117,8 @@ var (
 // InstallSnapshot is special, in that after the RPC request we stream
 // the entire state. That socket is not re-used as the connection state
 // is not known if there is an error.
+//
+//nolint:govet // Usually initialized once. Preferring readability to struct optimization here.
 type TCPTransport struct {
 	connPool     map[raft.ServerAddress][]*netConn
 	connPoolLock sync.Mutex
@@ -139,6 +143,9 @@ type TCPTransport struct {
 	stream raft.StreamLayer
 
 	// streamCtx is used to cancel existing connection handlers.
+	//nolint:containedctx // we want to be able to re-open the contexts.
+	origCtx context.Context
+	//nolint:containedctx // we want to be able to re-open the contexts.
 	streamCtx     context.Context
 	streamCancel  context.CancelFunc
 	streamCtxLock sync.RWMutex
@@ -147,7 +154,10 @@ type TCPTransport struct {
 	TimeoutScale int
 }
 
-func (s *TCPTransport) Store(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
+// Store asks the master to apply a change command to the raft cluster.
+func (s *TCPTransport) Store(ctx context.Context, id raft.ServerID, target raft.ServerAddress,
+	command *pb.Store,
+) (*pb.StoreResponse, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.timeout)
@@ -159,7 +169,10 @@ func (s *TCPTransport) Store(ctx context.Context, id raft.ServerID, target raft.
 	return &resp, err
 }
 
-func (s *TCPTransport) LatestUID(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
+// LatestUID asks the master to return its latest known / generated uid.
+func (s *TCPTransport) LatestUID(ctx context.Context, id raft.ServerID, target raft.ServerAddress,
+	command *pb.LatestUid,
+) (*pb.LatestUidResponse, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.timeout)
@@ -207,7 +220,7 @@ func (s *TCPTransport) CloseStreams() {
 	// cancelable.
 	s.streamCtxLock.Lock()
 	s.streamCancel()
-	s.setupStreamContext()
+	s.setupStreamContext(s.origCtx)
 	s.streamCtxLock.Unlock()
 }
 
@@ -218,8 +231,10 @@ func (s *TCPTransport) Close() error {
 
 	if !s.shutdown {
 		close(s.shutdownCh)
-		s.stream.Close()
 		s.shutdown = true
+		if err := s.stream.Close(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -266,7 +281,8 @@ func (s *TCPTransport) getPooledConn(target raft.ServerAddress) *netConn {
 	return conn
 }
 
-// getConnFromAddressProvider returns a connection from the server address provider if available, or defaults to a connection using the target server address
+// getConnFromAddressProvider returns a connection from the server address provider if available,
+// or defaults to a connection using the target server address.
 func (s *TCPTransport) getConnFromAddressProvider(id raft.ServerID, target raft.ServerAddress) (*netConn, error) {
 	address := s.getProviderAddressOrFallback(id, target)
 	return s.getConn(address)
@@ -346,7 +362,9 @@ func (s *TCPTransport) AppendEntriesPipeline(id raft.ServerID, target raft.Serve
 }
 
 // AppendEntries implements the Transport interface.
-func (s *TCPTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
+func (s *TCPTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest,
+	resp *raft.AppendEntriesResponse,
+) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
@@ -354,7 +372,9 @@ func (s *TCPTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress
 }
 
 // RequestVote implements the Transport interface.
-func (s *TCPTransport) RequestVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
+func (s *TCPTransport) RequestVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest,
+	resp *raft.RequestVoteResponse,
+) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
@@ -362,7 +382,9 @@ func (s *TCPTransport) RequestVote(id raft.ServerID, target raft.ServerAddress, 
 }
 
 // genericRPC handles a simple request/response RPC.
-func (s *TCPTransport) genericRPC(ctx context.Context, id raft.ServerID, target raft.ServerAddress, rpcType uint8, args interface{}, resp interface{}) error {
+func (s *TCPTransport) genericRPC(ctx context.Context, id raft.ServerID, target raft.ServerAddress, rpcType uint8,
+	args interface{}, resp interface{},
+) error {
 	// Get a conn
 	conn, err := s.getConnFromAddressProvider(id, target)
 	if err != nil {
@@ -390,7 +412,9 @@ func (s *TCPTransport) genericRPC(ctx context.Context, id raft.ServerID, target 
 }
 
 // InstallSnapshot implements the Transport interface.
-func (s *TCPTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
+func (s *TCPTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest,
+	resp *raft.InstallSnapshotResponse, data io.Reader,
+) error {
 	// Get a conn, always close for InstallSnapshot
 	conn, err := s.getConnFromAddressProvider(id, target)
 	if err != nil {
@@ -400,11 +424,7 @@ func (s *TCPTransport) InstallSnapshot(id raft.ServerID, target raft.ServerAddre
 
 	// Set a deadline, scaled by request size
 	if s.timeout > 0 {
-		timeout := s.timeout * time.Duration(args.Size/int64(s.TimeoutScale))
-		if timeout < s.timeout {
-			timeout = s.timeout
-		}
-		_ = conn.conn.SetDeadline(time.Now().Add(timeout))
+		_ = conn.conn.SetDeadline(time.Now().Add(snapshotTimeout(s.timeout, args.Size)))
 	}
 
 	// Send the RPC
@@ -506,7 +526,7 @@ func (s *TCPTransport) handleConn(connCtx context.Context, conn net.Conn) {
 		}
 
 		if err := s.handleCommand(r, dec, enc); err != nil {
-			if err != io.EOF {
+			if errors.Is(err, io.EOF) {
 				s.logger.Error("failed to decode incoming command", "error", err)
 			}
 			return
@@ -519,6 +539,8 @@ func (s *TCPTransport) handleConn(connCtx context.Context, conn net.Conn) {
 }
 
 // handleCommand is used to decode and dispatch a single command.
+//
+//nolint:funlen,maintidx // It's just a big switch
 func (s *TCPTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *codec.Encoder) error {
 	getTypeStart := time.Now()
 
@@ -667,8 +689,8 @@ RESP:
 
 // setupStreamContext is used to create a new stream context. This should be
 // called with the stream lock held.
-func (s *TCPTransport) setupStreamContext() {
-	ctx, cancel := context.WithCancel(context.Background())
+func (s *TCPTransport) setupStreamContext(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
 	s.streamCtx = ctx
 	s.streamCancel = cancel
 }
@@ -736,11 +758,11 @@ func sendRPC(conn *netConn, rpcType uint8, args interface{}) error {
 }
 
 type netConn struct {
-	target raft.ServerAddress
 	conn   net.Conn
 	w      *bufio.Writer
 	dec    *codec.Decoder
 	enc    *codec.Encoder
+	target raft.ServerAddress
 }
 
 func (n *netConn) Release() error {

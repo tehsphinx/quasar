@@ -24,14 +24,15 @@ func newNetPipeline(trans *TCPTransport, conn *netConn, maxInFlight int) *netPip
 		// soon as it's waiting on the first request. So a zero-buffered channel
 		// still allows 1 request to be sent even while decode is still waiting for
 		// a response from the previous one. i.e. two are inflight at the same time.
-		inprogressCh: make(chan *appendFuture, maxInFlight-2),
-		doneCh:       make(chan raft.AppendFuture, maxInFlight-2),
+		inprogressCh: make(chan *appendFuture, maxInFlight-2),     //nolint:mnd // explained above
+		doneCh:       make(chan raft.AppendFuture, maxInFlight-2), //nolint:mnd // explained above
 		shutdownCh:   make(chan struct{}),
 	}
 	go n.decodeResponses()
 	return n
 }
 
+//nolint:govet // Usually initialized once. Preferring readability to struct optimization here.
 type netPipeline struct {
 	conn  *netConn
 	trans *TCPTransport

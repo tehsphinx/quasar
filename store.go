@@ -11,7 +11,7 @@ func wrapStore(s raft.LogStore, fsm *fsmWrapper) *store {
 	}
 }
 
-// store is a wrapper struct for raft.LogStore
+// store is a wrapper struct for raft.LogStore.
 type store struct {
 	raft.LogStore
 

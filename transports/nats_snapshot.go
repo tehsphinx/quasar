@@ -16,37 +16,48 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// InstallSnapshot is used to push a snapshot down to a follower. The data is read from
+// the ReadCloser and streamed to the client.
 func (s *NATSTransport) InstallSnapshot(_ raft.ServerID, address raft.ServerAddress,
 	request *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader,
 ) error {
-	subj := fmt.Sprintf("quasar.%s.%s.install.snapshot", s.cacheName, address)
-
-	bts, err := proto.Marshal(pb.ToInstallSnapshotRequest(request))
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.TODO(), s.timeout)
+	ctx, cancel := context.WithTimeout(context.TODO(), snapshotTimeout(s.timeout, request.Size))
 	defer cancel()
 
-	response, err := s.conn.RequestWithContext(ctx, subj, bts)
+	protoRespCh, err := s.requestOpenChannel(ctx, address, request)
 	if err != nil {
 		return err
 	}
 
-	var protoRespCh pb.InstallSnapshotChannel
-	if r := proto.Unmarshal(response.Data, &protoRespCh); r != nil {
-		return r
-	}
-
-	recvSubj := protoRespCh.GetSubject() + ".resp"
 	chResp := make(chan []byte)
+	recvSubj := protoRespCh.GetSubject() + ".resp"
 	respSub, err := s.conn.Subscribe(recvSubj, func(msg *nats.Msg) {
 		chResp <- msg.Data
 	})
+	if err != nil {
+		return err
+	}
 	defer func() { _ = respSub.Unsubscribe() }()
 
 	sendSubj := protoRespCh.GetSubject() + ".send"
+	if r := s.sendSnapshot(sendSubj, data); r != nil {
+		return r
+	}
+
+	select {
+	case <-ctx.Done():
+		return errors.New("timeout waiting for response on install snapshot")
+	case respBts := <-chResp:
+		var protoResp pb.CommandResponse
+		if r := proto.Unmarshal(respBts, &protoResp); r != nil {
+			return r
+		}
+		*resp = *protoResp.GetInstallSnapshot().Convert()
+	}
+	return nil
+}
+
+func (s *NATSTransport) sendSnapshot(sendSubj string, data io.Reader) error {
 	buf := make([]byte, maxPkgSize)
 	var counter int
 	for {
@@ -66,34 +77,84 @@ func (s *NATSTransport) InstallSnapshot(_ raft.ServerID, address raft.ServerAddr
 			return e
 		}
 	}
-
-	select {
-	case <-time.After(60 * time.Second):
-		return errors.New("timeout waiting for response on install snapshot")
-	case respBts := <-chResp:
-		var protoResp pb.CommandResponse
-		if r := proto.Unmarshal(respBts, &protoResp); r != nil {
-			return r
-		}
-		*resp = *protoResp.GetInstallSnapshot().Convert()
-	}
 	return nil
 }
 
-func (s *NATSTransport) handleInstallSnapshot(msg *nats.Msg) {
-	var protoMsg pb.InstallSnapshotRequest
-	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-		s.logger.Error("failed to decode incoming command", "error", r)
-		return
+func (s *NATSTransport) requestOpenChannel(ctx context.Context, address raft.ServerAddress,
+	request *raft.InstallSnapshotRequest,
+) (*pb.InstallSnapshotChannel, error) {
+	bts, err := proto.Marshal(pb.ToInstallSnapshotRequest(request))
+	if err != nil {
+		return nil, err
 	}
 
-	chanSubj := "quasar.snapshot.channel." + uuid.NewString()
+	subj := fmt.Sprintf("quasar.%s.%s.install.snapshot", s.cacheName, address)
+	response, err := s.conn.RequestWithContext(ctx, subj, bts)
+	if err != nil {
+		return nil, err
+	}
+
+	var protoRespCh pb.InstallSnapshotChannel
+	if r := proto.Unmarshal(response.Data, &protoRespCh); r != nil {
+		return nil, r
+	}
+
+	return &protoRespCh, nil
+}
+
+func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(msg *nats.Msg) {
+	return func(msg *nats.Msg) {
+		chanSubj := "quasar.snapshot.channel." + uuid.NewString()
+		pipeReader, chanSub, err := s.openNatsStream(chanSubj)
+		if err != nil {
+			s.logger.Error("failed to open snapshot channel", "error", err)
+			return
+		}
+		defer func() { _ = chanSub.Unsubscribe() }()
+
+		bts, err := proto.Marshal(&pb.InstallSnapshotChannel{Subject: chanSubj})
+		if err != nil {
+			s.logger.Error("failed to marshal InstallSnapshotChannel message", "error", err)
+			return
+		}
+		if r := msg.Respond(bts); r != nil {
+			s.logger.Error("failed to send install snapshot channel message", "error", r)
+			return
+		}
+
+		chResp, rpc, err := s.buildConsumeMsg(msg, pipeReader)
+		if err != nil {
+			s.logger.Error("failed to decode incoming command", "error", err)
+			return
+		}
+
+		s.chConsume <- rpc
+
+		bts, err = s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
+			resp, _ := i.(*raft.InstallSnapshotResponse)
+			return &pb.CommandResponse{Resp: &pb.CommandResponse_InstallSnapshot{
+				InstallSnapshot: pb.ToInstallSnapshotResponse(resp),
+			}}
+		})
+		if err != nil {
+			s.logger.Error("failed to send response", "error", err)
+			return
+		}
+
+		respSubj := chanSubj + ".resp"
+		if r := s.conn.Publish(respSubj, bts); r != nil {
+			s.logger.Error("failed to send response", "error", r)
+		}
+	}
+}
+
+func (s *NATSTransport) openNatsStream(subj string) (*io.PipeReader, *nats.Subscription, error) {
 	pipeReader, pipeWriter := io.Pipe()
 	timer := time.AfterFunc(snapshotPkgTimout, func() {
 		_ = pipeWriter.CloseWithError(context.DeadlineExceeded)
 	})
 
-	chanSub, err := s.conn.Subscribe(chanSubj+".send.*", func(msg *nats.Msg) {
+	chanSub, err := s.conn.Subscribe(subj+".send.*", func(msg *nats.Msg) {
 		timer.Reset(snapshotPkgTimout)
 		if _, r := pipeWriter.Write(msg.Data); r != nil {
 			_ = pipeWriter.CloseWithError(r)
@@ -104,20 +165,13 @@ func (s *NATSTransport) handleInstallSnapshot(msg *nats.Msg) {
 			_ = pipeWriter.Close()
 		}
 	})
-	if err != nil {
-		s.logger.Error("failed to open snapshot channel", "error", err)
-		return
-	}
-	defer func() { _ = chanSub.Unsubscribe() }()
+	return pipeReader, chanSub, err
+}
 
-	bts, err := proto.Marshal(&pb.InstallSnapshotChannel{Subject: chanSubj})
-	if err != nil {
-		s.logger.Error("failed to marshal InstallSnapshotChannel message", "error", err)
-		return
-	}
-	if r := msg.Respond(bts); r != nil {
-		s.logger.Error("failed to send install snapshot channel message", "error", r)
-		return
+func (s *NATSTransport) buildConsumeMsg(msg *nats.Msg, pipeReader *io.PipeReader) (chan raft.RPCResponse, raft.RPC, error) {
+	var protoMsg pb.InstallSnapshotRequest
+	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+		return nil, raft.RPC{}, r
 	}
 
 	// Create the RPC object
@@ -127,22 +181,5 @@ func (s *NATSTransport) handleInstallSnapshot(msg *nats.Msg) {
 		Command:  protoMsg.Convert(),
 		Reader:   pipeReader,
 	}
-
-	s.chConsume <- rpc
-
-	bts, err = s.awaitResponse(chResp, func(i interface{}) *pb.CommandResponse {
-		resp, _ := i.(*raft.InstallSnapshotResponse)
-		return &pb.CommandResponse{Resp: &pb.CommandResponse_InstallSnapshot{
-			InstallSnapshot: pb.ToInstallSnapshotResponse(resp),
-		}}
-	})
-	if err != nil {
-		s.logger.Error("failed to send response", "error", err)
-		return
-	}
-
-	respSubj := chanSubj + ".resp"
-	if r := s.conn.Publish(respSubj, bts); r != nil {
-		s.logger.Error("failed to send response", "error", r)
-	}
+	return chResp, rpc, nil
 }

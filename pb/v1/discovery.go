@@ -4,6 +4,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
+// ToServerInfo converts the raft.Server to a *pb.ServerInfo.
 func ToServerInfo(info raft.Server) *ServerInfo {
 	return &ServerInfo{
 		ServerId:      string(info.ID),
@@ -12,6 +13,7 @@ func ToServerInfo(info raft.Server) *ServerInfo {
 	}
 }
 
+// Convert converts the *pb.ServerInfo to a raft.Server.
 func (x *ServerInfo) Convert() raft.Server {
 	if x == nil {
 		return raft.Server{}

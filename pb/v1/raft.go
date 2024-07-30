@@ -5,6 +5,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// ToRPCHeader converts the *raft.RPCHeader to a *pb.RPCHeader.
 func ToRPCHeader(in raft.RPCHeader) *RPCHeader {
 	return &RPCHeader{
 		ProtocolVersion: uint32(in.ProtocolVersion),
@@ -13,6 +14,7 @@ func ToRPCHeader(in raft.RPCHeader) *RPCHeader {
 	}
 }
 
+// Convert converts the *pb.RPCHeader to a *raft.RPCHeader.
 func (x *RPCHeader) Convert() raft.RPCHeader {
 	return raft.RPCHeader{
 		ProtocolVersion: raft.ProtocolVersion(x.GetProtocolVersion()),
@@ -21,10 +23,12 @@ func (x *RPCHeader) Convert() raft.RPCHeader {
 	}
 }
 
+// ToAppendEntriesRequest converts the *raft.AppendEntriesRequest to a *pb.AppendEntriesRequest.
 func ToAppendEntriesRequest(in *raft.AppendEntriesRequest) *AppendEntriesRequest {
 	return &AppendEntriesRequest{
-		Header:            ToRPCHeader(in.GetRPCHeader()),
-		Term:              in.Term,
+		Header: ToRPCHeader(in.GetRPCHeader()),
+		Term:   in.Term,
+		//nolint:staticcheck // just to be backwards compatible
 		Leader:            in.Leader,
 		PrevLogEntry:      in.PrevLogEntry,
 		PrevLogTerm:       in.PrevLogTerm,
@@ -33,6 +37,7 @@ func ToAppendEntriesRequest(in *raft.AppendEntriesRequest) *AppendEntriesRequest
 	}
 }
 
+// Convert converts the *pb.AppendEntriesRequest to a *raft.AppendEntriesRequest.
 func (x *AppendEntriesRequest) Convert() *raft.AppendEntriesRequest {
 	return &raft.AppendEntriesRequest{
 		RPCHeader:         x.GetHeader().Convert(),
@@ -45,6 +50,7 @@ func (x *AppendEntriesRequest) Convert() *raft.AppendEntriesRequest {
 	}
 }
 
+// ToAppendEntriesResponse converts the *raft.AppendEntriesResponse to a *pb.AppendEntriesResponse.
 func ToAppendEntriesResponse(in *raft.AppendEntriesResponse) *AppendEntriesResponse {
 	return &AppendEntriesResponse{
 		Header:         ToRPCHeader(in.GetRPCHeader()),
@@ -55,6 +61,7 @@ func ToAppendEntriesResponse(in *raft.AppendEntriesResponse) *AppendEntriesRespo
 	}
 }
 
+// Convert converts the *pb.AppendEntriesResponse to a *raft.AppendEntriesResponse.
 func (x *AppendEntriesResponse) Convert() *raft.AppendEntriesResponse {
 	return &raft.AppendEntriesResponse{
 		RPCHeader:      x.GetHeader().Convert(),
@@ -65,10 +72,12 @@ func (x *AppendEntriesResponse) Convert() *raft.AppendEntriesResponse {
 	}
 }
 
+// ToRequestVoteRequest converts the *raft.RequestVoteRequest to a *pb.RequestVoteRequest.
 func ToRequestVoteRequest(in *raft.RequestVoteRequest) *RequestVoteRequest {
 	return &RequestVoteRequest{
-		Header:             ToRPCHeader(in.GetRPCHeader()),
-		Term:               in.Term,
+		Header: ToRPCHeader(in.GetRPCHeader()),
+		Term:   in.Term,
+		//nolint:staticcheck // just to be backwards compatible
 		Candidate:          in.Candidate,
 		LastLogIndex:       in.LastLogIndex,
 		LastLogTerm:        in.LastLogTerm,
@@ -76,6 +85,7 @@ func ToRequestVoteRequest(in *raft.RequestVoteRequest) *RequestVoteRequest {
 	}
 }
 
+// Convert converts the *pb.RequestVoteRequest to a *raft.RequestVoteRequest.
 func (x *RequestVoteRequest) Convert() *raft.RequestVoteRequest {
 	return &raft.RequestVoteRequest{
 		RPCHeader:          x.GetHeader().Convert(),
@@ -87,6 +97,7 @@ func (x *RequestVoteRequest) Convert() *raft.RequestVoteRequest {
 	}
 }
 
+// ToRequestVoteResponse converts the *raft.RequestVoteResponse to a *pb.RequestVoteResponse.
 func ToRequestVoteResponse(in *raft.RequestVoteResponse) *RequestVoteResponse {
 	return &RequestVoteResponse{
 		Header:  ToRPCHeader(in.GetRPCHeader()),
@@ -96,6 +107,7 @@ func ToRequestVoteResponse(in *raft.RequestVoteResponse) *RequestVoteResponse {
 	}
 }
 
+// Convert converts the *pb.RequestVoteResponse to a *raft.RequestVoteResponse.
 func (x *RequestVoteResponse) Convert() *raft.RequestVoteResponse {
 	return &raft.RequestVoteResponse{
 		RPCHeader: x.GetHeader().Convert(),
@@ -105,6 +117,7 @@ func (x *RequestVoteResponse) Convert() *raft.RequestVoteResponse {
 	}
 }
 
+// ToInstallSnapshotRequest converts the *raft.InstallSnapshotRequest to a *pb.InstallSnapshotRequest.
 func ToInstallSnapshotRequest(in *raft.InstallSnapshotRequest) *InstallSnapshotRequest {
 	return &InstallSnapshotRequest{
 		Header:             ToRPCHeader(in.GetRPCHeader()),
@@ -120,6 +133,7 @@ func ToInstallSnapshotRequest(in *raft.InstallSnapshotRequest) *InstallSnapshotR
 	}
 }
 
+// Convert converts the *pb.InstallSnapshotRequest to a *raft.InstallSnapshotRequest.
 func (x *InstallSnapshotRequest) Convert() *raft.InstallSnapshotRequest {
 	return &raft.InstallSnapshotRequest{
 		RPCHeader:          x.GetHeader().Convert(),
@@ -135,6 +149,7 @@ func (x *InstallSnapshotRequest) Convert() *raft.InstallSnapshotRequest {
 	}
 }
 
+// ToInstallSnapshotResponse converts the *raft.InstallSnapshotResponse to a *pb.InstallSnapshotResponse.
 func ToInstallSnapshotResponse(in *raft.InstallSnapshotResponse) *InstallSnapshotResponse {
 	return &InstallSnapshotResponse{
 		Header:  ToRPCHeader(in.GetRPCHeader()),
@@ -143,6 +158,7 @@ func ToInstallSnapshotResponse(in *raft.InstallSnapshotResponse) *InstallSnapsho
 	}
 }
 
+// Convert converts the *pb.InstallSnapshotResponse to a *raft.InstallSnapshotResponse.
 func (x *InstallSnapshotResponse) Convert() *raft.InstallSnapshotResponse {
 	return &raft.InstallSnapshotResponse{
 		RPCHeader: x.GetHeader().Convert(),
@@ -151,30 +167,35 @@ func (x *InstallSnapshotResponse) Convert() *raft.InstallSnapshotResponse {
 	}
 }
 
+// ToTimeoutNowRequest converts the *raft.TimeoutNowRequest to a *pb.TimeoutNowRequest.
 func ToTimeoutNowRequest(in *raft.TimeoutNowRequest) *TimeoutNowRequest {
 	return &TimeoutNowRequest{
 		Header: ToRPCHeader(in.GetRPCHeader()),
 	}
 }
 
+// Convert converts the *pb.TimeoutNowRequest to a *raft.TimeoutNowRequest.
 func (x *TimeoutNowRequest) Convert() *raft.TimeoutNowRequest {
 	return &raft.TimeoutNowRequest{
 		RPCHeader: x.GetHeader().Convert(),
 	}
 }
 
+// ToTimeoutNowResponse converts the *raft.TimeoutNowResponse to a *pb.TimeoutNowResponse.
 func ToTimeoutNowResponse(in *raft.TimeoutNowResponse) *TimeoutNowResponse {
 	return &TimeoutNowResponse{
 		Header: ToRPCHeader(in.GetRPCHeader()),
 	}
 }
 
+// Convert converts the *pb.TimeoutNowResponse to a *raft.TimeoutNowResponse.
 func (x *TimeoutNowResponse) Convert() *raft.TimeoutNowResponse {
 	return &raft.TimeoutNowResponse{
 		RPCHeader: x.GetHeader().Convert(),
 	}
 }
 
+// FromLogs converts a []*pb.Log to []*raft.Log.
 func FromLogs(in []*Log) []*raft.Log {
 	logs := make([]*raft.Log, 0, len(in))
 	for _, l := range in {
@@ -184,6 +205,7 @@ func FromLogs(in []*Log) []*raft.Log {
 	return logs
 }
 
+// ToLogs converts a []*raft.Log to []*pb.Log.
 func ToLogs(in []*raft.Log) []*Log {
 	logs := make([]*Log, 0, len(in))
 	for _, log := range in {
@@ -192,6 +214,7 @@ func ToLogs(in []*raft.Log) []*Log {
 	return logs
 }
 
+// ToLog converts a *raft.Log to *pb.Log.
 func ToLog(in *raft.Log) *Log {
 	return &Log{
 		Index:      in.Index,
@@ -203,6 +226,7 @@ func ToLog(in *raft.Log) *Log {
 	}
 }
 
+// Convert converts the *pb.Log to a *raft.Log.
 func (x *Log) Convert() *raft.Log {
 	return &raft.Log{
 		Index:      x.GetIndex(),

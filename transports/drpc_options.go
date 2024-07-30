@@ -9,7 +9,7 @@ type DRPCOption func(cfg *drpcOptions)
 
 func getDRPCOptions(opts []DRPCOption) drpcOptions {
 	cfg := drpcOptions{
-		timeout: 5 * time.Second,
+		timeout: defaultTimout,
 	}
 	for _, opt := range opts {
 		opt(&cfg)

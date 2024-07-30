@@ -6,6 +6,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// NewNatsKVStore creates a new NATS JetStream based key/value store.
 func NewNatsKVStore(kv nats.KeyValue) KVStore {
 	return &natsKVStore{
 		kv: kv,

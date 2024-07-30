@@ -10,6 +10,7 @@ import (
 	"golang.org/x/exp/maps"
 )
 
+// Discovery defines a auto discovery for servers of the cache.
 type Discovery interface {
 	Inject(cache *DiscoveryInjector)
 	Run(ctx context.Context) error
@@ -23,6 +24,9 @@ func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 	}
 }
 
+// DiscoveryInjector provides access to the underlying cache in a Discovery implementation.
+//
+//nolint:govet // Usually initialized once. Preferring readability to struct optimization here.
 type DiscoveryInjector struct {
 	cache *Cache
 
@@ -32,14 +36,18 @@ type DiscoveryInjector struct {
 	applied  map[raft.ServerID]struct{}
 }
 
+// Name returns the caches name. This name identifies a cache and separates it from other caches on the network.
 func (s *DiscoveryInjector) Name() string {
 	return s.cache.name
 }
 
+// ServerInfo returns the raft.Server info of this cache instance.
 func (s *DiscoveryInjector) ServerInfo() raft.Server {
 	return s.cache.serverInfo()
 }
 
+// ProcessServer processes the given server. It adds it to the list of known servers.
+// If it is a new server, it will also be added to raft if we are the leader.
 func (s *DiscoveryInjector) ProcessServer(srv raft.Server) {
 	isNew := s.setServer(srv)
 	if !isNew {
@@ -78,7 +86,7 @@ func (s *DiscoveryInjector) getAddServerFunc(voter bool) (addServerFunc, error) 
 }
 
 func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) {
-	chPeerChange := make(chan raft.Observation, 5)
+	chPeerChange := make(chan raft.Observation, observationChanSize)
 	observer := raft.NewObserver(chPeerChange, true, func(o *raft.Observation) bool {
 		if _, ok := o.Data.(raft.PeerObservation); ok {
 			return true
@@ -120,6 +128,7 @@ func (s *DiscoveryInjector) addMissingServers() {
 			continue
 		}
 
+		//nolint:staticcheck // empty branch will be filled later
 		if err := s.addServer(srv); err != nil {
 			// TODO: log?
 		}

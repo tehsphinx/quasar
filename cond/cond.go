@@ -1,3 +1,4 @@
+// Package cond implements a customized sync.Cond.
 package cond
 
 import (

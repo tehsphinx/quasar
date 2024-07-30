@@ -3,7 +3,6 @@ package transports
 import (
 	"net"
 	"sync"
-	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
@@ -17,9 +16,9 @@ func newClientsPool() *clients {
 }
 
 type clients struct {
+	clients  map[raft.ServerAddress]pb.DRPCQuasarServiceClient
 	m        sync.RWMutex
 	mConnect sync.Mutex
-	clients  map[raft.ServerAddress]pb.DRPCQuasarServiceClient
 }
 
 func (s *clients) GetClient(target raft.ServerAddress) (pb.DRPCQuasarServiceClient, error) {
@@ -64,7 +63,7 @@ func (s *clients) set(target raft.ServerAddress, client pb.DRPCQuasarServiceClie
 }
 
 func getClient(target raft.ServerAddress) (pb.DRPCQuasarServiceClient, error) {
-	conn, err := net.DialTimeout("tcp", string(target), 5*time.Second)
+	conn, err := net.DialTimeout("tcp", string(target), defaultTimout)
 	if err != nil {
 		return nil, err
 	}

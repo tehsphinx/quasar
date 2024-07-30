@@ -4,6 +4,7 @@ import (
 	"sync"
 )
 
+// NewInMemKVStore creates a very simple in-memory key/value store based on a map.
 func NewInMemKVStore() KVStore {
 	return &memKVStore{
 		store: map[string][]byte{},
@@ -13,8 +14,8 @@ func NewInMemKVStore() KVStore {
 var _ KVStore = (*memKVStore)(nil)
 
 type memKVStore struct {
-	m     sync.RWMutex
 	store map[string][]byte
+	m     sync.RWMutex
 }
 
 func (s *memKVStore) Store(key string, data []byte) error {

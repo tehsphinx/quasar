@@ -13,9 +13,11 @@ import (
 type TCPOption func(cfg *tcpOptions)
 
 func getTCPOptions(opts []TCPOption) tcpOptions {
+	const defaultMaxPool = 3
+
 	cfg := tcpOptions{
-		maxPool: 3,
-		timeout: 5 * time.Second,
+		maxPool: defaultMaxPool,
+		timeout: defaultTimout,
 		output:  os.Stderr,
 	}
 	for _, opt := range opts {
@@ -24,6 +26,7 @@ func getTCPOptions(opts []TCPOption) tcpOptions {
 	return cfg
 }
 
+//nolint:govet // Usually initialized once. Preferring readability to struct optimization here.
 type tcpOptions struct {
 	maxPool int
 	timeout time.Duration
@@ -35,9 +38,9 @@ type tcpOptions struct {
 
 // WithTCPMaxPool limits the max amount of connections in the TCP connection pool.
 // If the connection pool is full, unused connections are released. Setting defaults to 3.
-func WithTCPMaxPool(max int) TCPOption {
+func WithTCPMaxPool(maxPool int) TCPOption {
 	return func(cfg *tcpOptions) {
-		cfg.maxPool = max
+		cfg.maxPool = maxPool
 	}
 }
 

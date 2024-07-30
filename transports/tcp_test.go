@@ -15,8 +15,11 @@ import (
 )
 
 func TestNetworkTransport_CloseStreams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// Transport 1 is consumer
-	trans1, err := NewTCPTransport("localhost:0", nil,
+	trans1, err := NewTCPTransport(ctx, "localhost:0", nil,
 		WithTCPMaxPool(2),
 		WithTCPTimeout(time.Second),
 		WithTCPLogger(newTestLogger(t)),
@@ -74,7 +77,7 @@ func TestNetworkTransport_CloseStreams(t *testing.T) {
 	}()
 
 	// Transport 2 makes outbound request, 3 conn pool
-	trans2, err := NewTCPTransport("localhost:0", nil,
+	trans2, err := NewTCPTransport(ctx, "localhost:0", nil,
 		WithTCPMaxPool(3),
 		WithTCPTimeout(time.Second),
 		WithTCPLogger(newTestLogger(t)),
@@ -131,7 +134,10 @@ func TestNetworkTransport_CloseStreams(t *testing.T) {
 }
 
 func TestNetworkTransport_StartStop(t *testing.T) {
-	trans, err := NewTCPTransport("localhost:0", nil,
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	trans, err := NewTCPTransport(ctx, "localhost:0", nil,
 		WithTCPMaxPool(2),
 		WithTCPTimeout(time.Second),
 		WithTCPLogger(newTestLogger(t)))
@@ -142,8 +148,11 @@ func TestNetworkTransport_StartStop(t *testing.T) {
 }
 
 func TestNetworkTransport_Heartbeat_FastPath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// Transport 1 is consumer
-	trans1, err := NewTCPTransport("localhost:0", nil,
+	trans1, err := NewTCPTransport(ctx, "localhost:0", nil,
 		WithTCPMaxPool(2),
 		WithTCPTimeout(time.Second),
 		WithTCPLogger(newTestLogger(t)),
@@ -180,7 +189,7 @@ func TestNetworkTransport_Heartbeat_FastPath(t *testing.T) {
 	trans1.SetHeartbeatHandler(fastpath)
 
 	// Transport 2 makes outbound request
-	trans2, err := NewTCPTransport("localhost:0", nil,
+	trans2, err := NewTCPTransport(ctx, "localhost:0", nil,
 		WithTCPMaxPool(2),
 		WithTCPTimeout(time.Second),
 		WithTCPLogger(newTestLogger(t)),
@@ -232,9 +241,12 @@ func makeAppendRPCResponse() raft.AppendEntriesResponse {
 }
 
 func TestNetworkTransport_AppendEntries(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	for _, useAddrProvider := range []bool{true, false} {
 		// Transport 1 is consumer
-		trans1, err := makeTransport(t, useAddrProvider, "localhost:0")
+		trans1, err := makeTransport(ctx, t, useAddrProvider, "localhost:0")
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -264,7 +276,7 @@ func TestNetworkTransport_AppendEntries(t *testing.T) {
 		}()
 
 		// Transport 2 makes outbound request
-		trans2, err := makeTransport(t, useAddrProvider, string(trans1.LocalAddr()))
+		trans2, err := makeTransport(ctx, t, useAddrProvider, string(trans1.LocalAddr()))
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -283,9 +295,12 @@ func TestNetworkTransport_AppendEntries(t *testing.T) {
 }
 
 func TestNetworkTransport_AppendEntriesPipeline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	for _, useAddrProvider := range []bool{true, false} {
 		// Transport 1 is consumer
-		trans1, err := makeTransport(t, useAddrProvider, "localhost:0")
+		trans1, err := makeTransport(ctx, t, useAddrProvider, "localhost:0")
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -317,7 +332,7 @@ func TestNetworkTransport_AppendEntriesPipeline(t *testing.T) {
 		}()
 
 		// Transport 2 makes outbound request
-		trans2, err := makeTransport(t, useAddrProvider, string(trans1.LocalAddr()))
+		trans2, err := makeTransport(ctx, t, useAddrProvider, string(trans1.LocalAddr()))
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -346,14 +361,17 @@ func TestNetworkTransport_AppendEntriesPipeline(t *testing.T) {
 				t.Fatalf("timeout")
 			}
 		}
-		pipeline.Close()
 
+		_ = pipeline.Close()
 	}
 }
 
 func TestNetworkTransport_AppendEntriesPipeline_CloseStreams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// Transport 1 is consumer
-	trans1, err := makeTransport(t, true, "localhost:0")
+	trans1, err := makeTransport(ctx, t, true, "localhost:0")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -387,7 +405,7 @@ func TestNetworkTransport_AppendEntriesPipeline_CloseStreams(t *testing.T) {
 	}()
 
 	// Transport 2 makes outbound request
-	trans2, err := makeTransport(t, true, string(trans1.LocalAddr()))
+	trans2, err := makeTransport(ctx, t, true, string(trans1.LocalAddr()))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -446,6 +464,9 @@ func TestNetworkTransport_AppendEntriesPipeline_MaxRPCsInFlight(t *testing.T) {
 	// Test the important cases 0 (default to 2), 1 (disabled), 2 and "some"
 	for _, max := range []int{0, 1, 2, 10} {
 		t.Run(fmt.Sprintf("max=%d", max), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
 			asrt := is.New(t)
 
 			config := &raft.NetworkTransportConfig{
@@ -458,7 +479,7 @@ func TestNetworkTransport_AppendEntriesPipeline_MaxRPCsInFlight(t *testing.T) {
 			}
 
 			// Transport 1 is consumer
-			trans1, err := NewTCPTransport("localhost:0", nil, WithTCPConfig(config))
+			trans1, err := NewTCPTransport(ctx, "localhost:0", nil, WithTCPConfig(config))
 			asrt.NoErr(err)
 			defer trans1.Close()
 
@@ -466,12 +487,9 @@ func TestNetworkTransport_AppendEntriesPipeline_MaxRPCsInFlight(t *testing.T) {
 			args := makeAppendRPC()
 			resp := makeAppendRPCResponse()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
 			// Transport 2 makes outbound request
 			config.ServerAddressProvider = &testAddrProvider{string(trans1.LocalAddr())}
-			trans2, err := NewTCPTransport("localhost:0", nil, WithTCPConfig(config))
+			trans2, err := NewTCPTransport(ctx, "localhost:0", nil, WithTCPConfig(config))
 			asrt.NoErr(err)
 			defer trans2.Close()
 
@@ -544,9 +562,12 @@ func TestNetworkTransport_AppendEntriesPipeline_MaxRPCsInFlight(t *testing.T) {
 }
 
 func TestNetworkTransport_RequestVote(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	for _, useAddrProvider := range []bool{true, false} {
 		// Transport 1 is consumer
-		trans1, err := makeTransport(t, useAddrProvider, "localhost:0")
+		trans1, err := makeTransport(ctx, t, useAddrProvider, "localhost:0")
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -586,7 +607,7 @@ func TestNetworkTransport_RequestVote(t *testing.T) {
 		}()
 
 		// Transport 2 makes outbound request
-		trans2, err := makeTransport(t, useAddrProvider, string(trans1.LocalAddr()))
+		trans2, err := makeTransport(ctx, t, useAddrProvider, string(trans1.LocalAddr()))
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -600,14 +621,16 @@ func TestNetworkTransport_RequestVote(t *testing.T) {
 		if !reflect.DeepEqual(resp, out) {
 			t.Fatalf("command mismatch: %#v %#v", resp, out)
 		}
-
 	}
 }
 
 func TestNetworkTransport_InstallSnapshot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	for _, useAddrProvider := range []bool{true, false} {
 		// Transport 1 is consumer
-		trans1, err := makeTransport(t, useAddrProvider, "localhost:0")
+		trans1, err := makeTransport(ctx, t, useAddrProvider, "localhost:0")
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -658,13 +681,13 @@ func TestNetworkTransport_InstallSnapshot(t *testing.T) {
 		}()
 
 		// Transport 2 makes outbound request
-		trans2, err := makeTransport(t, useAddrProvider, string(trans1.LocalAddr()))
+		trans2, err := makeTransport(ctx, t, useAddrProvider, string(trans1.LocalAddr()))
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
 		defer trans2.Close()
 		// Create a buffer
-		buf := bytes.NewBuffer([]byte("0123456789"))
+		buf := bytes.NewBufferString("0123456789")
 
 		var out raft.InstallSnapshotResponse
 		if err := trans2.InstallSnapshot("id1", trans1.LocalAddr(), &args, &out, buf); err != nil {
@@ -675,13 +698,15 @@ func TestNetworkTransport_InstallSnapshot(t *testing.T) {
 		if !reflect.DeepEqual(resp, out) {
 			t.Fatalf("command mismatch: %#v %#v", resp, out)
 		}
-
 	}
 }
 
 func TestNetworkTransport_EncodeDecode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// Transport 1 is consumer
-	trans1, err := NewTCPTransport("localhost:0", nil,
+	trans1, err := NewTCPTransport(ctx, "localhost:0", nil,
 		WithTCPMaxPool(2),
 		WithTCPTimeout(time.Second),
 		WithTCPLogger(newTestLogger(t)),
@@ -701,12 +726,15 @@ func TestNetworkTransport_EncodeDecode(t *testing.T) {
 }
 
 func TestNetworkTransport_EncodeDecode_AddressProvider(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	addressOverride := "localhost:11111"
 	config := &raft.NetworkTransportConfig{
 		MaxPool: 2, Timeout: time.Second, Logger: newTestLogger(t),
 		ServerAddressProvider: &testAddrProvider{addressOverride},
 	}
-	trans1, err := NewTCPTransport("localhost:0", nil, WithTCPConfig(config))
+	trans1, err := NewTCPTransport(ctx, "localhost:0", nil, WithTCPConfig(config))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -722,8 +750,11 @@ func TestNetworkTransport_EncodeDecode_AddressProvider(t *testing.T) {
 }
 
 func TestNetworkTransport_PooledConn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// Transport 1 is consumer
-	trans1, err := NewTCPTransport("localhost:0", nil,
+	trans1, err := NewTCPTransport(ctx, "localhost:0", nil,
 		WithTCPMaxPool(2),
 		WithTCPTimeout(time.Second),
 		WithTCPLogger(newTestLogger(t)),
@@ -781,7 +812,7 @@ func TestNetworkTransport_PooledConn(t *testing.T) {
 	}()
 
 	// Transport 2 makes outbound request, 3 conn pool
-	trans2, err := NewTCPTransport("localhost:0", nil,
+	trans2, err := NewTCPTransport(ctx, "localhost:0", nil,
 		WithTCPMaxPool(3),
 		WithTCPTimeout(time.Second),
 		WithTCPLogger(newTestLogger(t)),
@@ -829,7 +860,7 @@ func TestNetworkTransport_PooledConn(t *testing.T) {
 	}
 }
 
-func makeTransport(t *testing.T, useAddrProvider bool, addressOverride string) (*TCPTransport, error) {
+func makeTransport(ctx context.Context, t *testing.T, useAddrProvider bool, addressOverride string) (*TCPTransport, error) {
 	t.Helper()
 
 	config := &raft.NetworkTransportConfig{
@@ -843,7 +874,7 @@ func makeTransport(t *testing.T, useAddrProvider bool, addressOverride string) (
 	if useAddrProvider {
 		config.ServerAddressProvider = &testAddrProvider{addressOverride}
 	}
-	return NewTCPTransport("localhost:0", nil, WithTCPConfig(config))
+	return NewTCPTransport(ctx, "localhost:0", nil, WithTCPConfig(config))
 }
 
 type testAddrProvider struct {

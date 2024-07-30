@@ -1,6 +1,7 @@
 package transports
 
 import (
+	"context"
 	"errors"
 	"net"
 )
@@ -11,14 +12,14 @@ var (
 )
 
 // NewTCPTransport creates a tcp transport layer for the cache.
-func NewTCPTransport(bindAddr string, advertise net.Addr, opts ...TCPOption) (*TCPTransport, error) {
+func NewTCPTransport(ctx context.Context, bindAddr string, advertise net.Addr, opts ...TCPOption) (*TCPTransport, error) {
 	// Try to bind
 	list, err := net.Listen("tcp", bindAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create stream
+	//nolint:forcetypeassert // listener was opened above. Can't be anything else.
 	stream := &TCPStreamLayer{
 		advertise: advertise,
 		listener:  list.(*net.TCPListener),
@@ -36,6 +37,6 @@ func NewTCPTransport(bindAddr string, advertise net.Addr, opts ...TCPOption) (*T
 	}
 
 	// Create the network transport
-	trans := newTPCTransport(stream, opts...)
+	trans := newTPCTransport(ctx, stream, opts...)
 	return trans, nil
 }

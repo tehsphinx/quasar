@@ -26,6 +26,8 @@ const (
 )
 
 // inmemPipeline is used to pipeline requests for the in-mem transport.
+//
+//nolint:govet // Usually initialized once. Preferring readability to struct optimization here.
 type inmemPipeline struct {
 	trans    *InmemTransport
 	peer     *InmemTransport
@@ -47,19 +49,22 @@ type inmemPipelineInflight struct {
 // InmemTransport Implements the Transport interface, to allow Raft to be
 // tested in-memory without going over a network.
 type InmemTransport struct {
-	sync.RWMutex
 	consumerCh     chan raft.RPC
 	chConsumeCache chan raft.RPC
 	localAddr      raft.ServerAddress
 	peers          map[raft.ServerAddress]*InmemTransport
 	pipelines      []*inmemPipeline
-	timeout        time.Duration
+
+	m       sync.RWMutex
+	timeout time.Duration
 }
 
+// CacheConsumer returns the cache consumer channel to which all incoming cache commands are sent.
 func (i *InmemTransport) CacheConsumer() <-chan raft.RPC {
 	return i.chConsumeCache
 }
 
+// Store asks the master to apply a change command to the raft cluster.
 func (i *InmemTransport) Store(ctx context.Context, _ raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -72,10 +77,14 @@ func (i *InmemTransport) Store(ctx context.Context, _ raft.ServerID, target raft
 		return nil, err
 	}
 
+	//nolint:forcetypeassert // can't be anything else.
 	return rpcResp.Response.(*pb.StoreResponse), nil
 }
 
-func (i *InmemTransport) LatestUID(ctx context.Context, _ raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error) {
+// LatestUID asks the master to return its latest known / generated uid.
+func (i *InmemTransport) LatestUID(ctx context.Context, _ raft.ServerID, target raft.ServerAddress,
+	command *pb.LatestUid,
+) (*pb.LatestUidResponse, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, i.timeout)
@@ -87,11 +96,14 @@ func (i *InmemTransport) LatestUID(ctx context.Context, _ raft.ServerID, target 
 		return nil, err
 	}
 
+	//nolint:forcetypeassert // can't be anything else.
 	return rpcResp.Response.(*pb.LatestUidResponse), nil
 }
 
-var _ raft.Transport = (*InmemTransport)(nil)
-var _ Transport = (*InmemTransport)(nil)
+var (
+	_ raft.Transport = (*InmemTransport)(nil)
+	_ Transport      = (*InmemTransport)(nil)
+)
 
 // NewInmemTransportWithTimeout is used to initialize a new transport and
 // generates a random local address if none is specified. The given timeout
@@ -102,8 +114,8 @@ func NewInmemTransportWithTimeout(addr raft.ServerAddress, timeout time.Duration
 		addr = NewInmemAddr()
 	}
 	trans := &InmemTransport{
-		consumerCh:     make(chan raft.RPC, 16),
-		chConsumeCache: make(chan raft.RPC, 16),
+		consumerCh:     make(chan raft.RPC, consumerChanSize),
+		chConsumeCache: make(chan raft.RPC, consumerChanSize),
 		localAddr:      addr,
 		peers:          make(map[raft.ServerAddress]*InmemTransport),
 		timeout:        timeout,
@@ -112,9 +124,10 @@ func NewInmemTransportWithTimeout(addr raft.ServerAddress, timeout time.Duration
 }
 
 // NewInmemTransport is used to initialize a new transport
-// and generates a random local address if none is specified
+// and generates a random local address if none is specified.
 func NewInmemTransport(addr raft.ServerAddress) (raft.ServerAddress, *InmemTransport) {
-	return NewInmemTransportWithTimeout(addr, 500*time.Millisecond)
+	const timeout = 500 * time.Millisecond
+	return NewInmemTransportWithTimeout(addr, timeout)
 }
 
 // SetHeartbeatHandler is used to set optional fast-path for
@@ -135,8 +148,8 @@ func (i *InmemTransport) LocalAddr() raft.ServerAddress {
 // AppendEntriesPipeline returns an interface that can be used to pipeline
 // AppendEntries requests.
 func (i *InmemTransport) AppendEntriesPipeline(id raft.ServerID, target raft.ServerAddress) (raft.AppendPipeline, error) {
-	i.Lock()
-	defer i.Unlock()
+	i.m.Lock()
+	defer i.m.Unlock()
 
 	peer, ok := i.peers[target]
 	if !ok {
@@ -148,7 +161,9 @@ func (i *InmemTransport) AppendEntriesPipeline(id raft.ServerID, target raft.Ser
 }
 
 // AppendEntries implements the Transport interface.
-func (i *InmemTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
+func (i *InmemTransport) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest,
+	resp *raft.AppendEntriesResponse,
+) error {
 	ctx, cancel := context.WithTimeout(context.Background(), i.timeout)
 	defer cancel()
 
@@ -158,13 +173,16 @@ func (i *InmemTransport) AppendEntries(id raft.ServerID, target raft.ServerAddre
 	}
 
 	// Copy the result back
+	//nolint:forcetypeassert // can't be anything else.
 	out := rpcResp.Response.(*raft.AppendEntriesResponse)
 	*resp = *out
 	return nil
 }
 
 // RequestVote implements the Transport interface.
-func (i *InmemTransport) RequestVote(_ raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
+func (i *InmemTransport) RequestVote(_ raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest,
+	resp *raft.RequestVoteResponse,
+) error {
 	ctx, cancel := context.WithTimeout(context.Background(), i.timeout)
 	defer cancel()
 
@@ -174,14 +192,17 @@ func (i *InmemTransport) RequestVote(_ raft.ServerID, target raft.ServerAddress,
 	}
 
 	// Copy the result back
+	//nolint:forcetypeassert // can't be anything else.
 	out := rpcResp.Response.(*raft.RequestVoteResponse)
 	*resp = *out
 	return nil
 }
 
 // InstallSnapshot implements the Transport interface.
-func (i *InmemTransport) InstallSnapshot(_ raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*i.timeout)
+func (i *InmemTransport) InstallSnapshot(_ raft.ServerID, target raft.ServerAddress, args *raft.InstallSnapshotRequest,
+	resp *raft.InstallSnapshotResponse, data io.Reader,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout(i.timeout, args.Size))
 	defer cancel()
 
 	rpcResp, err := i.makeRPC(ctx, target, args, data, consumeRaft)
@@ -190,6 +211,7 @@ func (i *InmemTransport) InstallSnapshot(_ raft.ServerID, target raft.ServerAddr
 	}
 
 	// Copy the result back
+	//nolint:forcetypeassert // can't be anything else.
 	out := rpcResp.Response.(*raft.InstallSnapshotResponse)
 	*resp = *out
 	return nil
@@ -197,7 +219,7 @@ func (i *InmemTransport) InstallSnapshot(_ raft.ServerID, target raft.ServerAddr
 
 // TimeoutNow implements the Transport interface.
 func (i *InmemTransport) TimeoutNow(_ raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*i.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), i.timeout)
 	defer cancel()
 
 	rpcResp, err := i.makeRPC(ctx, target, args, nil, consumeRaft)
@@ -206,19 +228,22 @@ func (i *InmemTransport) TimeoutNow(_ raft.ServerID, target raft.ServerAddress, 
 	}
 
 	// Copy the result back
+	//nolint:forcetypeassert // can't be anything else.
 	out := rpcResp.Response.(*raft.TimeoutNowResponse)
 	*resp = *out
 	return nil
 }
 
-func (i *InmemTransport) makeRPC(ctx context.Context, target raft.ServerAddress, args interface{}, r io.Reader, cType consumeType) (rpcResp raft.RPCResponse, err error) {
-	i.RLock()
+func (i *InmemTransport) makeRPC(ctx context.Context, target raft.ServerAddress, args interface{}, r io.Reader,
+	cType consumeType,
+) (rpcResp raft.RPCResponse, err error) {
+	i.m.RLock()
 	peer, ok := i.peers[target]
-	i.RUnlock()
+	i.m.RUnlock()
 
 	if !ok {
 		err = fmt.Errorf("failed to connect to peer: %v", target)
-		return
+		return raft.RPCResponse{}, err
 	}
 
 	// Send the RPC over
@@ -233,7 +258,7 @@ func (i *InmemTransport) makeRPC(ctx context.Context, target raft.ServerAddress,
 	case chConsume <- req:
 	case <-ctx.Done():
 		err = fmt.Errorf("send timed out")
-		return
+		return raft.RPCResponse{}, err
 	}
 
 	// Wait for a response
@@ -242,10 +267,11 @@ func (i *InmemTransport) makeRPC(ctx context.Context, target raft.ServerAddress,
 		if rpcResp.Error != nil {
 			err = rpcResp.Error
 		}
+		return rpcResp, err
 	case <-ctx.Done():
 		err = fmt.Errorf("command timed out")
+		return raft.RPCResponse{}, err
 	}
-	return
 }
 
 func getConsumeChan(peer *InmemTransport, cType consumeType) chan raft.RPC {
@@ -268,23 +294,24 @@ func (i *InmemTransport) DecodePeer(buf []byte) raft.ServerAddress {
 // Connect is used to connect this transport to another transport for
 // a given peer name. This allows for local routing.
 func (i *InmemTransport) Connect(peer raft.ServerAddress, t raft.Transport) {
+	//nolint:forcetypeassert // can't be anything else.
 	trans := t.(*InmemTransport)
-	i.Lock()
-	defer i.Unlock()
+	i.m.Lock()
+	defer i.m.Unlock()
 	i.peers[peer] = trans
 }
 
 // Disconnect is used to remove the ability to route to a given peer.
 func (i *InmemTransport) Disconnect(peer raft.ServerAddress) {
-	i.Lock()
-	defer i.Unlock()
+	i.m.Lock()
+	defer i.m.Unlock()
 	delete(i.peers, peer)
 
 	// Disconnect any pipelines
 	n := len(i.pipelines)
 	for idx := 0; idx < n; idx++ {
 		if i.pipelines[idx].peerAddr == peer {
-			i.pipelines[idx].Close()
+			_ = i.pipelines[idx].Close()
 			i.pipelines[idx], i.pipelines[n-1] = i.pipelines[n-1], nil
 			idx--
 			n--
@@ -295,30 +322,32 @@ func (i *InmemTransport) Disconnect(peer raft.ServerAddress) {
 
 // DisconnectAll is used to remove all routes to peers.
 func (i *InmemTransport) DisconnectAll() {
-	i.Lock()
-	defer i.Unlock()
+	i.m.Lock()
+	defer i.m.Unlock()
 	i.peers = make(map[raft.ServerAddress]*InmemTransport)
 
 	// Handle pipelines
 	for _, pipeline := range i.pipelines {
-		pipeline.Close()
+		_ = pipeline.Close()
 	}
 	i.pipelines = nil
 }
 
-// Close is used to permanently disable the transport
+// Close is used to permanently disable the transport.
 func (i *InmemTransport) Close() error {
 	i.DisconnectAll()
 	return nil
 }
 
-func newInmemPipeline(trans *InmemTransport, peer *InmemTransport, addr raft.ServerAddress) *inmemPipeline {
+func newInmemPipeline(trans, peer *InmemTransport, addr raft.ServerAddress) *inmemPipeline {
+	const chanSize = 16
+
 	i := &inmemPipeline{
 		trans:        trans,
 		peer:         peer,
 		peerAddr:     addr,
-		doneCh:       make(chan raft.AppendFuture, 16),
-		inprogressCh: make(chan *inmemPipelineInflight, 16),
+		doneCh:       make(chan raft.AppendFuture, chanSize),
+		inprogressCh: make(chan *inmemPipelineInflight, chanSize),
 		shutdownCh:   make(chan struct{}),
 	}
 	go i.decodeResponses()
@@ -338,6 +367,7 @@ func (i *inmemPipeline) decodeResponses() {
 			select {
 			case rpcResp := <-inp.respCh:
 				// Copy the result back
+				//nolint:forcetypeassert // can't be anything else.
 				*inp.future.resp = *rpcResp.Response.(*raft.AppendEntriesResponse)
 				inp.future.respond(rpcResp.Error)
 

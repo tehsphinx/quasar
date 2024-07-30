@@ -13,7 +13,7 @@ type NATSOption func(cfg *natsOptions)
 
 func getNATSOptions(opts []NATSOption) natsOptions {
 	cfg := natsOptions{
-		timeout: 5 * time.Second,
+		timeout: defaultTimout,
 		output:  os.Stderr,
 	}
 	for _, opt := range opts {
@@ -31,9 +31,9 @@ func getNATSOptions(opts []NATSOption) natsOptions {
 }
 
 type natsOptions struct {
-	timeout time.Duration
 	output  io.Writer
 	logger  hclog.Logger
+	timeout time.Duration
 }
 
 // WithNATSTimeout adds a timout for nats requests. Defaults to 5s. Set to 0 to disable the timeout.

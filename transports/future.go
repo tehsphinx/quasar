@@ -9,10 +9,10 @@ import (
 // appendFuture is used for waiting on a pipelined append
 // entries RPC.
 type appendFuture struct {
-	deferError
 	start time.Time
 	args  *raft.AppendEntriesRequest
 	resp  *raft.AppendEntriesResponse
+	deferError
 }
 
 func (a *appendFuture) Start() time.Time {
@@ -32,8 +32,8 @@ func (a *appendFuture) Response() *raft.AppendEntriesResponse {
 type deferError struct {
 	err        error
 	errCh      chan error
-	responded  bool
 	ShutdownCh chan struct{}
+	responded  bool
 }
 
 func (d *deferError) init() {
