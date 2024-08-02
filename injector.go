@@ -58,6 +58,12 @@ func (s *FSMInjector) IsLeader() bool {
 	return s.cache.isLeader()
 }
 
+// HasLeader returns if the cache has a leader. Or at least if the current node
+// thinks there is a leader. The leader might already be unreachable.
+func (s *FSMInjector) HasLeader() bool {
+	return s.cache.hasLeader()
+}
+
 func getWaitCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < maxWait {
 		return ctx, func() {}

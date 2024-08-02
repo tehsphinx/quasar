@@ -214,6 +214,13 @@ func (s *Cache) isLeader() bool {
 	return s.raft.State() == raft.Leader
 }
 
+// hasLeader returns if the cache has a leader. Or at least if the current node
+// thinks there is a leader. The leader might already be unreachable.
+func (s *Cache) hasLeader() bool {
+	_, id := s.raft.LeaderWithID()
+	return id != ""
+}
+
 // WaitReady is a helper function to wait for the raft cluster to be ready.
 // Specifically it waits for a leader to be elected. The context can be used
 // to add a timeout or cancel waiting.
@@ -247,7 +254,7 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 }
 
 func (s *Cache) waitForLeader(ctx context.Context) error {
-	if _, id := s.raft.LeaderWithID(); id != "" {
+	if s.hasLeader() {
 		return nil
 	}
 
@@ -261,7 +268,7 @@ func (s *Cache) waitForLeader(ctx context.Context) error {
 	s.raft.RegisterObserver(observer)
 	defer s.raft.DeregisterObserver(observer)
 
-	if _, id := s.raft.LeaderWithID(); id != "" {
+	if s.hasLeader() {
 		// leader elected while starting to observe
 		return nil
 	}
@@ -271,7 +278,7 @@ func (s *Cache) waitForLeader(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-chChange:
-			if _, id := s.raft.LeaderWithID(); id != "" {
+			if s.hasLeader() {
 				return nil
 			}
 		}
