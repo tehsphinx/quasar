@@ -30,7 +30,8 @@ type options struct {
 	servers    []raft.Server
 	discovery  Discovery
 
-	kv stores.KVStore
+	kv     stores.KVStore
+	pStore stores.PersistentStorage
 }
 
 func getOptions(opts []Option) options {
@@ -41,9 +42,6 @@ func getOptions(opts []Option) options {
 	}
 	for _, opt := range opts {
 		opt(&cfg)
-	}
-	if cfg.kv == nil {
-		cfg.kv = stores.NewInMemKVStore()
 	}
 	return cfg
 }
@@ -70,6 +68,14 @@ func WithLocalID(id string) Option {
 func WithKVStore(kv stores.KVStore) Option {
 	return func(o *options) {
 		o.kv = kv
+	}
+}
+
+// WithPersistentStore sets the persistent store to use. This is only applicable for the Cache.
+// If not set no persistence will take place.
+func WithPersistentStore(store stores.PersistentStorage) Option {
+	return func(o *options) {
+		o.pStore = store
 	}
 }
 

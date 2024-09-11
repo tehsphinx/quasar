@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
+	"github.com/tehsphinx/quasar/stores"
 	"github.com/tehsphinx/quasar/transports"
 	"google.golang.org/protobuf/proto"
 )
@@ -97,8 +98,8 @@ type Cache struct {
 	name    string
 	localID string
 
-	fsm *fsmWrapper
-	// kv  stores.KVStore
+	fsm    *fsmWrapper
+	pStore stores.PersistentStorage
 
 	raft      *raft.Raft
 	transport transports.Transport
@@ -165,9 +166,24 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 		return nil, 0, fmt.Errorf("apply function returned error: %w", r)
 	}
 
-	// TODO: apply to persistent storage if one is set
+	if r := s.persist(cmd); r != nil {
+		return resp.resp, index, r
+	}
 
 	return resp.resp, index, nil
+}
+
+func (s *Cache) persist(cmd *pb.Command) error {
+	if s.pStore == nil {
+		return nil
+	}
+
+	c := cmd.GetStore()
+	if c == nil {
+		return nil
+	}
+
+	return s.pStore.Store(c.Data)
 }
 
 func getTimeout(ctx context.Context, timeout time.Duration) time.Duration {

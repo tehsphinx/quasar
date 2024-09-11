@@ -2,11 +2,16 @@ package quasar
 
 import (
 	"context"
+
+	"github.com/tehsphinx/quasar/stores"
 )
 
 // NewKVCache creates a new key-value based cache.
 func NewKVCache(ctx context.Context, opts ...Option) (*KVCache, error) {
 	cfg := getOptions(opts)
+	if cfg.kv == nil {
+		cfg.kv = stores.NewInMemKVStore()
+	}
 
 	fsm := newKeyValueFSM(cfg.kv)
 
