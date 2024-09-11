@@ -46,6 +46,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		name:     cfg.cacheName,
 		localID:  cfg.localID,
 		fsm:      fsm,
+		pStore:   cfg.pStore,
 		suffrage: cfg.suffrage,
 		close:    closeCache,
 	}
@@ -149,6 +150,11 @@ func (s *Cache) apply(ctx context.Context, cmd *pb.Command) (*pb.CommandResponse
 }
 
 func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
+	cmd, err := s.persist(cmd)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	bts, err := proto.Marshal(cmd)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to marshal command: %w", err)
@@ -166,24 +172,30 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 		return nil, 0, fmt.Errorf("apply function returned error: %w", r)
 	}
 
-	if r := s.persist(cmd); r != nil {
-		return resp.resp, index, r
-	}
-
 	return resp.resp, index, nil
 }
 
-func (s *Cache) persist(cmd *pb.Command) error {
+func (s *Cache) persist(cmd *pb.Command) (*pb.Command, error) {
 	if s.pStore == nil {
-		return nil
+		return cmd, nil
 	}
 
 	c := cmd.GetStore()
 	if c == nil {
-		return nil
+		return cmd, nil
 	}
 
-	return s.pStore.Store(c.Data)
+	pData := stores.NewPersistData(c.Data)
+	if err := s.pStore.Store(pData); err != nil {
+		return cmd, err
+	}
+
+	if pData.IsUpdated() {
+		c.Data = pData.Data()
+		cmd.Cmd = &pb.Command_Store{Store: c}
+	}
+
+	return cmd, nil
 }
 
 func getTimeout(ctx context.Context, timeout time.Duration) time.Duration {
