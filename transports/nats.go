@@ -2,6 +2,7 @@ package transports
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -116,6 +117,9 @@ func (s *NATSTransport) Store(ctx context.Context, _ raft.ServerID, address raft
 	if err := s.request(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
+	if errStr := protoResp.GetError(); errStr != "" {
+		return nil, errors.New(errStr)
+	}
 	return protoResp.GetStore(), nil
 }
 
@@ -167,6 +171,9 @@ func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address 
 	var protoResp pb.CommandResponse
 	if err := s.request(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
+	}
+	if errStr := protoResp.GetError(); errStr != "" {
+		return nil, errors.New(errStr)
 	}
 	return protoResp.GetLatestUid(), nil
 }

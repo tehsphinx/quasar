@@ -3,6 +3,7 @@ package quasar_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/tehsphinx/quasar"
 	"github.com/tehsphinx/quasar/discoveries"
 	"github.com/tehsphinx/quasar/examples/generic/exampleFSM"
+	"github.com/tehsphinx/quasar/stores"
 	"github.com/tehsphinx/quasar/transports"
 )
 
@@ -352,6 +354,90 @@ func TestCacheClusterNATS(t *testing.T) {
 			}
 		})
 	}
+}
+
+type testPersistStore struct {
+	store func(data stores.StoreData) error
+}
+
+func (s testPersistStore) Store(data stores.StoreData) error {
+	return s.store(data)
+}
+
+func TestNatsFail(t *testing.T) {
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelMain()
+
+	asrtMain := is.New(t)
+
+	nc1, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc2, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache1", "cache1")
+	asrtMain.NoErr(err)
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache1", "cache2")
+	asrtMain.NoErr(err)
+
+	fsm1 := exampleFSM.NewInMemoryFSM()
+	fsm2 := exampleFSM.NewInMemoryFSM()
+
+	persistStore := testPersistStore{store: func(data stores.StoreData) error {
+		return io.ErrNoProgress
+	}}
+
+	cache1, err := quasar.NewCache(ctxMain, fsm1,
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport1),
+		quasar.WithServers([]raft.Server{
+			{ID: "cache1", Address: "cache1"},
+			{ID: "cache2", Address: "cache2"},
+			{ID: "cache3", Address: "cache3"},
+		}),
+		quasar.WithPersistentStore(persistStore),
+	)
+	asrtMain.NoErr(err)
+	defer cache1.Shutdown()
+
+	cache2, err := quasar.NewCache(ctxMain, fsm2,
+		quasar.WithLocalID("cache2"),
+		quasar.WithTransport(transport2),
+		quasar.WithServers([]raft.Server{
+			{ID: "cache1", Address: "cache1"},
+			{ID: "cache2", Address: "cache2"},
+			{ID: "cache3", Address: "cache3"},
+		}),
+		quasar.WithPersistentStore(persistStore),
+	)
+	asrtMain.NoErr(err)
+	defer cache2.Shutdown()
+
+	err = cache1.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	fmt.Println("WAIT DONE")
+
+	fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2}
+
+	t.Run("error propagation", func(t *testing.T) {
+		for i, fsm := range fsms {
+			t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+				defer cancel()
+
+				asrtWrite := asrtMain.New(t)
+
+				r := fsm.SetMusician(ctx, exampleFSM.Musician{
+					Name:        "Alex",
+					Age:         23,
+					Instruments: []string{"flute"},
+				})
+				asrtWrite.True(r != nil)
+			})
+		}
+	})
 }
 
 func TestInstallSnapshot(t *testing.T) {
