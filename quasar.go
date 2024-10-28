@@ -17,6 +17,7 @@ import (
 
 const (
 	applyTimout         = 5 * time.Second
+	noLeaderTimeout     = 8 * time.Second
 	observationChanSize = 5
 )
 
@@ -212,9 +213,9 @@ func getTimeout(ctx context.Context, timeout time.Duration) time.Duration {
 }
 
 func (s *Cache) applyRemote(ctx context.Context, command *pb.Command) (*pb.CommandResponse, uint64, error) {
-	addr, id := s.raft.LeaderWithID()
-	if id == "" {
-		return nil, 0, ErrNoLeader
+	addr, id, err := s.getLeaderWait(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get leader: %w: %w", err, ErrNoLeader)
 	}
 
 	switch cmd := command.GetCmd().(type) {
@@ -233,6 +234,20 @@ func (s *Cache) applyRemote(ctx context.Context, command *pb.Command) (*pb.Comma
 	}
 
 	return nil, 0, errors.New("leader request type not implemented")
+}
+
+func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.ServerID, error) {
+	ctx, cancel := context.WithTimeout(ctx, noLeaderTimeout)
+	defer cancel()
+
+	addr, id := s.raft.LeaderWithID()
+	if id == "" {
+		if r := s.waitForLeader(ctx); r != nil {
+			return "", "", r
+		}
+		addr, id = s.raft.LeaderWithID()
+	}
+	return addr, id, nil
 }
 
 // isLeader returns if the cache is the current leader. This is not a verified
