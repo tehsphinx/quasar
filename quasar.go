@@ -122,7 +122,7 @@ func (s *Cache) serverInfo() raft.Server {
 // GetLeader returns the current leader of the cluster.
 // It may return empty strings if there is no current leader or the leader is unknown.
 func (s *Cache) GetLeader() raft.Server {
-	addr, id := s.fsm.raft.LeaderWithID()
+	addr, id := s.raft.LeaderWithID()
 	return raft.Server{
 		ID:       id,
 		Address:  addr,
@@ -132,7 +132,7 @@ func (s *Cache) GetLeader() raft.Server {
 
 // GetServerList returns the servers in the cluster and whether they have votes.
 func (s *Cache) GetServerList() ([]raft.Server, error) {
-	future := s.fsm.raft.GetConfiguration()
+	future := s.raft.GetConfiguration()
 	if err := future.Error(); err != nil {
 		return nil, err
 	}
