@@ -750,19 +750,8 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
-	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
-	asrtMain.NoErr(err)
-
 	fsm1 := exampleFSM.NewInMemoryFSM()
-	fsm2 := exampleFSM.NewInMemoryFSM()
-	fsm3 := exampleFSM.NewInMemoryFSM()
-
 	discovery1 := discoveries.NewNATSDiscovery(nc1)
-	discovery2 := discoveries.NewNATSDiscovery(nc2)
-	discovery3 := discoveries.NewNATSDiscovery(nc3)
-
 	cache1, err := quasar.NewCache(ctxMain, fsm1,
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
@@ -772,6 +761,10 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 	asrtMain.NoErr(err)
 	defer cache1.Shutdown()
 
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
+	asrtMain.NoErr(err)
+	fsm2 := exampleFSM.NewInMemoryFSM()
+	discovery2 := discoveries.NewNATSDiscovery(nc2)
 	cache2, err := quasar.NewCache(ctxMain, fsm2,
 		quasar.WithLocalID("cache2"),
 		quasar.WithTransport(transport2),
@@ -781,6 +774,10 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 	asrtMain.NoErr(err)
 	defer cache2.Shutdown()
 
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
+	asrtMain.NoErr(err)
+	fsm3 := exampleFSM.NewInMemoryFSM()
+	discovery3 := discoveries.NewNATSDiscovery(nc3)
 	cache3, err := quasar.NewCache(ctxMain, fsm3,
 		quasar.WithLocalID("cache3"),
 		quasar.WithTransport(transport3),
@@ -796,6 +793,8 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 	err = cache3.WaitReady(ctxMain)
 	asrtMain.NoErr(err)
 	fmt.Println("WAIT DONE")
+
+	asrtMain.Equal(cache1.GetLeader().ID, raft.ServerID("cache3"))
 
 	asrtMain.Equal(cache1.GetLeader().Suffrage, raft.Voter)
 	asrtMain.Equal(cache2.GetLeader().Suffrage, raft.Voter)
@@ -1122,6 +1121,8 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 			fmt.Println(cache2.GetServerList())
 			fmt.Println("cache3 leader", cache3.GetLeader())
 			fmt.Println(cache3.GetServerList())
+
+			asrtMain.Equal(cache1.GetLeader().ID, raft.ServerID("cache2"))
 
 			asrtMain.Equal(cache1.GetLeader().Suffrage, raft.Voter)
 			asrtMain.Equal(cache2.GetLeader().Suffrage, raft.Voter)
