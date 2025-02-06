@@ -69,6 +69,11 @@ func (s *kvFSM) Restore(snapshot io.ReadCloser) error {
 	panic("implement me")
 }
 
+func (s *kvFSM) Reset() error {
+	// TODO implement me
+	panic("implement me")
+}
+
 func (s *kvFSM) store(uid uint64, cmd *pb.Store) (*pb.CommandResponse, error) {
 	err := s.Store(cmd.Key, cmd.Data)
 	return respStore(&pb.StoreResponse{Uid: uid}), err

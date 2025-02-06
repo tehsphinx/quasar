@@ -243,6 +243,19 @@ func (s *InMemoryFSM) Restore(reader io.ReadCloser) error {
 	return nil
 }
 
+func (s *InMemoryFSM) Reset() error {
+	s.musiciansM.Lock()
+	s.citiesM.Lock()
+	defer func() {
+		s.citiesM.Unlock()
+		s.musiciansM.Unlock()
+	}()
+
+	s.cities = map[string]City{}
+	s.musicians = map[string]Musician{}
+	return nil
+}
+
 func (s *snapshot) newSection(sink raft.SnapshotSink, section string) error {
 	if _, err := sink.Write([]byte(section)); err != nil {
 		return err

@@ -73,6 +73,10 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	subResetCache, err := s.conn.Subscribe(subjPrefix+".cache.reset", s.handleResetCache(ctx))
+	if err != nil {
+		return err
+	}
 	subLatestUID, err := s.conn.Subscribe(subjPrefix+".cache.uid.latest", s.handleLatestUID(ctx))
 	if err != nil {
 		return err
@@ -91,6 +95,7 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 		_ = subEntries.Unsubscribe()
 		_ = subVote.Unsubscribe()
 		_ = subStore.Unsubscribe()
+		_ = subResetCache.Unsubscribe()
 		_ = subLatestUID.Unsubscribe()
 		_ = subInstallSnapshot.Unsubscribe()
 		_ = subTimeoutNow.Unsubscribe()
@@ -144,6 +149,63 @@ func (s *NATSTransport) handleStore(ctx context.Context) func(msg *nats.Msg) {
 			resp, _ := i.(*pb.StoreResponse)
 			return &pb.CommandResponse{Resp: &pb.CommandResponse_Store{
 				Store: resp,
+			}}
+		})
+		if err != nil {
+			s.logger.Error("failed to send response", "error", err)
+			return
+		}
+		if r := msg.Respond(bts); r != nil {
+			s.logger.Error("failed to send response", "error", r)
+		}
+	}
+}
+
+// ResetCache asks the master to reset the cache.
+func (s *NATSTransport) ResetCache(ctx context.Context, _ raft.ServerID, address raft.ServerAddress,
+	request *pb.ResetCache,
+) (*pb.ResetCacheResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+
+	subj := fmt.Sprintf("quasar.%s.%s.cache.reset", s.cacheName, address)
+
+	var protoResp pb.CommandResponse
+	if err := s.request(ctx, subj, request, &protoResp); err != nil {
+		return nil, err
+	}
+	if errStr := protoResp.GetError(); errStr != "" {
+		return nil, errors.New(errStr)
+	}
+
+	return protoResp.GetResetCache(), nil
+}
+
+func (s *NATSTransport) handleResetCache(ctx context.Context) func(msg *nats.Msg) {
+	return func(msg *nats.Msg) {
+		var protoMsg pb.ResetCache
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+			s.logger.Error("failed to decode incoming command", "error", r)
+			return
+		}
+
+		// Create the RPC object
+		chResp := make(chan raft.RPCResponse, 1)
+		rpc := raft.RPC{
+			RespChan: chResp,
+			Command:  &protoMsg,
+		}
+
+		s.chConsumeCache <- rpc
+
+		bts, err := s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
+			// TODO: be able to return error if type cast fails
+			resp, _ := i.(*pb.ResetCacheResponse)
+			return &pb.CommandResponse{Resp: &pb.CommandResponse_ResetCache{
+				ResetCache: resp,
 			}}
 		})
 		if err != nil {

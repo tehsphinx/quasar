@@ -34,6 +34,9 @@ type DiscoveryInjector struct {
 	servers  map[raft.ServerID]raft.Server
 	appliedM sync.RWMutex
 	applied  map[raft.ServerID]struct{}
+
+	cancelM sync.Mutex
+	cancel  context.CancelFunc
 }
 
 // Name returns the caches name. This name identifies a cache and separates it from other caches on the network.
@@ -86,6 +89,10 @@ func (s *DiscoveryInjector) getAddServerFunc(voter bool) (addServerFunc, error) 
 }
 
 func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) {
+	s.cancelPrevious()
+	ctx, cancel := context.WithCancel(ctx)
+	s.setCancel(cancel)
+
 	chPeerChange := make(chan raft.Observation, observationChanSize)
 	observer := raft.NewObserver(chPeerChange, true, func(o *raft.Observation) bool {
 		if _, ok := o.Data.(raft.PeerObservation); ok {
@@ -99,6 +106,11 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 	rft.RegisterObserver(observer)
 
 	go func() {
+		defer func() {
+			cancel()
+			rft.DeregisterObserver(observer)
+		}()
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -175,4 +187,20 @@ func (s *DiscoveryInjector) getServers() []raft.Server {
 	defer s.serversM.RUnlock()
 
 	return maps.Values(s.servers)
+}
+
+func (s *DiscoveryInjector) setCancel(cancel context.CancelFunc) {
+	s.cancelM.Lock()
+	defer s.cancelM.Unlock()
+
+	s.cancel = cancel
+}
+
+func (s *DiscoveryInjector) cancelPrevious() {
+	s.cancelM.Lock()
+	defer s.cancelM.Unlock()
+
+	if s.cancel != nil {
+		s.cancel()
+	}
 }

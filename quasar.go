@@ -44,6 +44,8 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 	cfg := getOptions(opts)
 
 	c := &Cache{
+		cfg:      cfg,
+		ctx:      ctx,
 		name:     cfg.cacheName,
 		localID:  cfg.localID,
 		fsm:      fsm,
@@ -68,7 +70,6 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		return nil, err
 	}
 	c.raft = rft
-	fsm.SetRaft(rft)
 	discovery.regObservation(ctx, rft)
 
 	if cfg.discovery != nil {
@@ -99,6 +100,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 type Cache struct {
 	name    string
 	localID string
+	cfg     options
 
 	fsm    *fsmWrapper
 	pStore stores.PersistentStorage
@@ -108,6 +110,7 @@ type Cache struct {
 	discovery *DiscoveryInjector
 	suffrage  raft.ServerSuffrage
 
+	ctx   context.Context
 	close context.CancelFunc
 }
 
@@ -395,6 +398,9 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 				var uid uint64
 				uid, err = s.store(ctx, cmd.Key, cmd.Data)
 				resp = &pb.StoreResponse{Uid: uid}
+			case *pb.ResetCache:
+				err = s.localReset()
+				resp = &pb.ResetCacheResponse{}
 			case *pb.LatestUid:
 				uid := s.localLastIndex()
 				resp = &pb.LatestUidResponse{Uid: uid}
@@ -422,6 +428,69 @@ func (s *Cache) shutdown() error {
 	}
 
 	return s.raft.Shutdown().Error()
+}
+
+// Reset resets calls Reset the cache on all servers.
+func (s *Cache) Reset(ctx context.Context) error {
+	servers, err := s.GetServerList()
+	if err != nil {
+		return err
+	}
+
+	var (
+		retErrs    []error
+		foundLocal bool
+	)
+	for _, server := range servers {
+		if server.ID == raft.ServerID(s.localID) {
+			foundLocal = true
+			if r := s.localReset(); r != nil {
+				retErrs = append(retErrs, r)
+			}
+			continue
+		}
+
+		resp, r := s.transport.ResetCache(ctx, server.ID, server.Address, &pb.ResetCache{})
+		if r != nil {
+			retErrs = append(retErrs, r)
+			continue
+		}
+		if resp.GetError() != "" {
+			retErrs = append(retErrs, errors.New(resp.GetError()))
+		}
+	}
+	if !foundLocal {
+		if r := s.localReset(); r != nil {
+			retErrs = append(retErrs, r)
+		}
+	}
+
+	return errors.Join(retErrs...)
+}
+
+func (s *Cache) localReset() error {
+	if err := s.fsm.applyReset(); err != nil {
+		return err
+	}
+
+	if s.isLeader() {
+		// don't reset raft itself on leader.
+		return nil
+	}
+
+	s.fsm.applyRaftReset()
+	s.raft.Shutdown()
+
+	logStore := wrapStore(raft.NewInmemStore(), s.fsm)
+
+	rft, err := getRaft(s.cfg, s.fsm, logStore, s.transport, s.discovery)
+	if err != nil {
+		return err
+	}
+	s.raft = rft
+	s.discovery.regObservation(s.ctx, rft)
+
+	return nil
 }
 
 // func (s *Cache) observeLeader(ctx context.Context, change chan raft.Observation) {

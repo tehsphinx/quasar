@@ -145,6 +145,14 @@ func (s *DRPCTransport) Store(ctx context.Context, id raft.ServerID, target raft
 	panic("implement me")
 }
 
+// ResetCache asks the master to reset the cache.
+func (s *DRPCTransport) ResetCache(ctx context.Context, _ raft.ServerID, address raft.ServerAddress,
+	request *pb.ResetCache,
+) (*pb.ResetCacheResponse, error) {
+	// TODO implement me
+	panic("implement me")
+}
+
 // LatestUID asks the master to return its latest known / generated uid.
 func (s *DRPCTransport) LatestUID(ctx context.Context, id raft.ServerID, target raft.ServerAddress,
 	command *pb.LatestUid,

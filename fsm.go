@@ -22,6 +22,7 @@ type FSM interface {
 	ApplyCmd(cmd []byte) error
 	Snapshot() (raft.FSMSnapshot, error)
 	Restore(snapshot io.ReadCloser) error
+	Reset() error
 }
 
 type logApplier interface {
@@ -43,8 +44,7 @@ func wrapFSM(fsm FSM) *fsmWrapper {
 
 //nolint:govet // struct optimization not worth it. Is not created often. Optimized for readability.
 type fsmWrapper struct {
-	fsm  FSM
-	raft *raft.Raft
+	fsm FSM
 
 	lastApplied uint64
 	sysUIDsM    sync.Mutex
@@ -53,10 +53,6 @@ type fsmWrapper struct {
 	cond        *cond.Cond
 
 	isLogApplier bool
-}
-
-func (s *fsmWrapper) SetRaft(rft *raft.Raft) {
-	s.raft = rft
 }
 
 type applyResponse struct {
@@ -130,6 +126,15 @@ func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
 	return nil
 }
 
+func (s *fsmWrapper) applyRaftReset() {
+	s.setLastApplied(0)
+	s.resetSysUIDs()
+}
+
+func (s *fsmWrapper) applyReset() error {
+	return s.fsm.Reset()
+}
+
 func (s *fsmWrapper) store(log *raft.Log, cmd *pb.Store) (*pb.CommandResponse, error) {
 	err := s.fsm.ApplyCmd(cmd.Data)
 	return respStore(&pb.StoreResponse{Uid: log.Index}), err
@@ -192,6 +197,13 @@ func (s *fsmWrapper) popSysUID(apply func(uid uint64) bool) bool {
 	s.sysUIDs = s.sysUIDs[1:]
 
 	return true
+}
+
+func (s *fsmWrapper) resetSysUIDs() {
+	s.sysUIDsM.Lock()
+	defer s.sysUIDsM.Unlock()
+
+	s.sysUIDs = s.sysUIDs[:0]
 }
 
 func (s *fsmWrapper) applySysUID(uid uint64) bool {

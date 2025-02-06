@@ -705,6 +705,150 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 	}
 }
 
+func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
+	type test struct {
+		name      string
+		storeVals []exampleFSM.Musician
+	}
+	tests := []test{
+		{
+			name: "sub test",
+			storeVals: []exampleFSM.Musician{
+				{
+					Name:        "Roberto",
+					Age:         43,
+					Instruments: []string{"violin", "guitar"},
+				},
+				{
+					Name:        "Angela",
+					Age:         24,
+					Instruments: []string{"piano", "flute"},
+				},
+				{
+					Name:        "Eva",
+					Age:         28,
+					Instruments: []string{"ukulele", "saxophone", "bass guitar"},
+				},
+			},
+		},
+	}
+
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelMain()
+
+	asrtMain := is.New(t)
+
+	nc1, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc2, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc3, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+	defer nc3.Close()
+
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
+	asrtMain.NoErr(err)
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
+	asrtMain.NoErr(err)
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
+	asrtMain.NoErr(err)
+
+	fsm1 := exampleFSM.NewInMemoryFSM()
+	fsm2 := exampleFSM.NewInMemoryFSM()
+	fsm3 := exampleFSM.NewInMemoryFSM()
+
+	discovery1 := discoveries.NewNATSDiscovery(nc1)
+	discovery2 := discoveries.NewNATSDiscovery(nc2)
+	discovery3 := discoveries.NewNATSDiscovery(nc3)
+
+	cache1, err := quasar.NewCache(ctxMain, fsm1,
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport1),
+		quasar.WithDiscovery(discovery1),
+		quasar.WithSuffrage(raft.Nonvoter),
+	)
+	asrtMain.NoErr(err)
+	defer cache1.Shutdown()
+
+	cache2, err := quasar.NewCache(ctxMain, fsm2,
+		quasar.WithLocalID("cache2"),
+		quasar.WithTransport(transport2),
+		quasar.WithDiscovery(discovery2),
+		quasar.WithSuffrage(raft.Nonvoter),
+	)
+	asrtMain.NoErr(err)
+	defer cache2.Shutdown()
+
+	cache3, err := quasar.NewCache(ctxMain, fsm3,
+		quasar.WithLocalID("cache3"),
+		quasar.WithTransport(transport3),
+		quasar.WithDiscovery(discovery3),
+	)
+	asrtMain.NoErr(err)
+	defer cache3.Shutdown()
+
+	err = cache1.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	err = cache2.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	err = cache3.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	fmt.Println("WAIT DONE")
+
+	asrtMain.Equal(cache1.GetLeader().Suffrage, raft.Voter)
+	asrtMain.Equal(cache2.GetLeader().Suffrage, raft.Voter)
+	asrtMain.Equal(cache3.GetLeader().Suffrage, raft.Voter)
+
+	fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(ctxMain, 2*time.Second)
+			defer cancel()
+
+			for i, fsm := range fsms {
+				t.Run("write cache "+strconv.Itoa(i), func(t *testing.T) {
+					asrtWrite := asrtMain.New(t)
+
+					for _, v := range tt.storeVals {
+						r := fsm.SetMusician(ctx, v)
+						asrtWrite.NoErr(r)
+					}
+
+					for j, readFSM := range fsms {
+						t.Run("read cache "+strconv.Itoa(j), func(t *testing.T) {
+							asrtRead := asrtWrite.New(t)
+
+							for _, v := range tt.storeVals {
+								got, r := readFSM.GetMusicianMaster(ctx, v.Name)
+								asrtRead.NoErr(r)
+
+								asrtRead.Equal(got, v)
+							}
+
+							for _, v := range tt.storeVals {
+								got, r := readFSM.GetMusicianLocal(v.Name)
+								asrtRead.NoErr(r)
+
+								asrtRead.Equal(got, v)
+							}
+
+							for _, v := range tt.storeVals {
+								got, r := readFSM.GetMusicianKnownLatest(ctx, v.Name)
+								asrtRead.NoErr(r)
+
+								asrtRead.Equal(got, v)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestCacheDiscoveryRestart(t *testing.T) {
 	// Enable to verify if cache shuts down properly. Will fail with other tests running as well.
 	// defer func() {
@@ -842,6 +986,191 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 										asrtRead.NoErr(r)
 
 										v.Age = age*3 + writeIndex
+										asrtRead.Equal(got, v)
+									}
+								})
+							}
+						})
+					}
+				})
+			}
+			e = cache3.Shutdown()
+			asrtMain.NoErr(e)
+			e = cache2.Shutdown()
+			asrtMain.NoErr(e)
+		}()
+	}
+
+	err = cache1.Shutdown()
+	asrtMain.NoErr(err)
+}
+
+func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
+	// Enable to verify if cache shuts down properly. Will fail with other tests running as well.
+	// defer func() {
+	// 	time.Sleep(100 * time.Millisecond)
+	// 	goleak.VerifyNone(t)
+	// }()
+
+	type test struct {
+		name      string
+		storeVals []exampleFSM.Musician
+	}
+	tests := []test{
+		{
+			name: "sub test",
+			storeVals: []exampleFSM.Musician{
+				{
+					Name:        "Roberto",
+					Age:         43,
+					Instruments: []string{"violin", "guitar"},
+				},
+				{
+					Name:        "Angela",
+					Age:         24,
+					Instruments: []string{"piano", "flute"},
+				},
+				{
+					Name:        "Eva",
+					Age:         28,
+					Instruments: []string{"ukulele", "saxophone", "bass guitar"},
+				},
+			},
+		},
+	}
+
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 50*time.Second)
+	defer cancelMain()
+
+	asrtMain := is.New(t)
+
+	nc1, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc2, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc3, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+	defer nc3.Close()
+
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
+	asrtMain.NoErr(err)
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
+	asrtMain.NoErr(err)
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
+	asrtMain.NoErr(err)
+
+	fsm1 := exampleFSM.NewInMemoryFSM()
+	fsm2 := exampleFSM.NewInMemoryFSM()
+	fsm3 := exampleFSM.NewInMemoryFSM()
+
+	discovery1 := discoveries.NewNATSDiscovery(nc1)
+
+	cache1, err := quasar.NewCache(ctxMain, fsm1,
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport1),
+		quasar.WithDiscovery(discovery1),
+		quasar.WithSuffrage(raft.Nonvoter),
+	)
+	asrtMain.NoErr(err)
+
+	for age := 0; age < 3; age++ {
+		func() {
+			ctx, cancel := context.WithTimeout(ctxMain, 5*time.Second)
+			defer cancel()
+
+			discovery2 := discoveries.NewNATSDiscovery(nc2)
+			cache2, e := quasar.NewCache(ctx, fsm2,
+				quasar.WithLocalID("cache2"),
+				quasar.WithTransport(transport2),
+				quasar.WithDiscovery(discovery2),
+			)
+			asrtMain.NoErr(e)
+
+			discovery3 := discoveries.NewNATSDiscovery(nc3)
+			cache3, e := quasar.NewCache(ctx, fsm3,
+				quasar.WithLocalID("cache3"),
+				quasar.WithTransport(transport3),
+				quasar.WithDiscovery(discovery3),
+				quasar.WithSuffrage(raft.Nonvoter),
+			)
+			asrtMain.NoErr(e)
+
+			e = cache2.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			e = cache3.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			e = cache1.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			fmt.Println("WAIT DONE")
+
+			e = cache2.Reset(ctx)
+			asrtMain.NoErr(e)
+
+			e = cache2.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			e = cache3.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			e = cache1.WaitReady(ctx)
+			asrtMain.NoErr(e)
+			fmt.Println("after reset: WAIT DONE")
+
+			fmt.Println("cache1 leader", cache1.GetLeader())
+			fmt.Println(cache1.GetServerList())
+			fmt.Println("cache2 leader", cache2.GetLeader())
+			fmt.Println(cache2.GetServerList())
+			fmt.Println("cache3 leader", cache3.GetLeader())
+			fmt.Println(cache3.GetServerList())
+
+			asrtMain.Equal(cache1.GetLeader().Suffrage, raft.Voter)
+			asrtMain.Equal(cache2.GetLeader().Suffrage, raft.Voter)
+			asrtMain.Equal(cache3.GetLeader().Suffrage, raft.Voter)
+
+			fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
+
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					for writeIndex, fsm := range fsms {
+						t.Run("write cache "+strconv.Itoa(writeIndex+1), func(t *testing.T) {
+							asrtWrite := asrtMain.New(t)
+
+							writeAge := age*3 + writeIndex
+
+							for _, v := range tt.storeVals {
+								v.Age = writeAge
+								fmt.Println("writing", v.Name, v.Age, v.Instruments)
+								r := fsm.SetMusician(ctx, v)
+								asrtWrite.NoErr(r)
+							}
+
+							for j, readFSM := range fsms {
+								t.Run("read cache "+strconv.Itoa(j+1), func(t *testing.T) {
+									asrtRead := asrtWrite.New(t)
+
+									for _, v := range tt.storeVals {
+										got, r := readFSM.GetMusicianMaster(ctx, v.Name)
+										asrtRead.NoErr(r)
+
+										fmt.Println("reading", got.Name, got.Age, got.Instruments)
+
+										v.Age = writeAge
+										asrtRead.Equal(got, v)
+									}
+
+									for _, v := range tt.storeVals {
+										got, r := readFSM.GetMusicianLocal(v.Name)
+										asrtRead.NoErr(r)
+
+										v.Age = writeAge
+										asrtRead.Equal(got, v)
+									}
+
+									for _, v := range tt.storeVals {
+										got, r := readFSM.GetMusicianKnownLatest(ctx, v.Name)
+										asrtRead.NoErr(r)
+
+										v.Age = writeAge
 										asrtRead.Equal(got, v)
 									}
 								})

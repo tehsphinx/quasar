@@ -12,6 +12,7 @@ message Command {
   oneof cmd {
     Store store = 1;
     LatestUid latest_uid = 2;
+    ResetCache reset_cache = 8;
 
     AppendEntriesRequest append_entries = 3;
     RequestVoteRequest request_vote = 4;
@@ -27,6 +28,7 @@ message CommandResponse {
   oneof resp {
     StoreResponse store = 1;
     LatestUidResponse latest_uid = 2;
+    ResetCacheResponse reset_cache = 8;
 
     AppendEntriesResponse append_entries = 3;
     RequestVoteResponse request_vote = 4;
@@ -49,4 +51,10 @@ message LatestUid {}
 
 message LatestUidResponse {
   uint64 uid = 1;
+}
+
+message ResetCache {}
+
+message ResetCacheResponse {
+  string error = 1;
 }

@@ -64,6 +64,11 @@ func (s *FSMInjector) HasLeader() bool {
 	return s.cache.hasLeader()
 }
 
+// CacheID returns the id of the cache the fms is attached to.
+func (s *FSMInjector) CacheID() string {
+	return s.cache.localID
+}
+
 func getWaitCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < maxWait {
 		return ctx, func() {}

@@ -26,7 +26,9 @@ func getRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, transport transp
 
 	if cfg.discovery != nil {
 		cfg.servers = discovery.getServers()
-		cfg.bootstrap = true
+		if cfg.suffrage == raft.Voter {
+			cfg.bootstrap = true
+		}
 	}
 
 	if cfg.bootstrap && len(cfg.servers) == 0 {

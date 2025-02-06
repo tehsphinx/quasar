@@ -24,6 +24,9 @@ type Transport interface {
 	// Store asks the master to apply a change command to the raft cluster.
 	Store(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.Store) (*pb.StoreResponse, error)
 
+	// ResetCache asks the master to reset the cache.
+	ResetCache(ctx context.Context, _ raft.ServerID, address raft.ServerAddress, request *pb.ResetCache) (*pb.ResetCacheResponse, error)
+
 	// LatestUID asks the master to return its latest known / generated uid.
 	LatestUID(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error)
 }

@@ -25,6 +25,7 @@ const (
 	rpcTimeoutNow
 	rpcStore
 	rpcLatestUID
+	rpcResetCache
 
 	// connReceiveBufferSize is the size of the buffer we will use for reading RPC requests into
 	// on followers.
@@ -181,6 +182,21 @@ func (s *TCPTransport) LatestUID(ctx context.Context, id raft.ServerID, target r
 
 	var resp pb.LatestUidResponse
 	err := s.genericRPC(ctx, id, target, rpcLatestUID, command, &resp)
+	return &resp, err
+}
+
+// ResetCache asks the master to reset the cache.
+func (s *TCPTransport) ResetCache(ctx context.Context, id raft.ServerID, target raft.ServerAddress,
+	command *pb.ResetCache,
+) (*pb.ResetCacheResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+
+	var resp pb.ResetCacheResponse
+	err := s.genericRPC(ctx, id, target, rpcResetCache, command, &resp)
 	return &resp, err
 }
 
@@ -625,6 +641,14 @@ func (s *TCPTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *c
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "Load"}}
+		consumeCh = s.chConsumeCache
+	case rpcResetCache:
+		var req pb.ResetCache
+		if err := dec.Decode(&req); err != nil {
+			return err
+		}
+		rpc.Command = &req
+		labels = []metrics.Label{{Name: "rpcType", Value: "Reset"}}
 		consumeCh = s.chConsumeCache
 	// case rpcLoad:
 	// 	var req pb.LoadValue

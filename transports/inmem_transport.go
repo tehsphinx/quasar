@@ -81,6 +81,25 @@ func (i *InmemTransport) Store(ctx context.Context, _ raft.ServerID, target raft
 	return rpcResp.Response.(*pb.StoreResponse), nil
 }
 
+// ResetCache asks the master to reset the cache.
+func (i *InmemTransport) ResetCache(ctx context.Context, _ raft.ServerID, target raft.ServerAddress,
+	command *pb.ResetCache,
+) (*pb.ResetCacheResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, i.timeout)
+		defer cancel()
+	}
+
+	rpcResp, err := i.makeRPC(ctx, target, command, nil, consumeCache)
+	if err != nil {
+		return nil, err
+	}
+
+	//nolint:forcetypeassert // can't be anything else.
+	return rpcResp.Response.(*pb.ResetCacheResponse), nil
+}
+
 // LatestUID asks the master to return its latest known / generated uid.
 func (i *InmemTransport) LatestUID(ctx context.Context, _ raft.ServerID, target raft.ServerAddress,
 	command *pb.LatestUid,
