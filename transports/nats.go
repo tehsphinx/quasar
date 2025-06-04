@@ -119,7 +119,7 @@ func (s *NATSTransport) Store(ctx context.Context, _ raft.ServerID, address raft
 	subj := fmt.Sprintf("quasar.%s.%s.cache.store", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(ctx, subj, request, &protoResp); err != nil {
+	if _, err := s.request(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -174,7 +174,7 @@ func (s *NATSTransport) ResetCache(ctx context.Context, _ raft.ServerID, address
 	subj := fmt.Sprintf("quasar.%s.%s.cache.reset", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(ctx, subj, request, &protoResp); err != nil {
+	if _, err := s.request(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -231,7 +231,7 @@ func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address 
 	subj := fmt.Sprintf("quasar.%s.%s.cache.uid.latest", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(ctx, subj, request, &protoResp); err != nil {
+	if _, err := s.request(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -301,7 +301,8 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 	subj := fmt.Sprintf("quasar.%s.%s.entries.append", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(ctx, subj, pb.ToAppendEntriesRequest(request), &protoResp); err != nil {
+	if size, err := s.request(ctx, subj, pb.ToAppendEntriesRequest(request), &protoResp); err != nil {
+		s.logger.Error("failed to send append entries request", "error", err, "size", size, "entries", len(request.Entries))
 		return err
 	}
 	*resp = *protoResp.GetAppendEntries().Convert()
@@ -351,7 +352,7 @@ func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress,
 	subj := fmt.Sprintf("quasar.%s.%s.request.vote", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(ctx, subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
+	if _, err := s.request(ctx, subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -424,7 +425,7 @@ func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, 
 	subj := fmt.Sprintf("quasar.%s.%s.timeout.now", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.request(ctx, subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
+	if _, err := s.request(ctx, subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -465,21 +466,21 @@ func (s *NATSTransport) handleTimeoutNow(ctx context.Context) func(msg *nats.Msg
 	}
 }
 
-func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp proto.Message) error {
+func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp proto.Message) (int, error) {
 	bts, err := proto.Marshal(msg)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// fmt.Println("request data:", fmt.Sprintf("%+v", msg))
 	response, err := s.conn.RequestWithContext(ctx, subj, bts)
 	if err != nil {
-		return err
+		return len(bts), err
 	}
 
 	err = proto.Unmarshal(response.Data, protoResp)
 	// fmt.Println("response data:", fmt.Sprintf("%+v", protoResp))
-	return err
+	return len(bts), err
 }
 
 func (s *NATSTransport) awaitResponse(
