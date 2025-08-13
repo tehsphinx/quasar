@@ -17,6 +17,7 @@ import (
 const (
 	maxPkgSize        = 900 * 1024 // 900KB
 	snapshotPkgTimout = 5 * time.Second
+	base10            = 10
 )
 
 // NewNATSTransport creates a new NATS based transport.
@@ -55,6 +56,8 @@ type NATSTransport struct {
 
 	heartbeatFn     func(raft.RPC)
 	heartbeatFnLock sync.Mutex
+
+	requestIDCounter uint64
 }
 
 func (s *NATSTransport) listen(ctx context.Context) error {
@@ -128,11 +131,22 @@ func (s *NATSTransport) Store(ctx context.Context, _ raft.ServerID, address raft
 	return protoResp.GetStore(), nil
 }
 
-func (s *NATSTransport) handleStore(ctx context.Context) func(msg *nats.Msg) {
+func (s *NATSTransport) handleStore(ctx context.Context) func(*nats.Msg) {
+	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
+	var message Message
+
 	return func(msg *nats.Msg) {
+		if complete, err := handleMultiPart(msg, &message); err != nil {
+			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
+			return
+		} else if !complete {
+			return
+		}
+		data := message.GetDataAndReset()
+
 		var protoMsg pb.Store
-		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-			s.logger.Error("failed to decode incoming command", "error", r)
+		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
 
@@ -152,7 +166,7 @@ func (s *NATSTransport) handleStore(ctx context.Context) func(msg *nats.Msg) {
 			}}
 		})
 		if err != nil {
-			s.logger.Error("failed to send response", "error", err)
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
 			return
 		}
 		if r := msg.Respond(bts); r != nil {
@@ -184,11 +198,22 @@ func (s *NATSTransport) ResetCache(ctx context.Context, _ raft.ServerID, address
 	return protoResp.GetResetCache(), nil
 }
 
-func (s *NATSTransport) handleResetCache(ctx context.Context) func(msg *nats.Msg) {
+func (s *NATSTransport) handleResetCache(ctx context.Context) func(*nats.Msg) {
+	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
+	var message Message
+
 	return func(msg *nats.Msg) {
+		if complete, err := handleMultiPart(msg, &message); err != nil {
+			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
+			return
+		} else if !complete {
+			return
+		}
+		data := message.GetDataAndReset()
+
 		var protoMsg pb.ResetCache
-		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-			s.logger.Error("failed to decode incoming command", "error", r)
+		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
 
@@ -209,7 +234,7 @@ func (s *NATSTransport) handleResetCache(ctx context.Context) func(msg *nats.Msg
 			}}
 		})
 		if err != nil {
-			s.logger.Error("failed to send response", "error", err)
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
 			return
 		}
 		if r := msg.Respond(bts); r != nil {
@@ -240,11 +265,22 @@ func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address 
 	return protoResp.GetLatestUid(), nil
 }
 
-func (s *NATSTransport) handleLatestUID(ctx context.Context) func(msg *nats.Msg) {
+func (s *NATSTransport) handleLatestUID(ctx context.Context) func(*nats.Msg) {
+	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
+	var message Message
+
 	return func(msg *nats.Msg) {
+		if complete, err := handleMultiPart(msg, &message); err != nil {
+			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
+			return
+		} else if !complete {
+			return
+		}
+		data := message.GetDataAndReset()
+
 		var protoMsg pb.LatestUid
-		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-			s.logger.Error("failed to decode incoming command", "error", r)
+		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
 
@@ -265,7 +301,7 @@ func (s *NATSTransport) handleLatestUID(ctx context.Context) func(msg *nats.Msg)
 			}}
 		})
 		if err != nil {
-			s.logger.Error("failed to send response", "error", err)
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
 			return
 		}
 		if r := msg.Respond(bts); r != nil {
@@ -309,11 +345,22 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 	return nil
 }
 
-func (s *NATSTransport) handleEntries(ctx context.Context) func(msg *nats.Msg) {
+func (s *NATSTransport) handleEntries(ctx context.Context) func(*nats.Msg) {
+	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
+	var message Message
+
 	return func(msg *nats.Msg) {
+		if complete, err := handleMultiPart(msg, &message); err != nil {
+			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
+			return
+		} else if !complete {
+			return
+		}
+		data := message.GetDataAndReset()
+
 		var protoMsg pb.AppendEntriesRequest
-		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-			s.logger.Error("failed to decode incoming command", "error", r)
+		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
 
@@ -333,7 +380,7 @@ func (s *NATSTransport) handleEntries(ctx context.Context) func(msg *nats.Msg) {
 			}}
 		})
 		if err != nil {
-			s.logger.Error("failed to send response", "error", err)
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
 			return
 		}
 		if r := msg.Respond(bts); r != nil {
@@ -360,11 +407,22 @@ func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress,
 	return nil
 }
 
-func (s *NATSTransport) handleVote(ctx context.Context) func(msg *nats.Msg) {
+func (s *NATSTransport) handleVote(ctx context.Context) func(*nats.Msg) {
+	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
+	var message Message
+
 	return func(msg *nats.Msg) {
+		if complete, err := handleMultiPart(msg, &message); err != nil {
+			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
+			return
+		} else if !complete {
+			return
+		}
+		data := message.GetDataAndReset()
+
 		var protoMsg pb.RequestVoteRequest
-		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-			s.logger.Error("failed to decode incoming command", "error", r)
+		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
 		// fmt.Printf("incoming request: %+v\n", protoMsg)
@@ -383,7 +441,7 @@ func (s *NATSTransport) handleVote(ctx context.Context) func(msg *nats.Msg) {
 			return &pb.CommandResponse{Resp: &pb.CommandResponse_RequestVote{RequestVote: pb.ToRequestVoteResponse(resp)}}
 		})
 		if err != nil {
-			s.logger.Error("error awaiting response", "error", err)
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
 			return
 		}
 
@@ -433,11 +491,22 @@ func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, 
 	return nil
 }
 
-func (s *NATSTransport) handleTimeoutNow(ctx context.Context) func(msg *nats.Msg) {
+func (s *NATSTransport) handleTimeoutNow(ctx context.Context) func(*nats.Msg) {
+	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
+	var message Message
+
 	return func(msg *nats.Msg) {
+		if complete, err := handleMultiPart(msg, &message); err != nil {
+			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
+			return
+		} else if !complete {
+			return
+		}
+		data := message.GetDataAndReset()
+
 		var protoMsg pb.TimeoutNowRequest
-		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-			s.logger.Error("failed to decode incoming command", "error", r)
+		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
 
@@ -457,7 +526,7 @@ func (s *NATSTransport) handleTimeoutNow(ctx context.Context) func(msg *nats.Msg
 			}}
 		})
 		if err != nil {
-			s.logger.Error("failed to send response", "error", err)
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
 			return
 		}
 		if r := msg.Respond(bts); r != nil {
@@ -471,6 +540,22 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 	if err != nil {
 		return 0, err
 	}
+
+	// Split the message if it is too large and build the last message part.
+	reqMsg := nats.NewMsg(subj)
+	if maxPkgSize < len(bts) {
+		var (
+			requestIDStr  string
+			lastPartIndex int
+		)
+		bts, requestIDStr, lastPartIndex, err = s.publishMultiPart(subj, bts)
+		if err != nil {
+			return 0, err
+		}
+		reqMsg.Header.Set("request_id", requestIDStr)
+		reqMsg.Header.Set("pkg_part", fmt.Sprintf("%d", lastPartIndex))
+	}
+	reqMsg.Data = bts
 
 	// fmt.Println("request data:", fmt.Sprintf("%+v", msg))
 	response, err := s.conn.RequestWithContext(ctx, subj, bts)
@@ -508,4 +593,25 @@ func (s *NATSTransport) awaitResponse(
 	case <-ctx.Done():
 		return nil, raft.ErrTransportShutdown
 	}
+}
+
+func (s *NATSTransport) handleError(msg *nats.Msg, err error) {
+	if err == nil {
+		s.logger.Error("handleError: no error to handle")
+		return
+	}
+
+	s.logger.Error("failed to handle request", "error", err, "subject", msg.Subject)
+
+	resp := &pb.CommandResponse{Error: err.Error()}
+	bts, err := proto.Marshal(resp)
+	if err != nil {
+		s.logger.Error("failed to marshal error response", "error", err, "subject", msg.Subject)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send error response", "error", r, "subject", msg.Subject)
+		return
+	}
+	return
 }

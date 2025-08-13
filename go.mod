@@ -1,6 +1,6 @@
 module github.com/tehsphinx/quasar
 
-go 1.18
+go 1.21
 
 require (
 	github.com/armon/go-metrics v0.4.1

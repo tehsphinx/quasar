@@ -102,7 +102,7 @@ func (s *NATSTransport) requestOpenChannel(ctx context.Context, address raft.Ser
 	return &protoRespCh, nil
 }
 
-func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(msg *nats.Msg) {
+func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(*nats.Msg) {
 	return func(msg *nats.Msg) {
 		chanSubj := "quasar.snapshot.channel." + uuid.NewString()
 		pipeReader, chanSub, err := s.openNatsStream(chanSubj)
@@ -137,7 +137,7 @@ func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(msg *nat
 			}}
 		})
 		if err != nil {
-			s.logger.Error("failed to send response", "error", err)
+			s.logger.Error("failed to consume message", "error", err)
 			return
 		}
 
