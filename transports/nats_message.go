@@ -47,7 +47,7 @@ func (s *NATSTransport) publishMultiPart(subj string, data []byte) ([]byte, stri
 	)
 	for {
 		partID++
-		part := data[:min(len(data), maxPkgSize)]
+		part := data[:min(len(data), s.maxMsgSize)]
 		data = data[len(part):]
 		if len(data) == 0 {
 			return part, requestIDStr, partID, nil

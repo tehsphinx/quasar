@@ -30,6 +30,7 @@ func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverNam
 		serverName:     serverName,
 		cacheName:      cacheName,
 		timeout:        config.timeout,
+		maxMsgSize:     config.maxMsgSize,
 		chConsume:      make(chan raft.RPC, consumerChanSize),
 		chConsumeCache: make(chan raft.RPC, consumerChanSize),
 	}
@@ -58,6 +59,7 @@ type NATSTransport struct {
 	heartbeatFnLock sync.Mutex
 
 	requestIDCounter uint64
+	maxMsgSize       int
 }
 
 func (s *NATSTransport) listen(ctx context.Context) error {
@@ -543,7 +545,7 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 
 	// Split the message if it is too large and build the last message part.
 	reqMsg := nats.NewMsg(subj)
-	if maxPkgSize < len(bts) {
+	if s.maxMsgSize < len(bts) {
 		var (
 			requestIDStr  string
 			lastPartIndex int

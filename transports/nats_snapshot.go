@@ -58,7 +58,7 @@ func (s *NATSTransport) InstallSnapshot(_ raft.ServerID, address raft.ServerAddr
 }
 
 func (s *NATSTransport) sendSnapshot(sendSubj string, data io.Reader) error {
-	buf := make([]byte, maxPkgSize)
+	buf := make([]byte, s.maxMsgSize)
 	var counter int
 	for {
 		n, r := data.Read(buf)

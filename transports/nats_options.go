@@ -13,8 +13,9 @@ type NATSOption func(cfg *natsOptions)
 
 func getNATSOptions(opts []NATSOption) natsOptions {
 	cfg := natsOptions{
-		timeout: defaultTimout,
-		output:  os.Stderr,
+		timeout:    defaultTimout,
+		output:     os.Stderr,
+		maxMsgSize: maxPkgSize,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -31,9 +32,10 @@ func getNATSOptions(opts []NATSOption) natsOptions {
 }
 
 type natsOptions struct {
-	output  io.Writer
-	logger  hclog.Logger
-	timeout time.Duration
+	output     io.Writer
+	logger     hclog.Logger
+	timeout    time.Duration
+	maxMsgSize int
 }
 
 // WithNATSTimeout adds a timout for nats requests. Defaults to 5s. Set to 0 to disable the timeout.
@@ -54,5 +56,11 @@ func WithNATSLogger(logger hclog.Logger) NATSOption {
 func WithNATSLogOutput(output io.Writer) NATSOption {
 	return func(cfg *natsOptions) {
 		cfg.output = output
+	}
+}
+
+func WithNATSMaxMsgSize(size int) NATSOption {
+	return func(cfg *natsOptions) {
+		cfg.maxMsgSize = size
 	}
 }
