@@ -1,10 +1,13 @@
 package quasar
 
 import (
+	"log/slog"
 	"net"
+	"os"
 	"strconv"
 
 	"github.com/google/uuid"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar/stores"
@@ -24,11 +27,13 @@ type options struct {
 	nc        *nats.Conn
 	transport transports.Transport
 
-	raftConfig *raft.Config
-	suffrage   raft.ServerSuffrage
-	bootstrap  bool
-	servers    []raft.Server
-	discovery  Discovery
+	raftConfig  *raft.Config
+	suffrage    raft.ServerSuffrage
+	bootstrap   bool
+	servers     []raft.Server
+	discovery   Discovery
+	hclogLogger hclog.Logger
+	slogLogger  *slog.Logger
 
 	kv     stores.KVStore
 	pStore stores.PersistentStorage
@@ -36,7 +41,7 @@ type options struct {
 
 func getOptions(opts []Option) options {
 	cfg := options{
-		cacheName: "default",
+		cacheName: "quasar",
 		localID:   uuid.NewString(),
 		suffrage:  raft.Voter,
 	}
@@ -44,6 +49,21 @@ func getOptions(opts []Option) options {
 		opt(&cfg)
 	}
 	return cfg
+}
+
+func (o *options) getLogger() hclog.Logger {
+	if o.hclogLogger != nil {
+		return o.hclogLogger
+	}
+	if o.slogLogger != nil {
+		return &slogAdapter{logger: o.slogLogger}
+	}
+
+	return hclog.New(&hclog.LoggerOptions{
+		Name:   o.cacheName,
+		Level:  hclog.NoLevel,
+		Output: os.Stdout,
+	})
 }
 
 // WithName sets the name of the cache. This can be important for distinguishing
@@ -151,6 +171,22 @@ func WithDiscovery(discovery Discovery) Option {
 func WithRaftConfig(cfg *raft.Config) Option {
 	return func(o *options) {
 		o.raftConfig = cfg
+	}
+}
+
+// WithHclogLogger sets an hclog.Logger to be used for raft logging.
+// Priority order: hclog > slog > zerolog.
+func WithHclogLogger(logger hclog.Logger) Option {
+	return func(o *options) {
+		o.hclogLogger = logger
+	}
+}
+
+// WithSlogLogger sets an slog.Logger to be used for raft logging.
+// Priority order: hclog > slog > zerolog.
+func WithSlogLogger(logger *slog.Logger) Option {
+	return func(o *options) {
+		o.slogLogger = logger
 	}
 }
 

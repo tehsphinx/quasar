@@ -18,6 +18,7 @@ func getRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, transport transp
 		conf = raft.DefaultConfig()
 	}
 	conf.LocalID = raft.ServerID(cfg.localID)
+	conf.Logger = cfg.getLogger()
 
 	rft, err := raft.NewRaft(conf, fsm, logStore, stableStore, snapshotStore, transport)
 	if err != nil {

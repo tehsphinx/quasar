@@ -8,6 +8,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
 	"github.com/tehsphinx/quasar/stores"
@@ -52,6 +53,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		pStore:   cfg.pStore,
 		suffrage: cfg.suffrage,
 		close:    closeCache,
+		logger:   cfg.getLogger(),
 	}
 
 	transport, err := getTransport(ctx, cfg)
@@ -109,6 +111,7 @@ type Cache struct {
 	transport transports.Transport
 	discovery *DiscoveryInjector
 	suffrage  raft.ServerSuffrage
+	logger    hclog.Logger
 
 	ctx   context.Context
 	close context.CancelFunc
@@ -437,6 +440,8 @@ func (s *Cache) Reset(ctx context.Context) error {
 		return err
 	}
 
+	s.logger.Info("cache reset triggered")
+
 	var (
 		retErrs    []error
 		foundLocal bool
@@ -475,8 +480,10 @@ func (s *Cache) localReset() error {
 
 	if s.isLeader() {
 		// don't reset raft itself on leader.
+		s.logger.Info("applied cache reset: no raft reset on leader")
 		return nil
 	}
+	s.logger.Info("applied cache reset: resetting raft")
 
 	s.fsm.applyRaftReset()
 	s.raft.Shutdown()
@@ -492,22 +499,3 @@ func (s *Cache) localReset() error {
 
 	return nil
 }
-
-// func (s *Cache) observeLeader(ctx context.Context, change chan raft.Observation) {
-// 	var obs raft.Observation
-// 	for {
-// 		select {
-// 		case <-ctx.Done():
-// 			return
-// 		case obs = <-change:
-// 		}
-//
-// 		leaderObs, ok := obs.Data.(raft.LeaderObservation)
-// 		if !ok {
-// 			continue
-// 		}
-// 		_ = leaderObs
-//
-// 		s.transport.SetLeader(leaderObs.LeaderID, leaderObs.LeaderAddr)
-// 	}
-// }
