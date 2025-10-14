@@ -55,7 +55,7 @@ func (s *FSMInjector) Store(ctx context.Context, bts []byte) (uint64, error) {
 // IsLeader returns if the cache is the current leader. This is not a verified
 // check, so it might be that it is not able to perform leadership actions.
 func (s *FSMInjector) IsLeader() bool {
-	return s.cache.isLeader()
+	return s.cache.IsLeader()
 }
 
 // HasLeader returns if the cache has a leader. Or at least if the current node

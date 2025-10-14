@@ -153,7 +153,7 @@ func (s *Cache) store(ctx context.Context, key string, data []byte) (uint64, err
 }
 
 func (s *Cache) masterLastIndex(ctx context.Context) (uint64, error) {
-	if s.isLeader() {
+	if s.IsLeader() {
 		return s.localLastIndex(), nil
 	}
 
@@ -171,7 +171,7 @@ func (s *Cache) localLastIndex() uint64 {
 }
 
 func (s *Cache) apply(ctx context.Context, cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
-	if s.isLeader() {
+	if s.IsLeader() {
 		return s.applyLocal(ctx, cmd)
 	}
 	return s.applyRemote(ctx, cmd)
@@ -277,10 +277,10 @@ func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.Ser
 	return addr, id, nil
 }
 
-// isLeader returns if the cache is the current leader. This is not a verified
+// IsLeader returns if the cache is the current leader. This is not a verified
 // check, so it might be that it looses leadership soon or is not able to do leadership
 // actions.
-func (s *Cache) isLeader() bool {
+func (s *Cache) IsLeader() bool {
 	return s.raft.State() == raft.Leader
 }
 
@@ -301,7 +301,7 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 		return err
 	}
 
-	if s.isLeader() {
+	if s.IsLeader() {
 		// If we ourselves became leader, attempt leadership transfer.
 		// This way we avoid new cache taking leadership of older instances.
 		fut := s.raft.LeadershipTransfer()
@@ -478,7 +478,7 @@ func (s *Cache) localReset() error {
 		return err
 	}
 
-	if s.isLeader() {
+	if s.IsLeader() {
 		// don't reset raft itself on leader.
 		s.logger.Info("applied cache reset: no raft reset on leader")
 		return nil

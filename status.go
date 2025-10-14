@@ -57,7 +57,7 @@ func (s *Cache) GetRaftStatus() RaftStatus {
 		LocalID:      s.localID,
 		LocalAddress: string(s.transport.LocalAddr()),
 		State:        s.raft.State().String(),
-		IsLeader:     s.isLeader(),
+		IsLeader:     s.IsLeader(),
 		Suffrage:     suffrageToString(s.suffrage),
 		CacheName:    s.name,
 		LastIndex:    s.raft.LastIndex(),
