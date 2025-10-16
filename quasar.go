@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
@@ -71,7 +73,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 	if err != nil {
 		return nil, err
 	}
-	c.raft = rft
+	c.setRaft(rft)
 	discovery.regObservation(ctx, rft)
 
 	if cfg.discovery != nil {
@@ -107,7 +109,12 @@ type Cache struct {
 	fsm    *fsmWrapper
 	pStore stores.PersistentStorage
 
-	raft      *raft.Raft
+	raftMutex   sync.RWMutex
+	ctxRaft     context.Context
+	closeRaft   context.CancelFunc
+	lastResetID string
+	raftLocker  *raft.Raft
+
 	transport transports.Transport
 	discovery *DiscoveryInjector
 	suffrage  raft.ServerSuffrage
@@ -128,7 +135,7 @@ func (s *Cache) serverInfo() raft.Server {
 // GetLeader returns the current leader of the cluster.
 // It may return empty strings if there is no current leader or the leader is unknown.
 func (s *Cache) GetLeader() raft.Server {
-	addr, id := s.raft.LeaderWithID()
+	addr, id := s.raft().LeaderWithID()
 	return raft.Server{
 		ID:       id,
 		Address:  addr,
@@ -138,7 +145,7 @@ func (s *Cache) GetLeader() raft.Server {
 
 // GetServerList returns the servers in the cluster and whether they have votes.
 func (s *Cache) GetServerList() ([]raft.Server, error) {
-	future := s.raft.GetConfiguration()
+	future := s.raft().GetConfiguration()
 	if err := future.Error(); err != nil {
 		return nil, err
 	}
@@ -167,7 +174,7 @@ func (s *Cache) masterLastIndex(ctx context.Context) (uint64, error) {
 }
 
 func (s *Cache) localLastIndex() uint64 {
-	return s.raft.LastIndex()
+	return s.raft().LastIndex()
 }
 
 func (s *Cache) apply(ctx context.Context, cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
@@ -188,7 +195,7 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 		return nil, 0, fmt.Errorf("failed to marshal command: %w", err)
 	}
 
-	fut := s.raft.Apply(bts, getTimeout(ctx, applyTimout))
+	fut := s.raft().Apply(bts, getTimeout(ctx, applyTimout))
 	if r := fut.Error(); r != nil {
 		return nil, 0, fmt.Errorf("applying failed with: %w", r)
 	}
@@ -267,12 +274,12 @@ func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.Ser
 	ctx, cancel := context.WithTimeout(ctx, noLeaderTimeout)
 	defer cancel()
 
-	addr, id := s.raft.LeaderWithID()
+	addr, id := s.raft().LeaderWithID()
 	if id == "" {
 		if r := s.waitForLeader(ctx); r != nil {
 			return "", "", r
 		}
-		addr, id = s.raft.LeaderWithID()
+		addr, id = s.raft().LeaderWithID()
 	}
 	return addr, id, nil
 }
@@ -281,13 +288,13 @@ func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.Ser
 // check, so it might be that it looses leadership soon or is not able to do leadership
 // actions.
 func (s *Cache) IsLeader() bool {
-	return s.raft.State() == raft.Leader
+	return s.raft().State() == raft.Leader
 }
 
 // hasLeader returns if the cache has a leader. Or at least if the current node
 // thinks there is a leader. The leader might already be unreachable.
 func (s *Cache) hasLeader() bool {
-	_, id := s.raft.LeaderWithID()
+	_, id := s.raft().LeaderWithID()
 	return id != ""
 }
 
@@ -304,7 +311,7 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 	if s.IsLeader() {
 		// If we ourselves became leader, attempt leadership transfer.
 		// This way we avoid new cache taking leadership of older instances.
-		fut := s.raft.LeadershipTransfer()
+		fut := s.raft().LeadershipTransfer()
 		//nolint:staticcheck // empty branch will be filled later
 		if r := fut.Error(); r != nil {
 			// log error
@@ -335,8 +342,10 @@ func (s *Cache) waitForLeader(ctx context.Context) error {
 		}
 		return false
 	})
-	s.raft.RegisterObserver(observer)
-	defer s.raft.DeregisterObserver(observer)
+
+	rft, ctxRaft := s.getRaftWithCtx()
+	rft.RegisterObserver(observer)
+	defer rft.DeregisterObserver(observer)
 
 	if s.hasLeader() {
 		// leader elected while starting to observe
@@ -351,13 +360,15 @@ func (s *Cache) waitForLeader(ctx context.Context) error {
 			if s.hasLeader() {
 				return nil
 			}
+		case <-ctxRaft.Done():
+			return s.waitForLeader(ctx)
 		}
 	}
 }
 
 // Snapshot takes a snapshot of the cache.
 func (s *Cache) Snapshot() (*raft.SnapshotMeta, io.ReadCloser, error) {
-	fut := s.raft.Snapshot()
+	fut := s.raft().Snapshot()
 	if err := fut.Error(); err != nil {
 		return nil, nil, err
 	}
@@ -374,14 +385,14 @@ func (s *Cache) Restore(ctx context.Context, meta *raft.SnapshotMeta, reader io.
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 	}
-	return s.raft.Restore(meta, reader, timeout)
+	return s.raft().Restore(meta, reader, timeout)
 }
 
 // ForceSnapshot triggers the underlying raft library to take a snapshot.
 // Mostly used for testing purposes.
 // TODO: remove and use Snapshot and Restore in tests instead.
 func (s *Cache) ForceSnapshot() error {
-	future := s.raft.Snapshot()
+	future := s.raft().Snapshot()
 	return future.Error()
 }
 
@@ -402,8 +413,8 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 				uid, err = s.store(ctx, cmd.Key, cmd.Data)
 				resp = &pb.StoreResponse{Uid: uid}
 			case *pb.ResetCache:
-				err = s.localReset()
-				resp = &pb.ResetCacheResponse{}
+				err = s.localReset(cmd.Uuid)
+				resp = &pb.ResetCacheResponse{Uuid: cmd.Uuid}
 			case *pb.LatestUid:
 				uid := s.localLastIndex()
 				resp = &pb.LatestUidResponse{Uid: uid}
@@ -430,7 +441,7 @@ func (s *Cache) shutdown() error {
 		_ = trans.Close()
 	}
 
-	return s.raft.Shutdown().Error()
+	return s.raft().Shutdown().Error()
 }
 
 // Reset resets calls Reset the cache on all servers.
@@ -445,17 +456,18 @@ func (s *Cache) Reset(ctx context.Context) error {
 	var (
 		retErrs    []error
 		foundLocal bool
+		resetID    = uuid.NewString()
 	)
 	for _, server := range servers {
 		if server.ID == raft.ServerID(s.localID) {
 			foundLocal = true
-			if r := s.localReset(); r != nil {
+			if r := s.localReset(resetID); r != nil {
 				retErrs = append(retErrs, r)
 			}
 			continue
 		}
 
-		resp, r := s.transport.ResetCache(ctx, server.ID, server.Address, &pb.ResetCache{})
+		resp, r := s.sendReset(ctx, server)
 		if r != nil {
 			retErrs = append(retErrs, r)
 			continue
@@ -465,7 +477,7 @@ func (s *Cache) Reset(ctx context.Context) error {
 		}
 	}
 	if !foundLocal {
-		if r := s.localReset(); r != nil {
+		if r := s.localReset(resetID); r != nil {
 			retErrs = append(retErrs, r)
 		}
 	}
@@ -473,7 +485,19 @@ func (s *Cache) Reset(ctx context.Context) error {
 	return errors.Join(retErrs...)
 }
 
-func (s *Cache) localReset() error {
+func (s *Cache) sendReset(ctx context.Context, server raft.Server) (*pb.ResetCacheResponse, error) {
+	resp, r := s.transport.ResetCache(ctx, server.ID, server.Address, &pb.ResetCache{
+		Uuid: s.getLastResetID(),
+	})
+	return resp, r
+}
+
+func (s *Cache) localReset(resetID string) error {
+	if resetID == s.getLastResetID() {
+		return nil
+	}
+	s.setLastResetID(resetID)
+
 	if err := s.fsm.applyReset(); err != nil {
 		return err
 	}
@@ -486,7 +510,7 @@ func (s *Cache) localReset() error {
 	s.logger.Info("applied cache reset: resetting raft")
 
 	s.fsm.applyRaftReset()
-	s.raft.Shutdown()
+	s.raft().Shutdown()
 
 	logStore := wrapStore(raft.NewInmemStore(), s.fsm)
 
@@ -494,8 +518,47 @@ func (s *Cache) localReset() error {
 	if err != nil {
 		return err
 	}
-	s.raft = rft
+	s.setRaft(rft)
 	s.discovery.regObservation(s.ctx, rft)
 
 	return nil
+}
+
+func (s *Cache) raft() *raft.Raft {
+	s.raftMutex.RLock()
+	defer s.raftMutex.RUnlock()
+
+	return s.raftLocker
+}
+
+func (s *Cache) setRaft(rft *raft.Raft) {
+	s.raftMutex.Lock()
+	defer s.raftMutex.Unlock()
+
+	if s.closeRaft != nil {
+		s.closeRaft()
+	}
+	s.ctxRaft, s.closeRaft = context.WithCancel(s.ctx)
+	s.raftLocker = rft
+}
+
+func (s *Cache) getLastResetID() string {
+	s.raftMutex.RLock()
+	defer s.raftMutex.RUnlock()
+
+	return s.lastResetID
+}
+
+func (s *Cache) setLastResetID(resetID string) {
+	s.raftMutex.Lock()
+	defer s.raftMutex.Unlock()
+
+	s.lastResetID = resetID
+}
+
+func (s *Cache) getRaftWithCtx() (*raft.Raft, context.Context) {
+	s.raftMutex.RLock()
+	defer s.raftMutex.RUnlock()
+
+	return s.raftLocker, s.ctxRaft
 }

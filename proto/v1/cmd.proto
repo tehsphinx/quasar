@@ -53,8 +53,16 @@ message LatestUidResponse {
   uint64 uid = 1;
 }
 
-message ResetCache {}
+message ResetCache {
+  // A random UUID to identify the reset. This is used to make sure that a reset is only done once
+  // and applied to all nodes.
+  string uuid = 1;
+}
 
 message ResetCacheResponse {
+  // The UID of the reset.
+  string uuid = 2;
+
+  // Error message in case of error.
   string error = 1;
 }

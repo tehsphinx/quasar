@@ -41,7 +41,7 @@ func (s *FSMInjector) WaitForKnownLatest(ctx context.Context) error {
 	ctx, cancel := getWaitCtx(ctx)
 	defer cancel()
 
-	uid := s.cache.raft.LastIndex()
+	uid := s.cache.raft().LastIndex()
 	return s.cache.fsm.WaitFor(ctx, uid)
 }
 

@@ -53,21 +53,22 @@ type ServerStatus struct {
 // GetRaftStatus returns comprehensive operational status information about the Raft cluster.
 // This includes cluster health, leader status, server list, and synchronization state.
 func (s *Cache) GetRaftStatus() RaftStatus {
+	cacheRaft := s.raft()
 	status := RaftStatus{
 		LocalID:      s.localID,
 		LocalAddress: string(s.transport.LocalAddr()),
-		State:        s.raft.State().String(),
+		State:        cacheRaft.State().String(),
 		IsLeader:     s.IsLeader(),
 		Suffrage:     suffrageToString(s.suffrage),
 		CacheName:    s.name,
-		LastIndex:    s.raft.LastIndex(),
-		LastApplied:  s.raft.AppliedIndex(),
-		CommitIndex:  s.raft.CommitIndex(),
-		Stats:        s.raft.Stats(),
+		LastIndex:    cacheRaft.LastIndex(),
+		LastApplied:  cacheRaft.AppliedIndex(),
+		CommitIndex:  cacheRaft.CommitIndex(),
+		Stats:        cacheRaft.Stats(),
 	}
 
 	// Get leader information
-	leaderAddr, leaderID := s.raft.LeaderWithID()
+	leaderAddr, leaderID := cacheRaft.LeaderWithID()
 	status.LeaderID = string(leaderID)
 	status.LeaderAddress = string(leaderAddr)
 	status.HasLeader = leaderID != ""
@@ -75,20 +76,20 @@ func (s *Cache) GetRaftStatus() RaftStatus {
 	// Check if leader is healthy by verifying leadership
 	if status.HasLeader {
 		// VerifyLeader returns nil if this node believes the leader is still valid
-		verifyFuture := s.raft.VerifyLeader()
+		verifyFuture := cacheRaft.VerifyLeader()
 		status.LeaderHealthy = verifyFuture.Error() == nil
 	}
 
 	// Get last contact time (only meaningful for followers)
 	if !status.IsLeader {
-		lastContact := s.raft.LastContact()
+		lastContact := cacheRaft.LastContact()
 		status.LastContact = lastContact.String()
 	} else {
 		status.LastContact = "0s (leader)"
 	}
 
 	// Get server list and analyze cluster composition
-	future := s.raft.GetConfiguration()
+	future := cacheRaft.GetConfiguration()
 	if err := future.Error(); err == nil {
 		configuration := future.Configuration()
 		status.NumServers = len(configuration.Servers)

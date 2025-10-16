@@ -70,22 +70,34 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 	}
 
 	fut := addServerFn(srv.ID, srv.Address, 0, 0)
-	if err := fut.Error(); err != nil {
-		return err
+	if r := fut.Error(); r != nil {
+		return r
 	}
+
+	if s.cache.getLastResetID() != "" {
+		resp, r := s.cache.sendReset(context.Background(), srv)
+		if r != nil {
+			return r
+		}
+		if resp.GetError() != "" {
+			return errors.New(resp.GetError())
+		}
+	}
+
 	return nil
 }
 
 type addServerFunc func(id raft.ServerID, address raft.ServerAddress, prevIndex uint64, timeout time.Duration) raft.IndexFuture
 
 func (s *DiscoveryInjector) getAddServerFunc(voter bool) (addServerFunc, error) {
-	if s.cache.raft == nil {
+	rft := s.cache.raft()
+	if rft == nil {
 		return nil, errors.New("raft not set (yet)")
 	}
 	if voter {
-		return s.cache.raft.AddVoter, nil
+		return rft.AddVoter, nil
 	}
-	return s.cache.raft.AddNonvoter, nil
+	return rft.AddNonvoter, nil
 }
 
 func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) {

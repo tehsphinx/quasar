@@ -1190,3 +1190,186 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 	err = cache1.Shutdown()
 	asrtMain.NoErr(err)
 }
+
+func TestVoterNodeRestart(t *testing.T) {
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelMain()
+
+	asrtMain := is.New(t)
+
+	nc1, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc2, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc3, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+	defer nc3.Close()
+
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_voter_restart", "cache1")
+	asrtMain.NoErr(err)
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_voter_restart", "cache2")
+	asrtMain.NoErr(err)
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_voter_restart", "cache3")
+	asrtMain.NoErr(err)
+
+	fsm1 := exampleFSM.NewInMemoryFSM()
+	fsm2 := exampleFSM.NewInMemoryFSM()
+	fsm3 := exampleFSM.NewInMemoryFSM()
+
+	discovery1 := discoveries.NewNATSDiscovery(nc1)
+	discovery2 := discoveries.NewNATSDiscovery(nc2)
+	discovery3 := discoveries.NewNATSDiscovery(nc3)
+
+	// Create cache1 as voter (leader)
+	cache1, err := quasar.NewCache(ctxMain, fsm1,
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport1),
+		quasar.WithDiscovery(discovery1),
+	)
+	asrtMain.NoErr(err)
+
+	// Create cache2 and cache3 as non-voters
+	cache2, err := quasar.NewCache(ctxMain, fsm2,
+		quasar.WithLocalID("cache2"),
+		quasar.WithTransport(transport2),
+		quasar.WithDiscovery(discovery2),
+		quasar.WithSuffrage(raft.Nonvoter),
+	)
+	asrtMain.NoErr(err)
+	defer cache2.Shutdown()
+
+	cache3, err := quasar.NewCache(ctxMain, fsm3,
+		quasar.WithLocalID("cache3"),
+		quasar.WithTransport(transport3),
+		quasar.WithDiscovery(discovery3),
+		quasar.WithSuffrage(raft.Nonvoter),
+	)
+	asrtMain.NoErr(err)
+	defer cache3.Shutdown()
+
+	err = cache1.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	err = cache2.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	err = cache3.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	fmt.Println("All caches ready")
+
+	// Verify cache1 is the leader
+	asrtMain.Equal(cache1.GetLeader().ID, raft.ServerID("cache1"))
+
+	// Add 50 entries from different nodes
+	ctx, cancel := context.WithTimeout(ctxMain, 10*time.Second)
+	defer cancel()
+
+	fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
+	for i := 0; i < 50; i++ {
+		fsm := fsms[i%3]
+		musician := exampleFSM.Musician{
+			Name:        fmt.Sprintf("Musician%d", i),
+			Age:         20 + i,
+			Instruments: []string{fmt.Sprintf("instrument%d", i)},
+		}
+		err = fsm.SetMusician(ctx, musician)
+		asrtMain.NoErr(err)
+	}
+	fmt.Println("Added 50 entries")
+
+	// Verify all entries are present on all nodes
+	for i := 0; i < 50; i++ {
+		for _, fsm := range fsms {
+			got, err := fsm.GetMusicianMaster(ctx, fmt.Sprintf("Musician%d", i))
+			asrtMain.NoErr(err)
+			asrtMain.Equal(got.Name, fmt.Sprintf("Musician%d", i))
+			asrtMain.Equal(got.Age, 20+i)
+		}
+	}
+	fmt.Println("Verified all entries on all nodes")
+
+	// Simulate voter node restart: shutdown cache1
+	err = cache1.Shutdown()
+	asrtMain.NoErr(err)
+	fmt.Println("Voter node (cache1) shut down")
+
+	// Wait a bit for the cluster to stabilize
+	time.Sleep(2 * time.Second)
+
+	// Create new cache1 with fresh FSM
+	fsm1New := exampleFSM.NewInMemoryFSM()
+	transport1New, err := transports.NewNATSTransport(ctxMain, nc1, "test_voter_restart", "cache1")
+	asrtMain.NoErr(err)
+	discovery1New := discoveries.NewNATSDiscovery(nc1)
+
+	cache1New, err := quasar.NewCache(ctxMain, fsm1New,
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport1New),
+		quasar.WithDiscovery(discovery1New),
+	)
+	asrtMain.NoErr(err)
+	defer cache1New.Shutdown()
+
+	err = cache1New.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	fmt.Println("New cache1 is ready")
+
+	// Reset the cache
+	err = cache1New.Reset(ctxMain)
+	asrtMain.NoErr(err)
+	fmt.Println("Cache reset complete")
+
+	// Wait for all caches to be ready again
+	err = cache1New.WaitReady(ctxMain)
+	fmt.Printf("cache1: %+v\n", cache1New.GetRaftStatus())
+	asrtMain.NoErr(err)
+	err = cache2.WaitReady(ctxMain)
+	fmt.Printf("cache2: %+v\n", cache2.GetRaftStatus())
+	asrtMain.NoErr(err)
+	err = cache3.WaitReady(ctxMain)
+	fmt.Printf("cache3: %+v\n", cache3.GetRaftStatus())
+	asrtMain.NoErr(err)
+	fmt.Println("All caches ready after reset")
+
+	// Test functionality: add new entries from all nodes
+	ctx2, cancel2 := context.WithTimeout(ctxMain, 10*time.Second)
+	defer cancel2()
+
+	fsmsNew := []*exampleFSM.InMemoryFSM{fsm1New, fsm2, fsm3}
+	for i := 50; i < 60; i++ {
+		fsm := fsmsNew[i%3]
+		musician := exampleFSM.Musician{
+			Name:        fmt.Sprintf("Musician%d", i),
+			Age:         20 + i,
+			Instruments: []string{fmt.Sprintf("instrument%d", i)},
+		}
+		err = fsm.SetMusician(ctx2, musician)
+		asrtMain.NoErr(err)
+	}
+	fmt.Println("Added 10 new entries after restart")
+
+	fmt.Println(cache1New.GetRaftStatus())
+	fmt.Println(cache2.GetRaftStatus())
+	fmt.Println(cache3.GetRaftStatus())
+
+	// Verify new entries can be read from all nodes
+	for i := 50; i < 60; i++ {
+		for _, fsm := range fsmsNew {
+			got, err := fsm.GetMusicianMaster(ctx2, fmt.Sprintf("Musician%d", i))
+			asrtMain.NoErr(err)
+			asrtMain.Equal(got.Name, fmt.Sprintf("Musician%d", i))
+			asrtMain.Equal(got.Age, 20+i)
+		}
+	}
+	fmt.Println("Verified all new entries on all nodes after restart")
+
+	// Verify reading from local cache works
+	for i := 50; i < 60; i++ {
+		for _, fsm := range fsmsNew {
+			got, err := fsm.GetMusicianLocal(fmt.Sprintf("Musician%d", i))
+			asrtMain.NoErr(err)
+			asrtMain.Equal(got.Name, fmt.Sprintf("Musician%d", i))
+		}
+	}
+	fmt.Println("Verified local reads work on all nodes")
+}
