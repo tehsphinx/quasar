@@ -99,6 +99,81 @@ func TestSingleCache(t *testing.T) {
 	}
 }
 
+func TestCacheRemoveAndShutdown(t *testing.T) {
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelMain()
+
+	asrt := is.New(t)
+
+	addr1, transport1 := transports.NewInmemTransport("")
+	addr2, transport2 := transports.NewInmemTransport("")
+	addr3, transport3 := transports.NewInmemTransport("")
+
+	transport1.Connect(addr2, transport2)
+	transport1.Connect(addr3, transport3)
+	transport2.Connect(addr1, transport1)
+	transport2.Connect(addr3, transport3)
+	transport3.Connect(addr1, transport1)
+	transport3.Connect(addr2, transport2)
+
+	servers := []raft.Server{
+		{ID: "cache1", Address: addr1, Suffrage: raft.Voter},
+		{ID: "cache2", Address: addr2, Suffrage: raft.Voter},
+		{ID: "cache3", Address: addr3, Suffrage: raft.Voter},
+	}
+
+	cache1, err := quasar.NewCache(ctxMain, exampleFSM.NewInMemoryFSM(),
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport1),
+		quasar.WithServers(servers),
+	)
+	asrt.NoErr(err)
+	defer cache1.Shutdown()
+
+	cache2, err := quasar.NewCache(ctxMain, exampleFSM.NewInMemoryFSM(),
+		quasar.WithLocalID("cache2"),
+		quasar.WithTransport(transport2),
+		quasar.WithServers(servers),
+	)
+	asrt.NoErr(err)
+
+	cache3, err := quasar.NewCache(ctxMain, exampleFSM.NewInMemoryFSM(),
+		quasar.WithLocalID("cache3"),
+		quasar.WithTransport(transport3),
+		quasar.WithServers(servers),
+	)
+	asrt.NoErr(err)
+	defer cache3.Shutdown()
+
+	err = cache1.WaitReady(ctxMain)
+	asrt.NoErr(err)
+	err = cache2.WaitReady(ctxMain)
+	asrt.NoErr(err)
+	err = cache3.WaitReady(ctxMain)
+	asrt.NoErr(err)
+
+	err = cache2.RemoveAndShutdown(ctxMain)
+	asrt.NoErr(err)
+
+	err = waitForCondition(ctxMain, func() error {
+		srvs, waitErr := cache1.GetServerList()
+		if waitErr != nil {
+			return waitErr
+		}
+		if len(srvs) != 2 {
+			return fmt.Errorf("expected 2 servers after removal, got %d", len(srvs))
+		}
+
+		for _, server := range srvs {
+			if server.ID == "cache2" {
+				return fmt.Errorf("cache2 should have been removed from raft")
+			}
+		}
+		return nil
+	})
+	asrt.NoErr(err)
+}
+
 func TestCacheClusterTCP(t *testing.T) {
 	type test struct {
 		name      string

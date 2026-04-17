@@ -18,3 +18,11 @@ func cmdLatestUID() *pb.Command {
 		LatestUid: &pb.LatestUid{},
 	}}
 }
+
+func cmdRemoveServer(id string) *pb.Command {
+	return &pb.Command{Cmd: &pb.Command_RemoveServer{
+		RemoveServer: &pb.RemoveServer{
+			Id: id,
+		},
+	}}
+}

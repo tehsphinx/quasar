@@ -26,6 +26,7 @@ const (
 	rpcStore
 	rpcLatestUID
 	rpcResetCache
+	rpcRemoveServer
 
 	// connReceiveBufferSize is the size of the buffer we will use for reading RPC requests into
 	// on followers.
@@ -197,6 +198,21 @@ func (s *TCPTransport) ResetCache(ctx context.Context, id raft.ServerID, target 
 
 	var resp pb.ResetCacheResponse
 	err := s.genericRPC(ctx, id, target, rpcResetCache, command, &resp)
+	return &resp, err
+}
+
+// RemoveServer asks the leader to remove a server from the raft configuration.
+func (s *TCPTransport) RemoveServer(ctx context.Context, id raft.ServerID, target raft.ServerAddress,
+	command *pb.RemoveServer,
+) (*pb.RemoveServerResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+
+	var resp pb.RemoveServerResponse
+	err := s.genericRPC(ctx, id, target, rpcRemoveServer, command, &resp)
 	return &resp, err
 }
 
@@ -649,6 +665,14 @@ func (s *TCPTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *c
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "Reset"}}
+		consumeCh = s.chConsumeCache
+	case rpcRemoveServer:
+		var req pb.RemoveServer
+		if err := dec.Decode(&req); err != nil {
+			return err
+		}
+		rpc.Command = &req
+		labels = []metrics.Label{{Name: "rpcType", Value: "RemoveServer"}}
 		consumeCh = s.chConsumeCache
 	// case rpcLoad:
 	// 	var req pb.LoadValue

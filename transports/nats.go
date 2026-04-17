@@ -82,6 +82,10 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	subRemoveServer, err := s.conn.Subscribe(subjPrefix+".cache.server.remove", s.handleRemoveServer(ctx))
+	if err != nil {
+		return err
+	}
 	subLatestUID, err := s.conn.Subscribe(subjPrefix+".cache.uid.latest", s.handleLatestUID(ctx))
 	if err != nil {
 		return err
@@ -101,6 +105,7 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 		_ = subVote.Unsubscribe()
 		_ = subStore.Unsubscribe()
 		_ = subResetCache.Unsubscribe()
+		_ = subRemoveServer.Unsubscribe()
 		_ = subLatestUID.Unsubscribe()
 		_ = subInstallSnapshot.Unsubscribe()
 		_ = subTimeoutNow.Unsubscribe()
@@ -200,6 +205,29 @@ func (s *NATSTransport) ResetCache(ctx context.Context, _ raft.ServerID, address
 	return protoResp.GetResetCache(), nil
 }
 
+// RemoveServer asks the leader to remove a server from the raft configuration.
+func (s *NATSTransport) RemoveServer(ctx context.Context, _ raft.ServerID, address raft.ServerAddress,
+	request *pb.RemoveServer,
+) (*pb.RemoveServerResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+
+	subj := fmt.Sprintf("quasar.%s.%s.cache.server.remove", s.cacheName, address)
+
+	var protoResp pb.CommandResponse
+	if _, err := s.request(ctx, subj, request, &protoResp); err != nil {
+		return nil, err
+	}
+	if errStr := protoResp.GetError(); errStr != "" {
+		return nil, errors.New(errStr)
+	}
+
+	return protoResp.GetRemoveServer(), nil
+}
+
 func (s *NATSTransport) handleResetCache(ctx context.Context) func(*nats.Msg) {
 	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
 	var message Message
@@ -233,6 +261,49 @@ func (s *NATSTransport) handleResetCache(ctx context.Context) func(*nats.Msg) {
 			resp, _ := i.(*pb.ResetCacheResponse)
 			return &pb.CommandResponse{Resp: &pb.CommandResponse_ResetCache{
 				ResetCache: resp,
+			}}
+		})
+		if err != nil {
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
+			return
+		}
+		if r := msg.Respond(bts); r != nil {
+			s.logger.Error("failed to send response", "error", r)
+		}
+	}
+}
+
+func (s *NATSTransport) handleRemoveServer(ctx context.Context) func(*nats.Msg) {
+	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
+	var message Message
+
+	return func(msg *nats.Msg) {
+		if complete, err := handleMultiPart(msg, &message); err != nil {
+			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
+			return
+		} else if !complete {
+			return
+		}
+		data := message.GetDataAndReset()
+
+		var protoMsg pb.RemoveServer
+		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
+			return
+		}
+
+		chResp := make(chan raft.RPCResponse, 1)
+		rpc := raft.RPC{
+			RespChan: chResp,
+			Command:  &protoMsg,
+		}
+
+		s.chConsumeCache <- rpc
+
+		bts, err := s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
+			resp, _ := i.(*pb.RemoveServerResponse)
+			return &pb.CommandResponse{Resp: &pb.CommandResponse_RemoveServer{
+				RemoveServer: resp,
 			}}
 		})
 		if err != nil {

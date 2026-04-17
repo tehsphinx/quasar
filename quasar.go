@@ -265,6 +265,12 @@ func (s *Cache) applyRemote(ctx context.Context, command *pb.Command) (*pb.Comma
 			return nil, 0, err
 		}
 		return respLatestUID(resp), resp.Uid, nil
+	case *pb.Command_RemoveServer:
+		resp, err := s.transport.RemoveServer(ctx, id, addr, cmd.RemoveServer)
+		if err != nil {
+			return nil, 0, err
+		}
+		return respRemoveServer(resp), 0, nil
 	}
 
 	return nil, 0, errors.New("leader request type not implemented")
@@ -415,6 +421,9 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 			case *pb.ResetCache:
 				err = s.localReset(cmd.Uuid)
 				resp = &pb.ResetCacheResponse{Uuid: cmd.Uuid}
+			case *pb.RemoveServer:
+				err = s.removeServer(cmd.Id)
+				resp = &pb.RemoveServerResponse{}
 			case *pb.LatestUid:
 				uid := s.localLastIndex()
 				resp = &pb.LatestUidResponse{Uid: uid}
@@ -436,12 +445,40 @@ func (s *Cache) Shutdown() error {
 	return s.shutdown()
 }
 
+// RemoveAndShutdown removes this server from the raft configuration and then shuts it down.
+func (s *Cache) RemoveAndShutdown(ctx context.Context) error {
+	if err := s.removeSelf(ctx); err != nil {
+		s.logger.Error("failed to remove self from raft", "error", err)
+	}
+
+	return s.Shutdown()
+}
+
 func (s *Cache) shutdown() error {
 	if trans, ok := s.transport.(io.Closer); ok {
 		_ = trans.Close()
 	}
 
 	return s.raft().Shutdown().Error()
+}
+
+func (s *Cache) removeSelf(ctx context.Context) error {
+	if s.IsLeader() {
+		return s.removeServer(s.localID)
+	}
+
+	_, _, err := s.applyRemote(ctx, cmdRemoveServer(s.localID))
+	return err
+}
+
+func (s *Cache) removeServer(id string) error {
+	rft := s.raft()
+	if rft == nil {
+		return errors.New("raft not set (yet)")
+	}
+
+	fut := rft.RemoveServer(raft.ServerID(id), 0, 0)
+	return fut.Error()
 }
 
 // Reset resets calls Reset the cache on all servers.

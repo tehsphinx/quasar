@@ -161,6 +161,14 @@ func (s *DRPCTransport) LatestUID(ctx context.Context, id raft.ServerID, target 
 	panic("implement me")
 }
 
+// RemoveServer asks the leader to remove a server from the raft configuration.
+func (s *DRPCTransport) RemoveServer(ctx context.Context, id raft.ServerID, target raft.ServerAddress,
+	command *pb.RemoveServer,
+) (*pb.RemoveServerResponse, error) {
+	// TODO implement me
+	panic("implement me")
+}
+
 // Close closes the transport.
 func (s *DRPCTransport) Close() {
 	_ = s.listener.Close()

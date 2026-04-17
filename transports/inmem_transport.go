@@ -119,6 +119,25 @@ func (i *InmemTransport) LatestUID(ctx context.Context, _ raft.ServerID, target 
 	return rpcResp.Response.(*pb.LatestUidResponse), nil
 }
 
+// RemoveServer asks the leader to remove a server from the raft configuration.
+func (i *InmemTransport) RemoveServer(ctx context.Context, _ raft.ServerID, target raft.ServerAddress,
+	command *pb.RemoveServer,
+) (*pb.RemoveServerResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, i.timeout)
+		defer cancel()
+	}
+
+	rpcResp, err := i.makeRPC(ctx, target, command, nil, consumeCache)
+	if err != nil {
+		return nil, err
+	}
+
+	//nolint:forcetypeassert // can't be anything else.
+	return rpcResp.Response.(*pb.RemoveServerResponse), nil
+}
+
 var (
 	_ raft.Transport = (*InmemTransport)(nil)
 	_ Transport      = (*InmemTransport)(nil)

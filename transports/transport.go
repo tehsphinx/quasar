@@ -29,6 +29,9 @@ type Transport interface {
 
 	// LatestUID asks the master to return its latest known / generated uid.
 	LatestUID(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.LatestUid) (*pb.LatestUidResponse, error)
+
+	// RemoveServer asks the leader to remove a server from the raft configuration.
+	RemoveServer(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.RemoveServer) (*pb.RemoveServerResponse, error)
 }
 
 func snapshotTimeout(origTimeout time.Duration, size int64) time.Duration {

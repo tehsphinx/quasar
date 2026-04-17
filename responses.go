@@ -19,3 +19,11 @@ func respLatestUID(cmd *pb.LatestUidResponse) *pb.CommandResponse {
 		},
 	}
 }
+
+func respRemoveServer(cmd *pb.RemoveServerResponse) *pb.CommandResponse {
+	return &pb.CommandResponse{
+		Resp: &pb.CommandResponse_RemoveServer{
+			RemoveServer: cmd,
+		},
+	}
+}
