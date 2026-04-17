@@ -1229,6 +1229,7 @@ func TestVoterNodeRestart(t *testing.T) {
 		quasar.WithDiscovery(discovery1),
 	)
 	asrtMain.NoErr(err)
+	defer cache1.Shutdown()
 
 	// Create cache2 and cache3 as non-voters
 	cache2, err := quasar.NewCache(ctxMain, fsm2,
@@ -1372,4 +1373,110 @@ func TestVoterNodeRestart(t *testing.T) {
 		}
 	}
 	fmt.Println("Verified local reads work on all nodes")
+}
+
+func TestCacheDiscoveryAutoPrune(t *testing.T) {
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelMain()
+
+	asrtMain := is.New(t)
+
+	nc1, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc2, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	nc3, err := nats.Connect("localhost:4222")
+	asrtMain.NoErr(err)
+	defer nc1.Close()
+	defer nc2.Close()
+	defer nc3.Close()
+
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_auto_prune", "cache1")
+	asrtMain.NoErr(err)
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_auto_prune", "cache2")
+	asrtMain.NoErr(err)
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_auto_prune", "cache3")
+	asrtMain.NoErr(err)
+
+	fsm1 := exampleFSM.NewInMemoryFSM()
+	fsm2 := exampleFSM.NewInMemoryFSM()
+	fsm3 := exampleFSM.NewInMemoryFSM()
+
+	cache1, err := quasar.NewCache(ctxMain, fsm1,
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport1),
+		quasar.WithDiscovery(discoveries.NewNATSDiscovery(nc1)),
+		quasar.WithAutoPrune(6*time.Second),
+	)
+	asrtMain.NoErr(err)
+	defer cache1.Shutdown()
+
+	cache2, err := quasar.NewCache(ctxMain, fsm2,
+		quasar.WithLocalID("cache2"),
+		quasar.WithTransport(transport2),
+		quasar.WithDiscovery(discoveries.NewNATSDiscovery(nc2)),
+		quasar.WithAutoPrune(6*time.Second),
+	)
+	asrtMain.NoErr(err)
+	defer cache2.Shutdown()
+
+	cache3, err := quasar.NewCache(ctxMain, fsm3,
+		quasar.WithLocalID("cache3"),
+		quasar.WithTransport(transport3),
+		quasar.WithDiscovery(discoveries.NewNATSDiscovery(nc3)),
+		quasar.WithAutoPrune(6*time.Second),
+	)
+	asrtMain.NoErr(err)
+	defer cache3.Shutdown()
+
+	err = cache1.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	err = cache2.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	err = cache3.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+
+	servers, err := cache1.GetServerList()
+	asrtMain.NoErr(err)
+	asrtMain.Equal(len(servers), 3)
+
+	err = cache2.Shutdown()
+	asrtMain.NoErr(err)
+
+	err = waitForCondition(ctxMain, func() error {
+		srvs, waitErr := cache1.GetServerList()
+		if waitErr != nil {
+			return waitErr
+		}
+		if len(srvs) != 2 {
+			return fmt.Errorf("expected 2 servers after pruning, got %d", len(srvs))
+		}
+
+		for _, server := range srvs {
+			if server.ID == "cache2" {
+				return fmt.Errorf("cache2 should have been pruned")
+			}
+		}
+		return nil
+	})
+	asrtMain.NoErr(err)
+}
+
+func waitForCondition(ctx context.Context, fn func() error) error {
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		if err := fn(); err == nil {
+			return nil
+		} else {
+			fmt.Println("waiting for condition", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
 }

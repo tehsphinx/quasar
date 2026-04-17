@@ -74,7 +74,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		return nil, err
 	}
 	c.setRaft(rft)
-	discovery.regObservation(ctx, rft)
+	discovery.run(ctx, rft)
 
 	if cfg.discovery != nil {
 		cfg.discovery.Inject(discovery)
@@ -519,7 +519,7 @@ func (s *Cache) localReset(resetID string) error {
 		return err
 	}
 	s.setRaft(rft)
-	s.discovery.regObservation(s.ctx, rft)
+	s.discovery.run(s.ctx, rft)
 
 	return nil
 }

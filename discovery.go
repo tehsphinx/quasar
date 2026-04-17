@@ -10,6 +10,8 @@ import (
 	"golang.org/x/exp/maps"
 )
 
+const minPruneInterval = 500 * time.Millisecond
+
 // Discovery defines a auto discovery for servers of the cache.
 type Discovery interface {
 	Inject(cache *DiscoveryInjector)
@@ -18,9 +20,10 @@ type Discovery interface {
 
 func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 	return &DiscoveryInjector{
-		cache:   c,
-		applied: map[raft.ServerID]struct{}{},
-		servers: map[raft.ServerID]raft.Server{},
+		cache:    c,
+		applied:  map[raft.ServerID]struct{}{},
+		servers:  map[raft.ServerID]raft.Server{},
+		lastSeen: map[raft.ServerID]time.Time{},
 	}
 }
 
@@ -32,6 +35,7 @@ type DiscoveryInjector struct {
 
 	serversM sync.RWMutex
 	servers  map[raft.ServerID]raft.Server
+	lastSeen map[raft.ServerID]time.Time
 	appliedM sync.RWMutex
 	applied  map[raft.ServerID]struct{}
 
@@ -100,6 +104,13 @@ func (s *DiscoveryInjector) getAddServerFunc(voter bool) (addServerFunc, error) 
 	return rft.AddNonvoter, nil
 }
 
+func (s *DiscoveryInjector) run(ctx context.Context, rft *raft.Raft) {
+	if s.cache.cfg.pruneAfter != 0 {
+		s.registerPruning(ctx, s.cache.cfg.pruneAfter)
+	}
+	s.regObservation(ctx, rft)
+}
+
 func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) {
 	s.cancelPrevious()
 	ctx, cancel := context.WithCancel(ctx)
@@ -131,6 +142,7 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 				switch obs := observation.Data.(type) {
 				case raft.PeerObservation:
 					if obs.Removed {
+						s.deleteServer(obs.Peer.ID)
 						s.removeApplied(obs.Peer.ID)
 						continue
 					}
@@ -159,6 +171,82 @@ func (s *DiscoveryInjector) addMissingServers() {
 	}
 }
 
+func (s *DiscoveryInjector) registerPruning(ctx context.Context, after time.Duration) {
+	interval := after / 5
+	if interval < minPruneInterval {
+		interval = minPruneInterval
+	}
+
+	tick := time.NewTicker(interval)
+
+	go func() {
+		defer tick.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-tick.C:
+				s.pruneExpiredServers(now.Add(-after))
+			}
+		}
+	}()
+}
+
+func (s *DiscoveryInjector) pruneExpiredServers(pruneBefore time.Time) {
+	if !s.cache.IsLeader() {
+		return
+	}
+
+	expired := s.getExpiredServers(pruneBefore)
+	if len(expired) == 0 {
+		return
+	}
+
+	go func(expired []raft.Server) {
+		for _, srv := range expired {
+			if err := s.removeServer(srv.ID); err != nil {
+				continue
+			}
+			s.deleteServer(srv.ID)
+			s.removeApplied(srv.ID)
+		}
+	}(expired)
+}
+
+func (s *DiscoveryInjector) getExpiredServers(pruneBefore time.Time) []raft.Server {
+	s.serversM.RLock()
+	defer s.serversM.RUnlock()
+
+	var expired []raft.Server
+	for id, srv := range s.servers {
+		if id == raft.ServerID(s.cache.localID) {
+			continue
+		}
+		lastSeen, ok := s.lastSeen[id]
+		if !ok {
+			continue
+		}
+		if lastSeen.After(pruneBefore) {
+			continue
+		}
+
+		expired = append(expired, srv)
+	}
+
+	return expired
+}
+
+func (s *DiscoveryInjector) removeServer(id raft.ServerID) error {
+	rft := s.cache.raft()
+	if rft == nil {
+		return errors.New("raft not set (yet)")
+	}
+
+	fut := rft.RemoveServer(id, 0, 0)
+	return fut.Error()
+}
+
 func (s *DiscoveryInjector) hasApplied(srvID raft.ServerID) bool {
 	s.appliedM.Lock()
 	defer s.appliedM.Unlock()
@@ -185,6 +273,8 @@ func (s *DiscoveryInjector) setServer(srv raft.Server) bool {
 	s.serversM.Lock()
 	defer s.serversM.Unlock()
 
+	s.lastSeen[srv.ID] = time.Now()
+
 	_, ok := s.servers[srv.ID]
 	if ok {
 		return false
@@ -192,6 +282,14 @@ func (s *DiscoveryInjector) setServer(srv raft.Server) bool {
 
 	s.servers[srv.ID] = srv
 	return true
+}
+
+func (s *DiscoveryInjector) deleteServer(id raft.ServerID) {
+	s.serversM.Lock()
+	defer s.serversM.Unlock()
+
+	delete(s.servers, id)
+	delete(s.lastSeen, id)
 }
 
 func (s *DiscoveryInjector) getServers() []raft.Server {

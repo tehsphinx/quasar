@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/go-hclog"
@@ -32,6 +33,7 @@ type options struct {
 	bootstrap   bool
 	servers     []raft.Server
 	discovery   Discovery
+	pruneAfter  time.Duration
 	hclogLogger hclog.Logger
 	slogLogger  *slog.Logger
 
@@ -163,6 +165,20 @@ func WithServers(servers []raft.Server) Option {
 func WithDiscovery(discovery Discovery) Option {
 	return func(opt *options) {
 		opt.discovery = discovery
+	}
+}
+
+// WithAutoPrune removes peers from the raft cluster after they have not been
+// observed through discovery pings for the given duration. If not set, peers
+// are never auto-pruned. The minimum value is 6 seconds.
+func WithAutoPrune(after time.Duration) Option {
+	const minPruneAfter = 6 * time.Second
+
+	return func(o *options) {
+		if after < minPruneAfter {
+			after = minPruneAfter
+		}
+		o.pruneAfter = after
 	}
 }
 
