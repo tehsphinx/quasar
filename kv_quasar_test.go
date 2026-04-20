@@ -220,6 +220,10 @@ func TestKVCacheClusterNATS(t *testing.T) {
 
 	err = cache1.WaitReady(ctxMain)
 	asrtMain.NoErr(err)
+	err = cache2.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
+	err = cache3.WaitReady(ctxMain)
+	asrtMain.NoErr(err)
 	fmt.Println("WAIT DONE")
 
 	caches := []*quasar.KVCache{cache1, cache2, cache3}
