@@ -5,24 +5,15 @@ import (
 	"fmt"
 
 	"github.com/hashicorp/raft"
-	"github.com/tehsphinx/quasar/stores"
 	"github.com/tehsphinx/quasar/transports"
 )
 
-func getRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, transport transports.Transport, discovery *DiscoveryInjector) (*raft.Raft, error) {
-	snapshotStore := raft.NewInmemSnapshotStore()
-	stableStore := stores.NewStableInMemory()
-
-	conf := cfg.raftConfig
-	if conf == nil {
-		conf = raft.DefaultConfig()
-	}
-	conf.LocalID = raft.ServerID(cfg.localID)
-	conf.Logger = cfg.getLogger()
-
-	rft, err := raft.NewRaft(conf, fsm, logStore, stableStore, snapshotStore, transport)
+func getRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, stableStore raft.StableStore,
+	snapshotStore raft.SnapshotStore, transport transports.Transport, discovery *DiscoveryInjector,
+) (*raft.Raft, error) {
+	rft, err := newRaft(cfg, fsm, logStore, stableStore, snapshotStore, transport)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create raft layer: %w", err)
+		return nil, err
 	}
 
 	if cfg.discovery != nil {
@@ -35,7 +26,7 @@ func getRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, transport transp
 	if cfg.bootstrap && len(cfg.servers) == 0 {
 		cfg.servers = []raft.Server{
 			{
-				ID:      conf.LocalID,
+				ID:      raft.ServerID(cfg.localID),
 				Address: transport.LocalAddr(),
 			},
 		}
@@ -47,6 +38,33 @@ func getRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, transport transp
 	}
 
 	return rft, nil
+}
+
+// newRaft creates a fresh *raft.Raft from the given stores without bootstrapping
+// or applying any discovery-driven configuration. Used by the quorum recovery
+// path which has already populated the stores via raft.RecoverCluster and must
+// not re-bootstrap.
+func newRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, stableStore raft.StableStore,
+	snapshotStore raft.SnapshotStore, transport transports.Transport,
+) (*raft.Raft, error) {
+	conf := raftConfig(cfg)
+	rft, err := raft.NewRaft(conf, fsm, logStore, stableStore, snapshotStore, transport)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create raft layer: %w", err)
+	}
+	return rft, nil
+}
+
+// raftConfig returns the raft.Config to use for this cache, applying the
+// quasar-level overrides on top of the user-supplied or default raft config.
+func raftConfig(cfg options) *raft.Config {
+	conf := cfg.raftConfig
+	if conf == nil {
+		conf = raft.DefaultConfig()
+	}
+	conf.LocalID = raft.ServerID(cfg.localID)
+	conf.Logger = cfg.getLogger()
+	return conf
 }
 
 func getTransport(ctx context.Context, cfg options) (transports.Transport, error) {

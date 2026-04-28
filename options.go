@@ -28,14 +28,15 @@ type options struct {
 	nc        *nats.Conn
 	transport transports.Transport
 
-	raftConfig  *raft.Config
-	suffrage    raft.ServerSuffrage
-	bootstrap   bool
-	servers     []raft.Server
-	discovery   Discovery
-	pruneAfter  time.Duration
-	hclogLogger hclog.Logger
-	slogLogger  *slog.Logger
+	raftConfig         *raft.Config
+	suffrage           raft.ServerSuffrage
+	bootstrap          bool
+	servers            []raft.Server
+	discovery          Discovery
+	pruneAfter         time.Duration
+	recoverQuorumAfter time.Duration
+	hclogLogger        hclog.Logger
+	slogLogger         *slog.Logger
 
 	kv     stores.KVStore
 	pStore stores.PersistentStorage
@@ -179,6 +180,39 @@ func WithAutoPrune(after time.Duration) Option {
 			after = minPruneAfter
 		}
 		o.pruneAfter = after
+	}
+}
+
+// WithQuorumRecovery enables automatic recovery of a stranded voter. When the
+// local node is a voter, has been without a leader for at least `after`, and
+// no other voter in the raft configuration has been observed by discovery
+// within the same window, the cache will shut down its raft instance and
+// force a new configuration that drops the missing voters and keeps only
+// itself plus the still-live nonvoters. After the rebuild it elects itself
+// as a single-voter leader; missing voters can rejoin later via discovery.
+//
+// This is intended for the "two-site" 2-voter deployment where losing one
+// voter would otherwise leave the cluster permanently without quorum. If
+// `after` is zero (default), recovery is disabled.
+//
+// WARNING: forced recovery is a controlled split-brain risk. If the missing
+// voter is in fact alive on the other side of a transient partition, recent
+// unreplicated writes from this side may be silently dropped when the
+// partition heals. Pick `after` long enough that genuine link blips do not
+// trigger. The minimum effective value is 6 seconds.
+func WithQuorumRecovery(after time.Duration) Option {
+	const minRecoverAfter = 6 * time.Second
+
+	return func(o *options) {
+		if after <= 0 {
+			o.recoverQuorumAfter = 0
+			return
+		}
+
+		if after < minRecoverAfter {
+			after = minRecoverAfter
+		}
+		o.recoverQuorumAfter = after
 	}
 }
 

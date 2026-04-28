@@ -67,9 +67,9 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 	discovery := newDiscoveryInjector(c)
 	c.discovery = discovery
 
-	logStore := wrapStore(raft.NewInmemStore(), fsm)
+	c.newStores()
 
-	rft, err := getRaft(cfg, fsm, logStore, transport, discovery)
+	rft, err := getRaft(cfg, fsm, c.logStore, c.stableStore, c.snapshotStore, transport, discovery)
 	if err != nil {
 		return nil, err
 	}
@@ -81,6 +81,10 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		if e := cfg.discovery.Run(ctx); e != nil {
 			return nil, e
 		}
+	}
+
+	if cfg.recoverQuorumAfter > 0 && cfg.suffrage == raft.Voter {
+		go c.runQuorumRecoveryWatch(ctx)
 	}
 
 	go c.consume(ctx, transport.CacheConsumer())
@@ -109,11 +113,16 @@ type Cache struct {
 	fsm    *fsmWrapper
 	pStore stores.PersistentStorage
 
-	raftMutex   sync.RWMutex
-	ctxRaft     context.Context
-	closeRaft   context.CancelFunc
-	lastResetID string
-	raftLocker  *raft.Raft
+	raftMutex     sync.RWMutex
+	ctxRaft       context.Context
+	closeRaft     context.CancelFunc
+	lastResetID   string
+	raftLocker    *raft.Raft
+	logStore      raft.LogStore
+	stableStore   raft.StableStore
+	snapshotStore raft.SnapshotStore
+
+	recoveryMutex sync.Mutex
 
 	transport transports.Transport
 	discovery *DiscoveryInjector
@@ -122,6 +131,17 @@ type Cache struct {
 
 	ctx   context.Context
 	close context.CancelFunc
+}
+
+// newStores (re)creates the in-memory raft stores and stashes them on the
+// cache so they can be reused across raft restarts (localReset, quorum
+// recovery). Stores are local to the *raft.Raft instance, so a fresh raft
+// requires fresh stores; the recovery path is the exception (it reuses the
+// existing stores via raft.RecoverCluster).
+func (s *Cache) newStores() {
+	s.logStore = wrapStore(raft.NewInmemStore(), s.fsm)
+	s.stableStore = stores.NewStableInMemory()
+	s.snapshotStore = raft.NewInmemSnapshotStore()
 }
 
 func (s *Cache) serverInfo() raft.Server {
@@ -549,9 +569,9 @@ func (s *Cache) localReset(resetID string) error {
 	s.fsm.applyRaftReset()
 	s.raft().Shutdown()
 
-	logStore := wrapStore(raft.NewInmemStore(), s.fsm)
+	s.newStores()
 
-	rft, err := getRaft(s.cfg, s.fsm, logStore, s.transport, s.discovery)
+	rft, err := getRaft(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport, s.discovery)
 	if err != nil {
 		return err
 	}
@@ -559,6 +579,230 @@ func (s *Cache) localReset(resetID string) error {
 	s.discovery.run(s.ctx, rft)
 
 	return nil
+}
+
+// runQuorumRecoveryWatch is the long-running goroutine that decides when to
+// invoke recoverQuorum. It exits when ctx is canceled (cache shutdown).
+func (s *Cache) runQuorumRecoveryWatch(ctx context.Context) {
+	const minInterval = time.Second
+
+	after := s.cfg.recoverQuorumAfter
+	interval := after / 4
+	if interval < minInterval {
+		interval = minInterval
+	}
+
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	var noLeaderSince time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-tick.C:
+			if !s.shouldRecoverQuorum(now, after, &noLeaderSince) {
+				continue
+			}
+			if err := s.recoverQuorum(); err != nil {
+				s.logger.Error("quorum recovery failed", "error", err)
+				// Reset the timer so we wait the full window before trying
+				// again. Avoids tight-looping on a persistent error.
+				noLeaderSince = time.Time{}
+			}
+		}
+	}
+}
+
+// recoverQuorum forces a single-voter raft configuration on this cache,
+// keeping only the live nonvoters. Used by the quorum-recovery watcher when
+// this voter has been stranded without a leader past the configured
+// threshold (and was elected captain by `shouldRecoverQuorum`). Preserves
+// the FSM data via raft.RecoverCluster, then rebuilds the raft instance on
+// top of the existing stores.
+//
+// All peer voters (alive or dead) are dropped from the new configuration
+// and forgotten in discovery state. Two reasons:
+//
+//   - hashicorp/raft.RecoverCluster is fundamentally a single-node
+//     operation — running it concurrently on two survivors with the same
+//     "alive voters" config produces divergent snapshots that fail to
+//     converge into one cluster. By becoming a single-voter cluster the
+//     captain side-steps that.
+//   - Once the captain is leader, any alive peer voter that pings via
+//     discovery is treated as new (because forgetServer cleared its
+//     bookkeeping) and is re-added through the standard AddVoter path,
+//     which rebuilds replication state cleanly.
+//
+//nolint:funlen // single linear procedure; splitting hurts readability.
+func (s *Cache) recoverQuorum() error {
+	s.recoveryMutex.Lock()
+	defer s.recoveryMutex.Unlock()
+
+	rft := s.raft()
+	if rft == nil {
+		return errors.New("raft not set (yet)")
+	}
+
+	cfgFut := rft.GetConfiguration()
+	if err := cfgFut.Error(); err != nil {
+		return fmt.Errorf("get configuration: %w", err)
+	}
+
+	current := cfgFut.Configuration().Servers
+	keep := make([]raft.Server, 0, len(current))
+	dropped := make([]raft.Server, 0, len(current))
+	selfPresent := false
+	for _, srv := range current {
+		if string(srv.ID) == s.localID {
+			// Always keep self, force voter status.
+			srv.Suffrage = raft.Voter
+			keep = append(keep, srv)
+			selfPresent = true
+			continue
+		}
+		if srv.Suffrage == raft.Voter {
+			dropped = append(dropped, srv)
+			continue
+		}
+		// Keep nonvoters in the new configuration. They'll catch up via
+		// normal replication once we are leader again.
+		keep = append(keep, srv)
+	}
+
+	if len(dropped) == 0 {
+		// No peer voters to drop — there's nothing for recovery to fix
+		// here. The watcher should not normally call us in this state
+		// (shouldRecoverQuorum requires aliveVoters < quorum), but be
+		// defensive.
+		return nil
+	}
+
+	// Make sure self is in the new configuration even if the old one had us
+	// missing for some reason.
+	if !selfPresent {
+		keep = append(keep, raft.Server{
+			ID:       raft.ServerID(s.localID),
+			Address:  s.transport.LocalAddr(),
+			Suffrage: raft.Voter,
+		})
+	}
+
+	s.logger.Warn("quorum lost — forcing raft recovery",
+		"keep", keep, "dropped", dropped)
+
+	// IMPORTANT: do not call .Error() on the shutdown future here.
+	// hashicorp/raft's shutdownFuture.Error() additionally invokes Close()
+	// on the transport (raft@v1.7.3 future.go), which the InmemTransport
+	// implements as DisconnectAll() and the TCPTransport implements as
+	// permanently shutting the listener down. Either would brick the
+	// transport for the new raft instance we're about to spin up on top of
+	// the same transport. raft.Shutdown() itself is synchronous enough —
+	// it sets the shutdown flag and closes the channel that all internal
+	// goroutines select on. Cache.localReset uses the same pattern.
+	rft.Shutdown()
+
+	conf := raftConfig(s.cfg)
+	if err := raft.RecoverCluster(conf, s.fsm, s.logStore, s.stableStore, s.snapshotStore,
+		s.transport, raft.Configuration{Servers: keep}); err != nil {
+		return fmt.Errorf("recover cluster: %w", err)
+	}
+
+	rftNew, err := newRaft(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport)
+	if err != nil {
+		return fmt.Errorf("restart raft: %w", err)
+	}
+
+	// Forget every peer voter we dropped so that, when they ping discovery
+	// again (whether currently alive or after a restart), ProcessServer
+	// treats them as brand-new and the standard AddVoter rejoin path runs.
+	for _, srv := range dropped {
+		s.discovery.forgetServer(srv.ID)
+	}
+
+	s.setRaft(rftNew)
+	s.discovery.run(s.ctx, rftNew)
+	return nil
+}
+
+// shouldRecoverQuorum returns true when this voter is stranded and the
+// recovery procedure should run. It updates noLeaderSince in place to track
+// the start of the leaderless period.
+func (s *Cache) shouldRecoverQuorum(now time.Time, after time.Duration, noLeaderSince *time.Time) bool {
+	if s.suffrage != raft.Voter {
+		return false
+	}
+	if s.IsLeader() || s.hasLeader() {
+		*noLeaderSince = time.Time{}
+		return false
+	}
+	if noLeaderSince.IsZero() {
+		*noLeaderSince = now
+		return false
+	}
+	if now.Sub(*noLeaderSince) < after {
+		return false
+	}
+
+	// Leaderless long enough. Two more checks before we tear things down:
+	//
+	//  1. Count voters in the current config and how many are alive per
+	//     discovery (self counts as alive — we are running this code). If
+	//     enough are alive to form quorum, raft should be able to elect
+	//     on its own and recovery would just cause churn.
+	//  2. Pick a deterministic recovery captain — the lowest-ID alive
+	//     voter — so that with multiple stranded survivors only one runs
+	//     raft.RecoverCluster. Concurrent recovery on multiple peers
+	//     produces divergent snapshots that fail to converge. The other
+	//     survivors stay in the captain's new config and get pulled to
+	//     the recovered state via InstallSnapshot once the captain wins
+	//     its election.
+	rft := s.raft()
+	if rft == nil {
+		return false
+	}
+	cfgFut := rft.GetConfiguration()
+	if err := cfgFut.Error(); err != nil {
+		return false
+	}
+
+	var (
+		configVoters int
+		aliveVoters  int
+		selfInConfig bool
+		captain      = s.localID
+		pruneBefore  = now.Add(-after)
+	)
+	for _, srv := range cfgFut.Configuration().Servers {
+		if srv.Suffrage != raft.Voter {
+			continue
+		}
+		configVoters++
+		alive := false
+		if string(srv.ID) == s.localID {
+			selfInConfig = true
+			alive = true
+		} else if s.discovery.isAliveSince(srv.ID, pruneBefore) {
+			alive = true
+		}
+		if alive {
+			aliveVoters++
+			if string(srv.ID) < captain {
+				captain = string(srv.ID)
+			}
+		}
+	}
+	if !selfInConfig || configVoters == 0 {
+		// Either we are not in the configuration as a voter (degenerate),
+		// or there is nothing to recover. Skip.
+		return false
+	}
+	quorum := configVoters/2 + 1
+	if quorum <= aliveVoters {
+		return false
+	}
+	return captain == s.localID
 }
 
 func (s *Cache) raft() *raft.Raft {

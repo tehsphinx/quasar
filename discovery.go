@@ -292,6 +292,35 @@ func (s *DiscoveryInjector) deleteServer(id raft.ServerID) {
 	delete(s.lastSeen, id)
 }
 
+// isAliveSince reports whether the given peer has pinged discovery on or
+// after `since`.
+func (s *DiscoveryInjector) isAliveSince(id raft.ServerID, since time.Time) bool {
+	s.serversM.RLock()
+	defer s.serversM.RUnlock()
+
+	last, ok := s.lastSeen[id]
+	if !ok {
+		return false
+	}
+	return !last.Before(since)
+}
+
+// forgetServer removes all bookkeeping for the given peer so that a fresh
+// discovery ping from that ID will be treated as a brand-new server. Used by
+// the quorum-recovery path after dropping a missing voter from raft so that,
+// when the voter eventually returns, ProcessServer triggers an AddVoter
+// instead of being suppressed as a duplicate.
+func (s *DiscoveryInjector) forgetServer(id raft.ServerID) {
+	s.serversM.Lock()
+	delete(s.servers, id)
+	delete(s.lastSeen, id)
+	s.serversM.Unlock()
+
+	s.appliedM.Lock()
+	delete(s.applied, id)
+	s.appliedM.Unlock()
+}
+
 func (s *DiscoveryInjector) getServers() []raft.Server {
 	s.serversM.RLock()
 	defer s.serversM.RUnlock()
