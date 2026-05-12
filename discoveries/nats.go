@@ -108,7 +108,7 @@ func (s *NATSDiscovery) discoveryHandler(msg *nats.Msg) {
 		return
 	}
 
-	s.cache.ProcessServer(sender)
+	s.cache.ProcessServerWithStatus(sender, peerStatusFromPB(ping.GetRaftStatus()))
 
 	if ping.GetIsResponse() {
 		// don't respond to responses
@@ -135,5 +135,23 @@ func (s *NATSDiscovery) marshalPing(isResponse bool) ([]byte, error) {
 	return proto.Marshal(&pb.DiscoverPing{
 		Sender:     pb.ToServerInfo(s.serverInfo),
 		IsResponse: isResponse,
+		RaftStatus: peerStatusToPB(s.cache.LocalPeerStatus()),
 	})
+}
+
+func peerStatusToPB(status quasar.PeerStatus) *pb.RaftStatus {
+	return &pb.RaftStatus{
+		HasLeader:         status.HasLeader,
+		NumVotersInConfig: status.NumVotersInConfig,
+	}
+}
+
+func peerStatusFromPB(pbStatus *pb.RaftStatus) quasar.PeerStatus {
+	if pbStatus == nil {
+		return quasar.PeerStatus{}
+	}
+	return quasar.PeerStatus{
+		HasLeader:         pbStatus.GetHasLeader(),
+		NumVotersInConfig: pbStatus.GetNumVotersInConfig(),
+	}
 }

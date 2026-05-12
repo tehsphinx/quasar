@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -20,11 +21,30 @@ type Discovery interface {
 
 func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 	return &DiscoveryInjector{
-		cache:    c,
-		applied:  map[raft.ServerID]struct{}{},
-		servers:  map[raft.ServerID]raft.Server{},
-		lastSeen: map[raft.ServerID]time.Time{},
+		cache:           c,
+		applied:         map[raft.ServerID]struct{}{},
+		servers:         map[raft.ServerID]raft.Server{},
+		lastSeen:        map[raft.ServerID]time.Time{},
+		peerInClusterCh: make(chan struct{}),
 	}
+}
+
+// PeerStatus is a small, transport-agnostic snapshot of a node's raft state
+// that Discovery implementations attach to outgoing pings. It is consumed by
+// the bootstrap-gating logic on a restarting voter (RT-12775): any peer
+// reporting HasLeader or NumVotersInConfig >= 2 proves an established
+// cluster exists, so the restarter skips its single-node bootstrap.
+type PeerStatus struct {
+	HasLeader         bool
+	NumVotersInConfig uint32
+}
+
+// inEstablishedCluster returns true when this status proves the reporting
+// node is part of a real, multi-voter raft cluster — either via an active
+// leader or via a multi-voter configuration that is currently leaderless
+// (e.g. a stuck candidate after its peer crashed).
+func (r PeerStatus) inEstablishedCluster() bool {
+	return r.HasLeader || r.NumVotersInConfig >= 2
 }
 
 // DiscoveryInjector provides access to the underlying cache in a Discovery implementation.
@@ -41,6 +61,24 @@ type DiscoveryInjector struct {
 
 	cancelM sync.Mutex
 	cancel  context.CancelFunc
+
+	// peerInClusterCh is closed (via peerInClusterOnce) the first time
+	// ProcessServer observes a non-self peer whose PeerStatus proves it is
+	// part of an established cluster (HasLeader || NumVotersInConfig >= 2).
+	// Used by startup bootstrap-gating (RT-12775): seeing such a peer means
+	// the restarter must skip its own single-node bootstrap. A peer that
+	// pings without such status (e.g. another node still in its own
+	// bootstrap-wait) does not close the channel, so two cold-starting
+	// voters won't deadlock waiting for each other.
+	peerInClusterOnce sync.Once
+	peerInClusterCh   chan struct{}
+
+	// voterCount tracks how many voters are in this node's raft
+	// configuration. Maintained by the regObservation goroutine via raft
+	// PeerObservation events (including the bootstrap configuration, which
+	// raft emits as well). Read non-blocking from LocalPeerStatus so NATS
+	// callbacks never have to wait on raft's main loop.
+	voterCount atomic.Uint32
 }
 
 // Name returns the caches name. This name identifies a cache and separates it from other caches on the network.
@@ -53,9 +91,26 @@ func (s *DiscoveryInjector) ServerInfo() raft.Server {
 	return s.cache.serverInfo()
 }
 
-// ProcessServer processes the given server. It adds it to the list of known servers.
-// If it is a new server, it will also be added to raft if we are the leader.
+// ProcessServer processes the given server. It adds it to the list of known
+// servers. If it is a new server, it will also be added to raft if we are
+// the leader. Equivalent to ProcessServerWithStatus(srv, PeerStatus{}): no
+// cluster-membership signal is carried, so it cannot abort a bootstrap-wait.
+// Kept for backwards compatibility with discovery implementations that don't
+// (yet) propagate raft status on the wire.
 func (s *DiscoveryInjector) ProcessServer(srv raft.Server) {
+	s.ProcessServerWithStatus(srv, PeerStatus{})
+}
+
+// ProcessServerWithStatus is the raft-status-aware variant of ProcessServer.
+// Discovery implementations should call this when they can read raft status
+// off the incoming ping. The status is consulted to decide whether the
+// observation is enough to short-circuit a bootstrap-wait on a restarting
+// voter (RT-12775) — see PeerStatus.inEstablishedCluster.
+func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status PeerStatus) {
+	if srv.ID != raft.ServerID(s.cache.localID) && status.inEstablishedCluster() {
+		s.peerInClusterOnce.Do(func() { close(s.peerInClusterCh) })
+	}
+
 	isNew := s.setServer(srv)
 	if !isNew {
 		return
@@ -64,6 +119,32 @@ func (s *DiscoveryInjector) ProcessServer(srv raft.Server) {
 	if err := s.addServer(srv); err != nil {
 		// TODO: log?
 		return
+	}
+}
+
+// PeerInCluster returns a channel that is closed when ProcessServer (with
+// status) has observed a non-self peer that is part of an established raft
+// cluster. Used by startup bootstrap-gating to abort the wait window as
+// soon as an existing cluster announces itself. Subsequent observations are
+// no-ops on this channel.
+func (s *DiscoveryInjector) PeerInCluster() <-chan struct{} {
+	return s.peerInClusterCh
+}
+
+// LocalPeerStatus returns a snapshot of the local node's raft state for
+// Discovery implementations to attach to outgoing pings. Non-blocking:
+// reads atomic state already maintained by the raft-observation
+// goroutine, so this is safe to call from NATS callback context without
+// stalling message delivery on raft's main loop.
+func (s *DiscoveryInjector) LocalPeerStatus() PeerStatus {
+	rft := s.cache.raft()
+	if rft == nil {
+		return PeerStatus{}
+	}
+	_, leaderID := rft.LeaderWithID()
+	return PeerStatus{
+		HasLeader:         leaderID != "",
+		NumVotersInConfig: s.voterCount.Load(),
 	}
 }
 
@@ -116,8 +197,13 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 	ctx, cancel := context.WithCancel(ctx)
 	s.setCancel(cancel)
 
+	// Non-blocking observer: raft's `observe` holds observersLock.RLock
+	// while delivering, and a blocking send into a full channel would pin
+	// that lock and stall DeregisterObserver elsewhere. The events we
+	// handle (PeerObservation, LeaderObservation) are advisory hints — a
+	// dropped event is corrected on the next ping / re-add cycle.
 	chPeerChange := make(chan raft.Observation, observationChanSize)
-	observer := raft.NewObserver(chPeerChange, true, func(o *raft.Observation) bool {
+	observer := raft.NewObserver(chPeerChange, false, func(o *raft.Observation) bool {
 		if _, ok := o.Data.(raft.PeerObservation); ok {
 			return true
 		}
@@ -128,10 +214,15 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 	})
 	rft.RegisterObserver(observer)
 
+	// Reset the voter count for this raft instance; the cached value is
+	// re-derived from observed configuration changes (including the
+	// bootstrap configuration that raft applies via the same path).
+	s.voterCount.Store(0)
+
 	go func() {
 		defer func() {
-			cancel()
 			rft.DeregisterObserver(observer)
+			cancel()
 		}()
 
 		for {
@@ -142,9 +233,16 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 				switch obs := observation.Data.(type) {
 				case raft.PeerObservation:
 					if obs.Removed {
+						if obs.Peer.Suffrage == raft.Voter {
+							// Is the equivalent of decreasing by 1.
+							s.voterCount.Add(^uint32(0))
+						}
 						s.deleteServer(obs.Peer.ID)
 						s.removeApplied(obs.Peer.ID)
 						continue
+					}
+					if obs.Peer.Suffrage == raft.Voter {
+						s.voterCount.Add(1)
 					}
 					s.setApplied(obs.Peer.ID)
 				case raft.LeaderObservation:

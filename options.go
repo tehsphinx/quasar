@@ -35,6 +35,7 @@ type options struct {
 	discovery          Discovery
 	pruneAfter         time.Duration
 	recoverQuorumAfter time.Duration
+	bootstrapWait      time.Duration
 	hclogLogger        hclog.Logger
 	slogLogger         *slog.Logger
 
@@ -213,6 +214,25 @@ func WithQuorumRecovery(after time.Duration) Option {
 			after = minRecoverAfter
 		}
 		o.recoverQuorumAfter = after
+	}
+}
+
+// WithBootstrapWait makes a voter wait up to `after` at startup for any
+// peer to announce itself via discovery before bootstrapping a single-node
+// cluster. If a peer pings within the window, bootstrap is skipped and the
+// existing cluster's leader is expected to pull this node in (via AddVoter
+// from the standard new-peer path, or via raft replication when this node
+// is already in the leader's configuration). The wait aborts as soon as
+// any peer is observed, so it only costs the full `after` in the cold-start
+// case where there genuinely is nothing else out there yet.
+//
+// Only effective when a Discovery is configured. A zero value preserves the
+// pre-RT-12775 behavior of unconditionally bootstrapping the local node at
+// startup, which can race with an existing cluster and create competing
+// single-node universes on restart.
+func WithBootstrapWait(after time.Duration) Option {
+	return func(o *options) {
+		o.bootstrapWait = after
 	}
 }
 

@@ -6,12 +6,25 @@ option go_package = "github.com/tehsphinx/quasar/pb";
 message DiscoverPing {
   ServerInfo sender = 1;
   bool is_response = 2;
+  // Sender's raft status at the moment the ping was emitted. Used to decide
+  // whether to skip its own single-node bootstrap: any responder reporting
+  // either has_leader or num_voters_in_config >= 2 proves an established
+  // cluster exists, so the restarter joins instead of bootstrapping a
+  // competing universe.
+  RaftStatus raft_status = 3;
 }
 
 message ServerInfo {
   string server_id = 1;
   string server_address = 2;
   ServerSuffrage suffrage = 3;
+}
+
+message RaftStatus {
+  // Indicates if the sender's raft has a leader.
+  bool has_leader = 1;
+  // Indicates the number of voters in the sender's raft cluster.
+  uint32 num_voters_in_config = 2;
 }
 
 enum ServerSuffrage {

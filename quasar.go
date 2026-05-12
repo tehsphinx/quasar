@@ -69,7 +69,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 
 	c.newStores()
 
-	rft, err := getRaft(cfg, fsm, c.logStore, c.stableStore, c.snapshotStore, transport, discovery)
+	rft, err := newRaft(cfg, fsm, c.logStore, c.stableStore, c.snapshotStore, transport)
 	if err != nil {
 		return nil, err
 	}
@@ -83,12 +83,87 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		}
 	}
 
+	if err := c.bootstrap(ctx, cfg, transport); err != nil {
+		return nil, err
+	}
+
 	if cfg.recoverQuorumAfter > 0 && cfg.suffrage == raft.Voter {
 		go c.runQuorumRecoveryWatch(ctx)
 	}
 
 	go c.consume(ctx, transport.CacheConsumer())
 	return c, nil
+}
+
+// bootstrap drives the initial raft-configuration decision for this cache.
+// With discovery and bootstrapWait set, a voter waits briefly for any peer
+// ping; if one arrives, bootstrap is skipped and the existing cluster's
+// leader pulls this node in via the standard new-peer path (AddVoter from
+// discovery's ProcessServer on the leader side, or — when the leader still
+// has this node in its configuration from before a restart — heartbeat
+// replication onto the fresh raft). Without discovery, bootstrap falls back
+// to the explicit WithServers / WithBootstrap configuration.
+//
+// Nonvoters never bootstrap: they sit waiting for the existing leader to
+// AddNonvoter them via discovery.
+//
+// This is the RT-12775 fix for "voter restart spawns a competing
+// single-node raft at term 1, then collides with the surviving cluster on
+// term and log freshness". By giving discovery a brief window to learn the
+// existing cluster, the restarter can avoid bootstrapping entirely and join
+// cleanly via the leader's replication.
+func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports.Transport) error {
+	rft := s.raft()
+	if rft == nil {
+		return errors.New("raft not set (yet)")
+	}
+
+	if cfg.discovery != nil && cfg.suffrage == raft.Voter {
+		if cfg.bootstrapWait > 0 {
+			waitForBootstrapDecision(ctx, s.discovery, cfg.bootstrapWait)
+		}
+		select {
+		case <-s.discovery.PeerInCluster():
+			s.logger.Info("bootstrap: peer in established cluster discovered, skipping single-node bootstrap")
+			return nil
+		default:
+		}
+		s.logger.Info("bootstrap: no peer in established cluster, bootstrapping single-voter cluster")
+		rft.BootstrapCluster(raft.Configuration{
+			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
+		})
+		return nil
+	}
+
+	if len(cfg.servers) > 0 {
+		rft.BootstrapCluster(raft.Configuration{Servers: cfg.servers})
+		return nil
+	}
+
+	if cfg.bootstrap {
+		rft.BootstrapCluster(raft.Configuration{
+			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
+		})
+	}
+	return nil
+}
+
+// waitForBootstrapDecision blocks until discovery has observed a peer that
+// is part of an established raft cluster, the given duration has elapsed,
+// or the context is canceled. Used at startup to give an existing cluster
+// a chance to announce itself before this voter would otherwise bootstrap
+// a competing single-node universe. Peers that ping without proof of
+// cluster membership (e.g. another node still in its own bootstrap-wait)
+// don't end the wait, so two cold-starting voters fall through to
+// independent bootstraps and converge via the standard discovery path.
+func waitForBootstrapDecision(ctx context.Context, discovery *DiscoveryInjector, after time.Duration) {
+	ctx, cancel := context.WithTimeout(ctx, after)
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+	case <-discovery.PeerInCluster():
+	}
 }
 
 // Cache implements the quasar cache. The cache is built on the raft consensus protocol but allows
@@ -571,13 +646,17 @@ func (s *Cache) localReset(resetID string) error {
 
 	s.newStores()
 
-	rft, err := getRaft(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport, s.discovery)
+	rft, err := newRaft(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport)
 	if err != nil {
 		return err
 	}
 	s.setRaft(rft)
 	s.discovery.run(s.ctx, rft)
 
+	// No bootstrap here: localReset is a follower re-init after a Reset
+	// command. The leader still has us in its raft configuration, so its
+	// heartbeats will catch the fresh raft up via the standard
+	// AppendEntries / InstallSnapshot probe-back path.
 	return nil
 }
 

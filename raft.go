@@ -8,42 +8,13 @@ import (
 	"github.com/tehsphinx/quasar/transports"
 )
 
-func getRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, stableStore raft.StableStore,
-	snapshotStore raft.SnapshotStore, transport transports.Transport, discovery *DiscoveryInjector,
-) (*raft.Raft, error) {
-	rft, err := newRaft(cfg, fsm, logStore, stableStore, snapshotStore, transport)
-	if err != nil {
-		return nil, err
-	}
-
-	if cfg.discovery != nil {
-		cfg.servers = discovery.getServers()
-		if cfg.suffrage == raft.Voter {
-			cfg.bootstrap = true
-		}
-	}
-
-	if cfg.bootstrap && len(cfg.servers) == 0 {
-		cfg.servers = []raft.Server{
-			{
-				ID:      raft.ServerID(cfg.localID),
-				Address: transport.LocalAddr(),
-			},
-		}
-	}
-	if len(cfg.servers) != 0 {
-		rft.BootstrapCluster(raft.Configuration{
-			Servers: cfg.servers,
-		})
-	}
-
-	return rft, nil
-}
-
 // newRaft creates a fresh *raft.Raft from the given stores without bootstrapping
-// or applying any discovery-driven configuration. Used by the quorum recovery
-// path which has already populated the stores via raft.RecoverCluster and must
-// not re-bootstrap.
+// or applying any discovery-driven configuration. Bootstrap of the initial
+// cluster configuration is intentionally deferred to the caller: newCache drives
+// the bootstrap decision after discovery has had a chance to learn whether an
+// existing cluster is already out there (see Cache.bootstrap), localReset
+// rejoins as a follower and relies on the leader's heartbeats, and the quorum
+// recovery path has already populated the stores via raft.RecoverCluster.
 func newRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, stableStore raft.StableStore,
 	snapshotStore raft.SnapshotStore, transport transports.Transport,
 ) (*raft.Raft, error) {
