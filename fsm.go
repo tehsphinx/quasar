@@ -52,6 +52,12 @@ type fsmWrapper struct {
 	condM       *sync.Mutex
 	cond        *cond.Cond
 
+	// hasLeader reports whether the cache currently sees a raft leader.
+	// Wired up by newCache after the Cache is constructed; used by WaitFor
+	// to enrich the returned error when the wait context expires while
+	// there is no leader to make progress.
+	hasLeader func() bool
+
 	isLogApplier bool
 }
 
@@ -146,7 +152,10 @@ func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
 
 	for s.getLastApplied() < uid {
 		if err := s.cond.WaitContext(ctx); err != nil {
-			return err
+			if s.hasLeader != nil && !s.hasLeader() {
+				return errors.Join(err, ErrWaitFor, ErrNoLeader)
+			}
+			return errors.Join(err, ErrWaitFor)
 		}
 	}
 	return nil

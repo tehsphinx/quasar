@@ -24,8 +24,13 @@ const (
 	observationChanSize = 5
 )
 
-// ErrNoLeader defines an error returned if there is no leader.
-var ErrNoLeader = errors.New("cluster does not have a leader")
+var (
+	// ErrNoLeader defines an error returned if there is no leader.
+	ErrNoLeader = errors.New("cluster does not have a leader")
+
+	// ErrWaitFor indicates a timeout occurred while waiting for a UID to be applied.
+	ErrWaitFor = errors.New("timeout waiting for UID to be applied")
+)
 
 // NewCache instantiates a new Cache. In contrast to NewKVCache (which holds []byte) this is meant
 // for use with custom types. The FSM implementation should hold all the data that is supposed to be synced
@@ -57,6 +62,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		close:    closeCache,
 		logger:   cfg.getLogger(),
 	}
+	fsm.hasLeader = c.hasLeader
 
 	transport, err := getTransport(ctx, cfg)
 	if err != nil {
@@ -395,7 +401,11 @@ func (s *Cache) IsLeader() bool {
 // hasLeader returns if the cache has a leader. Or at least if the current node
 // thinks there is a leader. The leader might already be unreachable.
 func (s *Cache) hasLeader() bool {
-	_, id := s.raft().LeaderWithID()
+	rft := s.raft()
+	if rft == nil {
+		return false
+	}
+	_, id := rft.LeaderWithID()
 	return id != ""
 }
 
