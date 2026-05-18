@@ -134,7 +134,11 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 			return nil
 		default:
 		}
-		s.logger.Info("bootstrap: no peer in established cluster, bootstrapping single-voter cluster")
+		s.logger.Info("bootstrap: no peer in established cluster, bootstrapping single-voter cluster",
+			"local-id", s.localID,
+			"local-address", transport.LocalAddr(),
+			"bootstrap-wait", cfg.bootstrapWait,
+		)
 		rft.BootstrapCluster(raft.Configuration{
 			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
 		})
@@ -422,10 +426,15 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 	if s.IsLeader() {
 		// If we ourselves became leader, attempt leadership transfer.
 		// This way we avoid new cache taking leadership of older instances.
+		s.logger.Info("WaitReady: local node holds leadership after restart; attempting voluntary leadership transfer",
+			"local-id", s.localID,
+		)
 		fut := s.raft().LeadershipTransfer()
-		//nolint:staticcheck // empty branch will be filled later
 		if r := fut.Error(); r != nil {
-			// log error
+			s.logger.Info("WaitReady: voluntary leadership transfer failed; staying leader",
+				"local-id", s.localID,
+				"error", r.Error(),
+			)
 		}
 
 		if err := s.waitForLeader(ctx); err != nil {
@@ -646,10 +655,16 @@ func (s *Cache) localReset(resetID string) error {
 
 	if s.IsLeader() {
 		// don't reset raft itself on leader.
-		s.logger.Info("applied cache reset: no raft reset on leader")
+		s.logger.Info("cache reset: FSM cleared; keeping raft state because this node is leader",
+			"local-id", s.localID,
+			"reset-id", resetID,
+		)
 		return nil
 	}
-	s.logger.Info("applied cache reset: resetting raft")
+	s.logger.Info("cache reset: FSM cleared; reinitializing raft because this node is a follower",
+		"local-id", s.localID,
+		"reset-id", resetID,
+	)
 
 	s.fsm.applyRaftReset()
 	s.raft().Shutdown()
