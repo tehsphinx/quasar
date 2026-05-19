@@ -70,6 +70,10 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	subHeartbeat, err := s.conn.Subscribe(subjPrefix+".entries.heartbeat", s.handleHeartbeat(ctx))
+	if err != nil {
+		return err
+	}
 	subVote, err := s.conn.Subscribe(subjPrefix+".request.vote", s.handleVote(ctx))
 	if err != nil {
 		return err
@@ -102,6 +106,7 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = subEntries.Unsubscribe()
+		_ = subHeartbeat.Unsubscribe()
 		_ = subVote.Unsubscribe()
 		_ = subStore.Unsubscribe()
 		_ = subResetCache.Unsubscribe()
@@ -407,6 +412,22 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
+	if isHeartbeat(request) {
+		// Try the dedicated heartbeat subject first so the round-trip
+		// can't be blocked by a slow chConsume push on entries.append.
+		// If the peer doesn't subscribe to it (older version), fall back
+		// transparently.
+		hbSubj := fmt.Sprintf("quasar.%s.%s.entries.heartbeat", s.cacheName, address)
+		var protoResp pb.CommandResponse
+		if _, err := s.request(ctx, hbSubj, pb.ToAppendEntriesRequest(request), &protoResp); err == nil {
+			*resp = *protoResp.GetAppendEntries().Convert()
+			return nil
+		} else if !errors.Is(err, nats.ErrNoResponders) {
+			s.logger.Error("failed to send heartbeat request", "error", err)
+			return err
+		}
+	}
+
 	subj := fmt.Sprintf("quasar.%s.%s.entries.append", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
@@ -439,12 +460,87 @@ func (s *NATSTransport) handleEntries(ctx context.Context) func(*nats.Msg) {
 
 		// Create the RPC object
 		chResp := make(chan raft.RPCResponse, 1)
+		req := protoMsg.Convert()
+		rpc := raft.RPC{
+			RespChan: chResp,
+			Command:  req,
+		}
+
+		// Heartbeat fast-path: dispatch zero-entry AppendEntries directly to
+		// the heartbeat handler so they don't queue behind normal entry
+		// traffic on chConsume. Matches the TCP transport (tcp_transport.go)
+		// and hashicorp/raft's own net_transport.go.
+		if isHeartbeat(req) {
+			s.heartbeatFnLock.Lock()
+			fn := s.heartbeatFn
+			s.heartbeatFnLock.Unlock()
+			if fn != nil {
+				fn(rpc)
+			} else {
+				s.chConsume <- rpc
+			}
+		} else {
+			s.chConsume <- rpc
+		}
+
+		bts, err := s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
+			resp, _ := i.(*raft.AppendEntriesResponse)
+			return &pb.CommandResponse{Resp: &pb.CommandResponse_AppendEntries{
+				AppendEntries: pb.ToAppendEntriesResponse(resp),
+			}}
+		})
+		if err != nil {
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
+			return
+		}
+		if r := msg.Respond(bts); r != nil {
+			s.logger.Error("failed to send response", "error", r)
+		}
+	}
+}
+
+// isHeartbeat reports whether req is a hashicorp/raft heartbeat
+// AppendEntries — i.e. one carrying no log entries and no probe-back state.
+// Mirrors the check in hashicorp/raft's net_transport.go.
+func isHeartbeat(req *raft.AppendEntriesRequest) bool {
+	leaderAddr := req.RPCHeader.Addr
+	if len(leaderAddr) == 0 {
+		//nolint:staticcheck // backwards compatibility with the deprecated Leader field.
+		leaderAddr = req.Leader
+	}
+	return req.Term != 0 && leaderAddr != nil &&
+		req.PrevLogEntry == 0 && req.PrevLogTerm == 0 &&
+		len(req.Entries) == 0 && req.LeaderCommitIndex == 0
+}
+
+// handleHeartbeat handles AppendEntries delivered on the dedicated heartbeat
+// subscription. Because this is a distinct NATS subscription, callbacks run
+// on a goroutine separate from handleEntries — so a slow chConsume push for
+// regular entries cannot stall heartbeat round-trips.
+func (s *NATSTransport) handleHeartbeat(ctx context.Context) func(*nats.Msg) {
+	return func(msg *nats.Msg) {
+		var protoMsg pb.AppendEntriesRequest
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
+			return
+		}
+
+		chResp := make(chan raft.RPCResponse, 1)
 		rpc := raft.RPC{
 			RespChan: chResp,
 			Command:  protoMsg.Convert(),
 		}
 
-		s.chConsume <- rpc
+		s.heartbeatFnLock.Lock()
+		fn := s.heartbeatFn
+		s.heartbeatFnLock.Unlock()
+		if fn != nil {
+			fn(rpc)
+		} else {
+			// raft hasn't registered the heartbeat handler yet — fall back
+			// to the regular consumer channel so we don't drop the message.
+			s.chConsume <- rpc
+		}
 
 		bts, err := s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
 			resp, _ := i.(*raft.AppendEntriesResponse)
