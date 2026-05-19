@@ -687,34 +687,137 @@ func (s *Cache) localReset(resetID string) error {
 
 // runQuorumRecoveryWatch is the long-running goroutine that decides when to
 // invoke recoverQuorum. It exits when ctx is canceled (cache shutdown).
+//
+// The trigger is event-driven: a raft LeaderObservation arms (or cancels) a
+// one-shot timer set to fire after recoverQuorumAfter of continuous
+// leaderlessness. This avoids the ~recoverQuorumAfter/4 polling slop that
+// the previous ticker-based implementation added on both sides of the
+// threshold (first-tick to register the loss + post-threshold tick to act).
+//
+// When recoverQuorum rebuilds the raft instance, the per-raft observer
+// dies with it; the outer loop re-registers on the new raft via
+// getRaftWithCtx and continues.
 func (s *Cache) runQuorumRecoveryWatch(ctx context.Context) {
-	const minInterval = time.Second
-
 	after := s.cfg.recoverQuorumAfter
-	interval := after / 4
-	if interval < minInterval {
-		interval = minInterval
+	// Alive-window for "is this peer dead per discovery". Decoupled from
+	// recoverQuorumAfter: the recovery threshold is a deliberate safety
+	// buffer against flaps, but it does not need to also be the cutoff for
+	// "we last saw the peer ping this recently". When auto-prune is
+	// configured, pruneAfter is the canonical dead-peer threshold; fall
+	// back to recoverQuorumAfter only if pruneAfter is zero.
+	aliveCutoff := s.cfg.pruneAfter
+	if aliveCutoff <= 0 {
+		aliveCutoff = after
 	}
 
-	tick := time.NewTicker(interval)
-	defer tick.Stop()
+	for {
+		rft, ctxRaft := s.getRaftWithCtx()
+		if rft == nil {
+			// Cache is still wiring itself up; wait briefly and retry.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
 
-	var noLeaderSince time.Time
+		s.watchQuorumOnRaft(ctx, ctxRaft, rft, after, aliveCutoff)
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+}
+
+// watchQuorumOnRaft runs the event-driven recovery loop against a single
+// raft instance. It returns when either ctx (cache shutdown) or ctxRaft
+// (this raft was replaced — e.g. by recoverQuorum or localReset) is done,
+// so the caller can re-register on the new raft.
+func (s *Cache) watchQuorumOnRaft(ctx, ctxRaft context.Context, rft *raft.Raft, after, aliveCutoff time.Duration) {
+	chObs := make(chan raft.Observation, observationChanSize)
+	observer := raft.NewObserver(chObs, false, func(o *raft.Observation) bool {
+		_, ok := o.Data.(raft.LeaderObservation)
+		return ok
+	})
+	rft.RegisterObserver(observer)
+	defer rft.DeregisterObserver(observer)
+
+	// fire is buffered so the timer goroutine can deliver without blocking.
+	// We drain it explicitly when we cancel; spurious wake-ups are harmless
+	// (the shouldRecoverQuorum check is the source of truth).
+	fire := make(chan struct{}, 1)
+	var timer *time.Timer
+
+	armTimer := func() {
+		if timer != nil {
+			return
+		}
+		timer = time.AfterFunc(after, func() {
+			select {
+			case fire <- struct{}{}:
+			default:
+			}
+		})
+	}
+	cancelTimer := func() {
+		if timer != nil {
+			timer.Stop()
+			timer = nil
+		}
+		select {
+		case <-fire:
+		default:
+		}
+	}
+	defer cancelTimer()
+
+	// Seed: react to the current leader state. Initial LeaderObservation
+	// events arrive only on changes, so a node started without a leader
+	// would otherwise sit unarmed until the next election attempt.
+	if !s.hasLeader() {
+		armTimer()
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-tick.C:
-			if !s.shouldRecoverQuorum(now, after, &noLeaderSince) {
+		case <-ctxRaft.Done():
+			return
+		case <-chObs:
+			if s.hasLeader() {
+				cancelTimer()
+			} else {
+				armTimer()
+			}
+		case <-fire:
+			timer = nil
+			if !s.shouldRecoverQuorum(time.Now(), aliveCutoff) {
+				// Either a leader came back between fire and now, or we
+				// are not the captain / quorum is still reachable. If we
+				// still have no leader, re-arm to retry on the next full
+				// window — avoids tight-looping when a transient condition
+				// (e.g. raft.GetConfiguration error) blocked recovery.
+				if !s.hasLeader() {
+					armTimer()
+				}
 				continue
 			}
 			if err := s.recoverQuorum(); err != nil {
 				s.logger.Error("quorum recovery failed", "error", err)
-				// Reset the timer so we wait the full window before trying
-				// again. Avoids tight-looping on a persistent error.
-				noLeaderSince = time.Time{}
+				// Re-arm on the same raft so we wait a full window before
+				// trying again. recoverQuorum only swaps raft on success.
+				if !s.hasLeader() {
+					armTimer()
+				}
+				continue
 			}
+			// recoverQuorum shut down the old raft and installed a new
+			// one; ctxRaft is now done and we'll exit the select on the
+			// next iteration to let the outer loop re-register.
 		}
 	}
 }
@@ -831,25 +934,25 @@ func (s *Cache) recoverQuorum() error {
 }
 
 // shouldRecoverQuorum returns true when this voter is stranded and the
-// recovery procedure should run. It updates noLeaderSince in place to track
-// the start of the leaderless period.
-func (s *Cache) shouldRecoverQuorum(now time.Time, after time.Duration, noLeaderSince *time.Time) bool {
+// recovery procedure should run. The leaderless-duration threshold is the
+// caller's responsibility (the recovery watcher arms a time.Timer for that);
+// shouldRecoverQuorum only re-confirms there is still no leader and that
+// this node is the elected recovery captain among the alive voters.
+//
+// aliveCutoff is the discovery-side "this peer is still alive" window. It
+// is independent of the recovery threshold so the alive-window can match
+// the auto-prune cutoff (the canonical dead-peer signal) rather than being
+// forced to equal the safety-buffer threshold.
+func (s *Cache) shouldRecoverQuorum(now time.Time, aliveCutoff time.Duration) bool {
 	if s.suffrage != raft.Voter {
 		return false
 	}
 	if s.IsLeader() || s.hasLeader() {
-		*noLeaderSince = time.Time{}
-		return false
-	}
-	if noLeaderSince.IsZero() {
-		*noLeaderSince = now
-		return false
-	}
-	if now.Sub(*noLeaderSince) < after {
 		return false
 	}
 
-	// Leaderless long enough. Two more checks before we tear things down:
+	// No leader, threshold already elapsed. Two more checks before we tear
+	// things down:
 	//
 	//  1. Count voters in the current config and how many are alive per
 	//     discovery (self counts as alive — we are running this code). If
@@ -876,7 +979,7 @@ func (s *Cache) shouldRecoverQuorum(now time.Time, after time.Duration, noLeader
 		aliveVoters  int
 		selfInConfig bool
 		captain      = s.localID
-		pruneBefore  = now.Add(-after)
+		pruneBefore  = now.Add(-aliveCutoff)
 	)
 	for _, srv := range cfgFut.Configuration().Servers {
 		if srv.Suffrage != raft.Voter {

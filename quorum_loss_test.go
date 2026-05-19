@@ -504,3 +504,283 @@ func TestQuorumLossMultiVoter(t *testing.T) {
 	}
 	t.Fatalf("no surviving node is leader after recovery")
 }
+
+// TestQuorumRecoveryFiresAtThreshold is the RT-12846 regression guard for the
+// event-driven recovery trigger.
+//
+// The original polling watcher (time.Ticker with interval recoverQuorumAfter/4,
+// min 1s) added up to ~recoverQuorumAfter/4 of slop on both sides of the
+// threshold: one tick to register noLeaderSince after step-down, and one tick
+// after the threshold elapsed to actually act. With the 6s floor that is
+// ~3s of avoidable slop on top of the threshold, pushing end-to-end recovery
+// to ~11s.
+//
+// The event-driven trigger arms a one-shot timer the moment LeaderObservation
+// reports leaderless and fires at exactly recoverQuorumAfter. End-to-end
+// recovery should fit in step-down (~1s) + recoverQuorumAfter + post-recovery
+// election (~1s) ≈ 8s. The budget below would fail if the polling slop
+// regressed.
+func TestQuorumRecoveryFiresAtThreshold(t *testing.T) {
+	const (
+		recoverAfter       = 6 * time.Second
+		fastRecoveryBudget = 9 * time.Second
+		discoveryTick      = 250 * time.Millisecond
+	)
+
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelMain()
+
+	asrt := is.New(t)
+	bus := newInmemBus()
+
+	specs := []string{"v1", "v2"}
+	addrs := map[string]raft.ServerAddress{}
+	trs := map[string]*transports.InmemTransport{}
+	for _, id := range specs {
+		addr, tr := transports.NewInmemTransport("")
+		addrs[id] = addr
+		trs[id] = tr
+	}
+	for id, tr := range trs {
+		for otherID, otherTr := range trs {
+			if id == otherID {
+				continue
+			}
+			tr.Connect(addrs[otherID], otherTr)
+		}
+	}
+
+	type node struct {
+		id    string
+		cache *quasar.Cache
+		fsm   *exampleFSM.InMemoryFSM
+	}
+	nodes := map[string]*node{}
+	for _, id := range specs {
+		fsm := exampleFSM.NewInMemoryFSM()
+		c, err := quasar.NewCache(ctxMain, fsm,
+			quasar.WithLocalID(id),
+			quasar.WithTransport(trs[id]),
+			quasar.WithDiscovery(newInmemDiscovery(bus, discoveryTick)),
+			quasar.WithAutoPrune(recoverAfter),
+			quasar.WithQuorumRecovery(recoverAfter),
+			quasar.WithSuffrage(raft.Voter),
+		)
+		asrt.NoErr(err)
+		nodes[id] = &node{id: id, cache: c, fsm: fsm}
+	}
+	defer func() {
+		for _, n := range nodes {
+			_ = n.cache.Shutdown()
+		}
+	}()
+
+	for _, id := range specs {
+		asrt.NoErr(nodes[id].cache.WaitReady(ctxMain))
+	}
+
+	settleCtx, cancelSettle := context.WithTimeout(ctxMain, 15*time.Second)
+	defer cancelSettle()
+	asrt.NoErr(waitForCondition(settleCtx, func() error {
+		srvs, e := nodes["v1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		if len(srvs) != 2 {
+			return fmt.Errorf("server list has %d entries, want 2", len(srvs))
+		}
+		if nodes["v1"].cache.GetLeader().ID == "" {
+			return fmt.Errorf("no leader yet")
+		}
+		return nil
+	}))
+
+	leader := nodes["v1"].cache.GetLeader()
+	var (
+		survivor   *node
+		victimName string
+	)
+	switch leader.ID {
+	case "v1":
+		survivor, victimName = nodes["v1"], "v2"
+	case "v2":
+		survivor, victimName = nodes["v2"], "v1"
+	default:
+		t.Fatalf("expected v1 or v2 as leader, got %q", leader.ID)
+	}
+
+	t.Logf("killing %s; survivor=%s", victimName, survivor.id)
+	asrt.NoErr(nodes[victimName].cache.Shutdown())
+	delete(nodes, victimName)
+
+	start := time.Now()
+	recoverCtx, cancelRecover := context.WithTimeout(ctxMain, fastRecoveryBudget+5*time.Second)
+	defer cancelRecover()
+	err := waitForCondition(recoverCtx, func() error {
+		if !survivor.cache.IsLeader() {
+			return fmt.Errorf("survivor %s not leader yet", survivor.id)
+		}
+		srvs, e := survivor.cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		for _, s := range srvs {
+			if string(s.ID) == victimName {
+				return fmt.Errorf("dead voter %s still in raft config", victimName)
+			}
+		}
+		return nil
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("survivor did not recover: %v", err)
+	}
+	if elapsed > fastRecoveryBudget {
+		t.Fatalf("recovery took %s, budget is %s — event-driven trigger may have regressed to polling", elapsed, fastRecoveryBudget)
+	}
+	t.Logf("recovery elapsed: %s (budget %s)", elapsed, fastRecoveryBudget)
+}
+
+// TestQuorumRecoveryCancelOnTransientPartition covers the cancel path of the
+// event-driven recovery trigger: when leadership briefly disappears and is
+// restored before recoverQuorumAfter, the armed recovery timer must be
+// cancelled so the cluster is not torn down by a spurious recoverQuorum.
+//
+// Setup: 3 voters with recoverQuorumAfter = 6s. The leader's raft transport
+// is severed from the other two for a window shorter than recoverQuorumAfter.
+// The two connected followers retain quorum (2/3) and elect a new leader; the
+// old leader steps down. After reconnecting, the old leader rejoins as a
+// follower. At no point should any node have run raft.RecoverCluster — the
+// configuration should still hold all three voters.
+//
+// Discovery runs on a separate in-process bus and is unaffected by the raft
+// transport partition, so discovery's alive-window check is also a backstop
+// against recovery here. The end-state invariant (all 3 voters present) is
+// the regression guard.
+func TestQuorumRecoveryCancelOnTransientPartition(t *testing.T) {
+	const (
+		recoverAfter  = 6 * time.Second
+		partitionFor  = 2 * time.Second
+		discoveryTick = 250 * time.Millisecond
+	)
+
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelMain()
+
+	asrt := is.New(t)
+	bus := newInmemBus()
+
+	specs := []string{"v1", "v2", "v3"}
+	addrs := map[string]raft.ServerAddress{}
+	trs := map[string]*transports.InmemTransport{}
+	for _, id := range specs {
+		addr, tr := transports.NewInmemTransport("")
+		addrs[id] = addr
+		trs[id] = tr
+	}
+	for id, tr := range trs {
+		for otherID, otherTr := range trs {
+			if id == otherID {
+				continue
+			}
+			tr.Connect(addrs[otherID], otherTr)
+		}
+	}
+
+	type node struct {
+		id    string
+		cache *quasar.Cache
+		fsm   *exampleFSM.InMemoryFSM
+	}
+	nodes := map[string]*node{}
+	for _, id := range specs {
+		fsm := exampleFSM.NewInMemoryFSM()
+		c, err := quasar.NewCache(ctxMain, fsm,
+			quasar.WithLocalID(id),
+			quasar.WithTransport(trs[id]),
+			quasar.WithDiscovery(newInmemDiscovery(bus, discoveryTick)),
+			quasar.WithAutoPrune(recoverAfter),
+			quasar.WithQuorumRecovery(recoverAfter),
+			quasar.WithSuffrage(raft.Voter),
+		)
+		asrt.NoErr(err)
+		nodes[id] = &node{id: id, cache: c, fsm: fsm}
+	}
+	defer func() {
+		for _, n := range nodes {
+			_ = n.cache.Shutdown()
+		}
+	}()
+
+	for _, id := range specs {
+		asrt.NoErr(nodes[id].cache.WaitReady(ctxMain))
+	}
+
+	settleCtx, cancelSettle := context.WithTimeout(ctxMain, 15*time.Second)
+	defer cancelSettle()
+	asrt.NoErr(waitForCondition(settleCtx, func() error {
+		srvs, e := nodes["v1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		if len(srvs) != 3 {
+			return fmt.Errorf("server list has %d entries, want 3", len(srvs))
+		}
+		if nodes["v1"].cache.GetLeader().ID == "" {
+			return fmt.Errorf("no leader yet")
+		}
+		return nil
+	}))
+
+	leader := nodes["v1"].cache.GetLeader()
+	if leader.ID == "" {
+		t.Fatalf("no leader after settle")
+	}
+	leaderID := string(leader.ID)
+	t.Logf("leader before partition: %s", leaderID)
+
+	// Sever the raft transport between the leader and the two followers
+	// in both directions. Discovery still works (separate channel), so
+	// the alive-window check would not by itself trigger recovery — the
+	// timer-cancel path is what we are exercising.
+	leaderTr := trs[leaderID]
+	for _, id := range specs {
+		if id == leaderID {
+			continue
+		}
+		leaderTr.Disconnect(addrs[id])
+		trs[id].Disconnect(addrs[leaderID])
+	}
+
+	time.Sleep(partitionFor)
+
+	// Heal the partition before recoverAfter elapses.
+	for _, id := range specs {
+		if id == leaderID {
+			continue
+		}
+		leaderTr.Connect(addrs[id], trs[id])
+		trs[id].Connect(addrs[leaderID], leaderTr)
+	}
+
+	// Wait past the original recoverAfter window. If any node failed to
+	// cancel its pending recovery timer, the configuration would now be
+	// short of voters (a forced recovery drops missing voters).
+	time.Sleep(recoverAfter + time.Second)
+
+	for _, id := range specs {
+		srvs, err := nodes[id].cache.GetServerList()
+		if err != nil {
+			t.Fatalf("node %s GetServerList: %v", id, err)
+		}
+		voters := 0
+		for _, s := range srvs {
+			if s.Suffrage == raft.Voter {
+				voters++
+			}
+		}
+		if voters != 3 {
+			t.Fatalf("node %s sees %d voters after transient partition, want 3 (a spurious recovery may have fired)", id, voters)
+		}
+	}
+}
