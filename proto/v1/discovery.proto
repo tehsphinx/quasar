@@ -25,6 +25,11 @@ message RaftStatus {
   bool has_leader = 1;
   // Indicates the number of voters in the sender's raft cluster.
   uint32 num_voters_in_config = 2;
+  // Sender's local raft.LastIndex() at the moment the ping was emitted.
+  // Used by the quorum-recovery captain selection (RT-12862) to prefer
+  // the most up-to-date alive voter as captain, so a recovered single-voter
+  // cluster never has its snapshot regressed behind a survivor's log.
+  uint64 last_index = 3;
 }
 
 enum ServerSuffrage {

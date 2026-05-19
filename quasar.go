@@ -958,10 +958,15 @@ func (s *Cache) shouldRecoverQuorum(now time.Time, aliveCutoff time.Duration) bo
 	//     discovery (self counts as alive — we are running this code). If
 	//     enough are alive to form quorum, raft should be able to elect
 	//     on its own and recovery would just cause churn.
-	//  2. Pick a deterministic recovery captain — the lowest-ID alive
-	//     voter — so that with multiple stranded survivors only one runs
+	//  2. Pick a deterministic recovery captain — the alive voter with
+	//     the highest reported raft.LastIndex(), tie-broken by lowest ID
+	//     — so that with multiple stranded survivors only one runs
 	//     raft.RecoverCluster. Concurrent recovery on multiple peers
-	//     produces divergent snapshots that fail to converge. The other
+	//     produces divergent snapshots that fail to converge. The
+	//     LastIndex preference (RT-12862) prevents a lagging captain
+	//     from defining the new cluster snapshot below a survivor's
+	//     already-replicated log tail, which would otherwise trap the
+	//     survivor in a snapshot-regression catchup loop. The other
 	//     survivors stay in the captain's new config and get pulled to
 	//     the recovered state via InstallSnapshot once the captain wins
 	//     its election.
@@ -975,29 +980,43 @@ func (s *Cache) shouldRecoverQuorum(now time.Time, aliveCutoff time.Duration) bo
 	}
 
 	var (
-		configVoters int
-		aliveVoters  int
-		selfInConfig bool
-		captain      = s.localID
-		pruneBefore  = now.Add(-aliveCutoff)
+		configVoters     int
+		aliveVoters      int
+		selfInConfig     bool
+		captain          = s.localID
+		captainLastIndex = rft.LastIndex()
+		pruneBefore      = now.Add(-aliveCutoff)
 	)
 	for _, srv := range cfgFut.Configuration().Servers {
 		if srv.Suffrage != raft.Voter {
 			continue
 		}
 		configVoters++
-		alive := false
+		var (
+			alive     bool
+			lastIndex uint64
+		)
 		if string(srv.ID) == s.localID {
 			selfInConfig = true
 			alive = true
-		} else if s.discovery.isAliveSince(srv.ID, pruneBefore) {
-			alive = true
+			lastIndex = captainLastIndex
+		} else {
+			lastIndex, alive = s.discovery.isAliveSince(srv.ID, pruneBefore)
 		}
-		if alive {
-			aliveVoters++
-			if string(srv.ID) < captain {
-				captain = string(srv.ID)
-			}
+		if !alive {
+			continue
+		}
+		aliveVoters++
+		if string(srv.ID) == s.localID {
+			continue
+		}
+		// Prefer the alive voter with the highest reported LastIndex; on
+		// ties, prefer the lowest ID. Initial captain is self, so we
+		// only replace when a peer strictly wins on (lastIndex, -ID).
+		if captainLastIndex < lastIndex  ||
+			(lastIndex == captainLastIndex && string(srv.ID) < captain) {
+			captain = string(srv.ID)
+			captainLastIndex = lastIndex
 		}
 	}
 	if !selfInConfig || configVoters == 0 {

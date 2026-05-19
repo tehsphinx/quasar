@@ -25,6 +25,7 @@ func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 		applied:         map[raft.ServerID]struct{}{},
 		servers:         map[raft.ServerID]raft.Server{},
 		lastSeen:        map[raft.ServerID]time.Time{},
+		lastIndex:       map[raft.ServerID]uint64{},
 		peerInClusterCh: make(chan struct{}),
 	}
 }
@@ -33,10 +34,13 @@ func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 // that Discovery implementations attach to outgoing pings. It is consumed by
 // the bootstrap-gating logic on a restarting voter (RT-12775): any peer
 // reporting HasLeader or NumVotersInConfig >= 2 proves an established
-// cluster exists, so the restarter skips its single-node bootstrap.
+// cluster exists, so the restarter skips its single-node bootstrap. The
+// quorum-recovery captain selection (RT-12862) also reads LastIndex to
+// prefer the most up-to-date alive voter.
 type PeerStatus struct {
 	HasLeader         bool
 	NumVotersInConfig uint32
+	LastIndex         uint64
 }
 
 // inEstablishedCluster returns true when this status proves the reporting
@@ -53,11 +57,12 @@ func (r PeerStatus) inEstablishedCluster() bool {
 type DiscoveryInjector struct {
 	cache *Cache
 
-	serversM sync.RWMutex
-	servers  map[raft.ServerID]raft.Server
-	lastSeen map[raft.ServerID]time.Time
-	appliedM sync.RWMutex
-	applied  map[raft.ServerID]struct{}
+	serversM  sync.RWMutex
+	servers   map[raft.ServerID]raft.Server
+	lastSeen  map[raft.ServerID]time.Time
+	lastIndex map[raft.ServerID]uint64
+	appliedM  sync.RWMutex
+	applied   map[raft.ServerID]struct{}
 
 	cancelM sync.Mutex
 	cancel  context.CancelFunc
@@ -111,7 +116,7 @@ func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status Peer
 		s.peerInClusterOnce.Do(func() { close(s.peerInClusterCh) })
 	}
 
-	isNew := s.setServer(srv)
+	isNew := s.setServer(srv, status)
 	if !isNew {
 		return
 	}
@@ -145,6 +150,7 @@ func (s *DiscoveryInjector) LocalPeerStatus() PeerStatus {
 	return PeerStatus{
 		HasLeader:         leaderID != "",
 		NumVotersInConfig: s.voterCount.Load(),
+		LastIndex:         rft.LastIndex(),
 	}
 }
 
@@ -367,11 +373,12 @@ func (s *DiscoveryInjector) removeApplied(srvID raft.ServerID) {
 	delete(s.applied, srvID)
 }
 
-func (s *DiscoveryInjector) setServer(srv raft.Server) bool {
+func (s *DiscoveryInjector) setServer(srv raft.Server, status PeerStatus) bool {
 	s.serversM.Lock()
 	defer s.serversM.Unlock()
 
 	s.lastSeen[srv.ID] = time.Now()
+	s.lastIndex[srv.ID] = status.LastIndex
 
 	_, ok := s.servers[srv.ID]
 	if ok {
@@ -388,19 +395,27 @@ func (s *DiscoveryInjector) deleteServer(id raft.ServerID) {
 
 	delete(s.servers, id)
 	delete(s.lastSeen, id)
+	delete(s.lastIndex, id)
 }
 
 // isAliveSince reports whether the given peer has pinged discovery on or
-// after `since`.
-func (s *DiscoveryInjector) isAliveSince(id raft.ServerID, since time.Time) bool {
+// after `since`. The second return value is the peer's most recently
+// reported raft LastIndex (0 if the peer has never reported one, e.g. via
+// the legacy ProcessServer entrypoint). Used by the quorum-recovery captain
+// selection (RT-12862) to break the lowest-ID tie in favor of the most
+// up-to-date alive voter.
+func (s *DiscoveryInjector) isAliveSince(id raft.ServerID, since time.Time) (uint64, bool) {
 	s.serversM.RLock()
 	defer s.serversM.RUnlock()
 
 	last, ok := s.lastSeen[id]
 	if !ok {
-		return false
+		return 0, false
 	}
-	return !last.Before(since)
+	if last.Before(since) {
+		return 0, false
+	}
+	return s.lastIndex[id], true
 }
 
 // forgetServer removes all bookkeeping for the given peer so that a fresh
@@ -412,6 +427,7 @@ func (s *DiscoveryInjector) forgetServer(id raft.ServerID) {
 	s.serversM.Lock()
 	delete(s.servers, id)
 	delete(s.lastSeen, id)
+	delete(s.lastIndex, id)
 	s.serversM.Unlock()
 
 	s.appliedM.Lock()
