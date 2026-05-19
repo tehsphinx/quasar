@@ -200,7 +200,7 @@ func (s *NATSTransport) ResetCache(ctx context.Context, _ raft.ServerID, address
 	subj := fmt.Sprintf("quasar.%s.%s.cache.reset", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if _, err := s.request(ctx, subj, request, &protoResp); err != nil {
+	if err := s.requestSmall(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -223,7 +223,7 @@ func (s *NATSTransport) RemoveServer(ctx context.Context, _ raft.ServerID, addre
 	subj := fmt.Sprintf("quasar.%s.%s.cache.server.remove", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if _, err := s.request(ctx, subj, request, &protoResp); err != nil {
+	if err := s.requestSmall(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -234,20 +234,9 @@ func (s *NATSTransport) RemoveServer(ctx context.Context, _ raft.ServerID, addre
 }
 
 func (s *NATSTransport) handleResetCache(ctx context.Context) func(*nats.Msg) {
-	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
-	var message Message
-
 	return func(msg *nats.Msg) {
-		if complete, err := handleMultiPart(msg, &message); err != nil {
-			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
-			return
-		} else if !complete {
-			return
-		}
-		data := message.GetDataAndReset()
-
 		var protoMsg pb.ResetCache
-		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
 			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
@@ -279,20 +268,9 @@ func (s *NATSTransport) handleResetCache(ctx context.Context) func(*nats.Msg) {
 }
 
 func (s *NATSTransport) handleRemoveServer(ctx context.Context) func(*nats.Msg) {
-	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
-	var message Message
-
 	return func(msg *nats.Msg) {
-		if complete, err := handleMultiPart(msg, &message); err != nil {
-			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
-			return
-		} else if !complete {
-			return
-		}
-		data := message.GetDataAndReset()
-
 		var protoMsg pb.RemoveServer
-		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
 			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
@@ -334,7 +312,7 @@ func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address 
 	subj := fmt.Sprintf("quasar.%s.%s.cache.uid.latest", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if _, err := s.request(ctx, subj, request, &protoResp); err != nil {
+	if err := s.requestSmall(ctx, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -344,20 +322,9 @@ func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address 
 }
 
 func (s *NATSTransport) handleLatestUID(ctx context.Context) func(*nats.Msg) {
-	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
-	var message Message
-
 	return func(msg *nats.Msg) {
-		if complete, err := handleMultiPart(msg, &message); err != nil {
-			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
-			return
-		} else if !complete {
-			return
-		}
-		data := message.GetDataAndReset()
-
 		var protoMsg pb.LatestUid
-		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
 			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
@@ -419,7 +386,7 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 		// transparently.
 		hbSubj := fmt.Sprintf("quasar.%s.%s.entries.heartbeat", s.cacheName, address)
 		var protoResp pb.CommandResponse
-		if _, err := s.request(ctx, hbSubj, pb.ToAppendEntriesRequest(request), &protoResp); err == nil {
+		if err := s.requestSmall(ctx, hbSubj, pb.ToAppendEntriesRequest(request), &protoResp); err == nil {
 			*resp = *protoResp.GetAppendEntries().Convert()
 			return nil
 		} else if !errors.Is(err, nats.ErrNoResponders) {
@@ -568,7 +535,7 @@ func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress,
 	subj := fmt.Sprintf("quasar.%s.%s.request.vote", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if _, err := s.request(ctx, subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
+	if err := s.requestSmall(ctx, subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -577,20 +544,9 @@ func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress,
 }
 
 func (s *NATSTransport) handleVote(ctx context.Context) func(*nats.Msg) {
-	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
-	var message Message
-
 	return func(msg *nats.Msg) {
-		if complete, err := handleMultiPart(msg, &message); err != nil {
-			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
-			return
-		} else if !complete {
-			return
-		}
-		data := message.GetDataAndReset()
-
 		var protoMsg pb.RequestVoteRequest
-		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
 			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
@@ -652,7 +608,7 @@ func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, 
 	subj := fmt.Sprintf("quasar.%s.%s.timeout.now", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if _, err := s.request(ctx, subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
+	if err := s.requestSmall(ctx, subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -661,20 +617,9 @@ func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, 
 }
 
 func (s *NATSTransport) handleTimeoutNow(ctx context.Context) func(*nats.Msg) {
-	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
-	var message Message
-
 	return func(msg *nats.Msg) {
-		if complete, err := handleMultiPart(msg, &message); err != nil {
-			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
-			return
-		} else if !complete {
-			return
-		}
-		data := message.GetDataAndReset()
-
 		var protoMsg pb.TimeoutNowRequest
-		if r := proto.Unmarshal(data, &protoMsg); r != nil {
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
 			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
 			return
 		}
@@ -704,6 +649,9 @@ func (s *NATSTransport) handleTimeoutNow(ctx context.Context) func(*nats.Msg) {
 	}
 }
 
+// request sends msg on subj, splitting it across multiple NATS messages if
+// it exceeds s.maxMsgSize. Use this for RPCs whose payload can grow large
+// (AppendEntries, Store).
 func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp proto.Message) (int, error) {
 	bts, err := proto.Marshal(msg)
 	if err != nil {
@@ -735,6 +683,22 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 	err = proto.Unmarshal(response.Data, protoResp)
 	// fmt.Println("response data:", fmt.Sprintf("%+v", protoResp))
 	return len(bts), err
+}
+
+// requestSmall sends msg on subj as a single NATS message. Use this for RPCs
+// whose payload is bounded by a few small fields (RequestVote, TimeoutNow,
+// LatestUid, ResetCache, RemoveServer, heartbeat AppendEntries) — the
+// multi-part path in request is dead code for them.
+func (s *NATSTransport) requestSmall(ctx context.Context, subj string, msg, protoResp proto.Message) error {
+	bts, err := proto.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	response, err := s.conn.RequestWithContext(ctx, subj, bts)
+	if err != nil {
+		return err
+	}
+	return proto.Unmarshal(response.Data, protoResp)
 }
 
 func (s *NATSTransport) awaitResponse(
