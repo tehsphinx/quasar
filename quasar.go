@@ -139,6 +139,7 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 			"local-address", transport.LocalAddr(),
 			"bootstrap-wait", cfg.bootstrapWait,
 		)
+		s.setInstanceID(uuid.NewString())
 		rft.BootstrapCluster(raft.Configuration{
 			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
 		})
@@ -146,11 +147,13 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 	}
 
 	if len(cfg.servers) > 0 {
+		s.setInstanceID(uuid.NewString())
 		rft.BootstrapCluster(raft.Configuration{Servers: cfg.servers})
 		return nil
 	}
 
 	if cfg.bootstrap {
+		s.setInstanceID(uuid.NewString())
 		rft.BootstrapCluster(raft.Configuration{
 			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
 		})
@@ -202,6 +205,7 @@ type Cache struct {
 	ctxRaft       context.Context
 	closeRaft     context.CancelFunc
 	lastResetID   string
+	instanceID    string
 	raftLocker    *raft.Raft
 	logStore      raft.LogStore
 	stableStore   raft.StableStore
@@ -540,7 +544,7 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 				uid, err = s.store(ctx, cmd.Key, cmd.Data)
 				resp = &pb.StoreResponse{Uid: uid}
 			case *pb.ResetCache:
-				err = s.localReset(cmd.Uuid)
+				err = s.localReset(cmd.Uuid, "")
 				resp = &pb.ResetCacheResponse{Uuid: cmd.Uuid}
 			case *pb.RemoveServer:
 				err = s.removeServer(cmd.Id)
@@ -619,7 +623,7 @@ func (s *Cache) Reset(ctx context.Context) error {
 	for _, server := range servers {
 		if server.ID == raft.ServerID(s.localID) {
 			foundLocal = true
-			if r := s.localReset(resetID); r != nil {
+			if r := s.localReset(resetID, ""); r != nil {
 				retErrs = append(retErrs, r)
 			}
 			continue
@@ -635,7 +639,7 @@ func (s *Cache) Reset(ctx context.Context) error {
 		}
 	}
 	if !foundLocal {
-		if r := s.localReset(resetID); r != nil {
+		if r := s.localReset(resetID, ""); r != nil {
 			retErrs = append(retErrs, r)
 		}
 	}
@@ -650,7 +654,20 @@ func (s *Cache) sendReset(ctx context.Context, server raft.Server) (*pb.ResetCac
 	return resp, r
 }
 
-func (s *Cache) localReset(resetID string) error {
+// localReset reinitializes the follower's raft state. resetID is the FSM
+// reset UUID (already-applied resets are no-ops); adoptInstanceID, when
+// non-empty, replaces this cache's instance ID so the post-reset raft
+// reports the adopted ID on the next discovery ping and the mismatch
+// watcher stays quiet. Two callers pass a non-empty adoptInstanceID:
+//   - adoptLeaderInstance, when this node observed a forked-history
+//     ping from the current raft leader (RT-12862);
+//   - any future caller that has independently determined the cluster's
+//     instance ID.
+//
+// All other callers pass "" and keep the existing instance ID, which is
+// the correct behavior for cluster-wide Reset commands (the cluster's
+// consensus history is preserved across the reset).
+func (s *Cache) localReset(resetID, adoptInstanceID string) error {
 	if resetID == s.getLastResetID() {
 		return nil
 	}
@@ -677,6 +694,9 @@ func (s *Cache) localReset(resetID string) error {
 	s.raft().Shutdown()
 
 	s.newStores()
+	if adoptInstanceID != "" {
+		s.setInstanceID(adoptInstanceID)
+	}
 
 	rft, err := newRaft(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport)
 	if err != nil {
@@ -913,6 +933,15 @@ func (s *Cache) recoverQuorum() error {
 	// goroutines select on. Cache.localReset uses the same pattern.
 	rft.Shutdown()
 
+	// Mint a fresh instance ID — recoverQuorum forks the consensus
+	// history line on purpose (RT-12862). Surviving peers compare the
+	// captain's new ID against their own on the next discovery ping;
+	// any mismatch triggers their localReset, which wipes the stale
+	// in-memory log/snapshot state that would otherwise trap them in a
+	// snapshot-regression catchup loop on top of the captain's
+	// (possibly older) recovered snapshot.
+	s.setInstanceID(uuid.NewString())
+
 	conf := raftConfig(s.cfg)
 	if err := raft.RecoverCluster(conf, s.fsm, s.logStore, s.stableStore, s.snapshotStore,
 		s.transport, raft.Configuration{Servers: keep}); err != nil {
@@ -936,21 +965,15 @@ func (s *Cache) recoverQuorum() error {
 	return nil
 }
 
-// aliveVoter is one entry in a voterScan's alive list.
-type aliveVoter struct {
-	id        raft.ServerID
-	lastIndex uint64
-}
-
 // voterScan summarizes the current raft voter configuration measured
 // against discovery's alive picture. configVoters counts every voter in
-// the configuration; aliveVoters lists only voters confirmed alive within
-// the caller's aliveCutoff window (self is always included with
-// rft.LastIndex()). selfIsVoter records whether the local node is a voter
-// in the configuration.
+// the configuration; aliveVoters lists only voters confirmed alive
+// within the caller's aliveCutoff window (self is always included).
+// selfIsVoter records whether the local node is a voter in the
+// configuration.
 type voterScan struct {
 	configVoters int
-	aliveVoters  []aliveVoter
+	aliveVoters  []raft.ServerID
 	selfIsVoter  bool
 }
 
@@ -970,7 +993,6 @@ func (s *Cache) scanVoters(now time.Time, aliveCutoff time.Duration) (voterScan,
 	}
 
 	pruneBefore := now.Add(-aliveCutoff)
-	selfLastIndex := rft.LastIndex()
 
 	var scan voterScan
 	for _, srv := range cfgFut.Configuration().Servers {
@@ -980,14 +1002,13 @@ func (s *Cache) scanVoters(now time.Time, aliveCutoff time.Duration) (voterScan,
 		scan.configVoters++
 		if string(srv.ID) == s.localID {
 			scan.selfIsVoter = true
-			scan.aliveVoters = append(scan.aliveVoters, aliveVoter{id: srv.ID, lastIndex: selfLastIndex})
+			scan.aliveVoters = append(scan.aliveVoters, srv.ID)
 			continue
 		}
-		lastIndex, alive := s.discovery.isAliveSince(srv.ID, pruneBefore)
-		if !alive {
+		if !s.discovery.isAliveSince(srv.ID, pruneBefore) {
 			continue
 		}
-		scan.aliveVoters = append(scan.aliveVoters, aliveVoter{id: srv.ID, lastIndex: lastIndex})
+		scan.aliveVoters = append(scan.aliveVoters, srv.ID)
 	}
 	return scan, true
 }
@@ -1034,14 +1055,24 @@ func (s *Cache) quorumReachable(now time.Time, aliveCutoff time.Duration) bool {
 
 // shouldRecoverQuorum returns true when this voter is stranded and the
 // recovery procedure should run. The leaderless-duration threshold is the
-// caller's responsibility (the recovery watcher arms a time.Timer for that);
-// shouldRecoverQuorum only re-confirms there is still no leader and that
-// this node is the elected recovery captain among the alive voters.
+// caller's responsibility (the recovery watcher arms a time.Timer for
+// that); shouldRecoverQuorum only re-confirms there is still no leader
+// and that this node is the elected recovery captain among the alive
+// voters.
 //
 // aliveCutoff is the discovery-side "this peer is still alive" window. It
 // is independent of the recovery threshold so the alive-window can match
 // the auto-prune cutoff (the canonical dead-peer signal) rather than being
 // forced to equal the safety-buffer threshold.
+//
+// The captain is the lowest-ID alive voter — a deterministic choice
+// computed from a snapshot every stranded survivor agrees on, so at
+// most one runs raft.RecoverCluster. The post-recovery snapshot may
+// land at a lower index than another voter's already-replicated log
+// tail (lagging captain, offline voter, stale ping); the instance-ID
+// watcher in noteLeaderInstanceID detects that fork on the next ping
+// from the recovered leader and resets the affected survivors, so the
+// captain decision no longer needs to factor in per-peer LastIndex.
 func (s *Cache) shouldRecoverQuorum(now time.Time, aliveCutoff time.Duration) bool {
 	if s.suffrage != raft.Voter {
 		return false
@@ -1050,25 +1081,6 @@ func (s *Cache) shouldRecoverQuorum(now time.Time, aliveCutoff time.Duration) bo
 		return false
 	}
 
-	// No leader, threshold already elapsed. Two more checks before we tear
-	// things down:
-	//
-	//  1. Count voters in the current config and how many are alive per
-	//     discovery (self counts as alive — we are running this code). If
-	//     enough are alive to form quorum, raft should be able to elect
-	//     on its own and recovery would just cause churn.
-	//  2. Pick a deterministic recovery captain — the alive voter with
-	//     the highest reported raft.LastIndex(), tie-broken by lowest ID
-	//     — so that with multiple stranded survivors only one runs
-	//     raft.RecoverCluster. Concurrent recovery on multiple peers
-	//     produces divergent snapshots that fail to converge. The
-	//     LastIndex preference (RT-12862) prevents a lagging captain
-	//     from defining the new cluster snapshot below a survivor's
-	//     already-replicated log tail, which would otherwise trap the
-	//     survivor in a snapshot-regression catchup loop. The other
-	//     survivors stay in the captain's new config and get pulled to
-	//     the recovered state via InstallSnapshot once the captain wins
-	//     its election.
 	scan, ok := s.scanVoters(now, aliveCutoff)
 	if !ok {
 		return false
@@ -1080,34 +1092,14 @@ func (s *Cache) shouldRecoverQuorum(now time.Time, aliveCutoff time.Duration) bo
 	if quorum <= len(scan.aliveVoters) {
 		return false
 	}
-	return electCaptain(scan.aliveVoters, raft.ServerID(s.localID)) == raft.ServerID(s.localID)
-}
 
-// electCaptain picks the recovery captain among the alive voters: the one
-// with the highest reported raft.LastIndex(), ties broken by lowest ID.
-// Starts the candidate at selfID so self wins on equal terms — matching
-// the "only replace when a peer strictly wins on (lastIndex, -ID)"
-// semantics the original loop encoded.
-func electCaptain(alive []aliveVoter, selfID raft.ServerID) raft.ServerID {
-	captain := selfID
-	var captainLast uint64
-	for _, v := range alive {
-		if v.id == selfID {
-			captainLast = v.lastIndex
-			break
+	lowest := raft.ServerID(s.localID)
+	for _, id := range scan.aliveVoters {
+		if id < lowest {
+			lowest = id
 		}
 	}
-	for _, v := range alive {
-		if v.id == selfID {
-			continue
-		}
-		if captainLast < v.lastIndex ||
-			(v.lastIndex == captainLast && v.id < captain) {
-			captain = v.id
-			captainLast = v.lastIndex
-		}
-	}
-	return captain
+	return lowest == raft.ServerID(s.localID)
 }
 
 func (s *Cache) raft() *raft.Raft {
@@ -1140,6 +1132,111 @@ func (s *Cache) setLastResetID(resetID string) {
 	defer s.raftMutex.Unlock()
 
 	s.lastResetID = resetID
+}
+
+// InstanceID returns this cache's current raft instance ID — a UUID that
+// identifies the consensus history line the local raft belongs to. Empty
+// until the cache has either bootstrapped its own cluster, run
+// recoverQuorum, or adopted a leader's ID from a discovery ping. Exposed
+// for tests and operational inspection.
+func (s *Cache) InstanceID() string {
+	return s.getInstanceID()
+}
+
+// getInstanceID returns this cache's current raft instance ID — see
+// InstanceID for the user-facing semantics.
+func (s *Cache) getInstanceID() string {
+	s.raftMutex.RLock()
+	defer s.raftMutex.RUnlock()
+
+	return s.instanceID
+}
+
+func (s *Cache) setInstanceID(id string) {
+	s.raftMutex.Lock()
+	defer s.raftMutex.Unlock()
+
+	s.instanceID = id
+}
+
+// noteLeaderInstanceID is called by the discovery layer for every received
+// ping (RT-12862). When the ping is from the peer that this node's local
+// raft currently considers leader (rft.LeaderWithID()), the local
+// instance ID is reconciled with the leader's:
+//
+//   - empty local ID → adopt the leader's silently. A node that has
+//     never bootstrapped or recovered has no consensus history of its
+//     own; it joins the cluster's history via normal replication.
+//   - matching local ID → already aligned, nothing to do.
+//   - different local ID → dispatch adoptLeaderInstance, which resets
+//     the local raft and adopts the leader's ID, discarding the forked
+//     in-memory log/snapshot that would otherwise trap this node in a
+//     snapshot-regression catchup loop on top of the leader's older
+//     snapshot.
+//
+// The leaderID gate is sufficient because rft.LeaderWithID() is the
+// authoritative current-leader cache from this node's own raft: a ping
+// from a peer that is not our raft's leader is filtered out before any
+// instance-ID comparison runs. Concurrent goroutines dispatched by
+// successive pings serialize on recoveryMutex inside
+// adoptLeaderInstance; the re-check under that lock turns redundant
+// dispatches into no-ops, so no separate debounce is needed.
+func (s *Cache) noteLeaderInstanceID(peerID raft.ServerID, peerInstanceID string) {
+	if peerInstanceID == "" {
+		return
+	}
+	if string(peerID) == s.localID {
+		return
+	}
+	rft := s.raft()
+	if rft == nil {
+		return
+	}
+	_, leaderID := rft.LeaderWithID()
+	if leaderID == "" || leaderID != peerID {
+		return
+	}
+
+	localID := s.getInstanceID()
+	if localID == peerInstanceID {
+		return
+	}
+	if localID == "" {
+		s.setInstanceID(peerInstanceID)
+		return
+	}
+
+	go s.adoptLeaderInstance(peerID, peerInstanceID)
+}
+
+// adoptLeaderInstance wipes the local raft stores and reinitializes raft
+// with the leader's instance ID, after which standard AddVoter /
+// InstallSnapshot replication brings this node back in line with the
+// post-recovery cluster (RT-12862). Serialized via recoveryMutex so a
+// concurrent quorum recovery or a second mismatch observation cannot
+// race the reset; re-checks the local instance ID under lock to skip
+// no-op resets.
+func (s *Cache) adoptLeaderInstance(leaderID raft.ServerID, leaderInstanceID string) {
+	s.recoveryMutex.Lock()
+	defer s.recoveryMutex.Unlock()
+
+	if s.getInstanceID() == leaderInstanceID {
+		return
+	}
+	if s.IsLeader() {
+		// Defensive: a node that is itself leader can't be on a forked
+		// history relative to "the leader". Skip.
+		return
+	}
+
+	s.logger.Warn("forked raft history detected; resetting to adopt leader instance",
+		"leader-id", leaderID,
+		"leader-instance-id", leaderInstanceID,
+		"local-instance-id", s.getInstanceID(),
+	)
+	if err := s.localReset(uuid.NewString(), leaderInstanceID); err != nil {
+		s.logger.Error("instance-id reset failed", "error", err)
+	}
 }
 
 func (s *Cache) getRaftWithCtx() (*raft.Raft, context.Context) {

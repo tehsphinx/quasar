@@ -143,7 +143,7 @@ func peerStatusToPB(status quasar.PeerStatus) *pb.RaftStatus {
 	return &pb.RaftStatus{
 		HasLeader:         status.HasLeader,
 		NumVotersInConfig: status.NumVotersInConfig,
-		LastIndex:         status.LastIndex,
+		InstanceId:        status.InstanceID,
 	}
 }
 
@@ -154,6 +154,6 @@ func peerStatusFromPB(pbStatus *pb.RaftStatus) quasar.PeerStatus {
 	return quasar.PeerStatus{
 		HasLeader:         pbStatus.GetHasLeader(),
 		NumVotersInConfig: pbStatus.GetNumVotersInConfig(),
-		LastIndex:         pbStatus.GetLastIndex(),
+		InstanceID:        pbStatus.GetInstanceId(),
 	}
 }

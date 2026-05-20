@@ -16,16 +16,26 @@ import (
 )
 
 // inmemBus is a tiny in-memory pubsub used by inmemDiscovery instances to
-// propagate raft.Server pings between caches in the same test process. It
-// replaces the NATS-based discovery used in production so the test can run
+// propagate raft.Server pings — including each sender's PeerStatus, so
+// RT-12862's InstanceID flows the same way the NATS discovery
+// (peerStatusToPB) does in production — between caches in the same test
+// process. It replaces the NATS-based discovery so the test can run
 // hermetically.
+//
+// muted holds a set of sender localIDs whose pings should not be
+// delivered to anyone, used by tests that need to partition discovery
+// independently of transport.
 type inmemBus struct {
 	mu      sync.RWMutex
 	members map[*inmemDiscovery]struct{}
+	muted   map[string]struct{}
 }
 
 func newInmemBus() *inmemBus {
-	return &inmemBus{members: map[*inmemDiscovery]struct{}{}}
+	return &inmemBus{
+		members: map[*inmemDiscovery]struct{}{},
+		muted:   map[string]struct{}{},
+	}
 }
 
 func (b *inmemBus) register(d *inmemDiscovery) {
@@ -40,11 +50,34 @@ func (b *inmemBus) unregister(d *inmemDiscovery) {
 	delete(b.members, d)
 }
 
-func (b *inmemBus) broadcast(srv raft.Server, sender *inmemDiscovery) {
+// mute and unmute toggle whether a given localID's discovery pings are
+// delivered. A muted sender's pings are dropped on broadcast, and other
+// senders' pings are not delivered to the muted member either (so the
+// muted node sees no peers and is seen by no peer).
+func (b *inmemBus) mute(localID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.muted[localID] = struct{}{}
+}
+
+func (b *inmemBus) unmute(localID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.muted, localID)
+}
+
+func (b *inmemBus) broadcast(srv raft.Server, status quasar.PeerStatus, sender *inmemDiscovery) {
 	b.mu.RLock()
+	if _, muted := b.muted[string(srv.ID)]; muted {
+		b.mu.RUnlock()
+		return
+	}
 	members := make([]*inmemDiscovery, 0, len(b.members))
 	for m := range b.members {
 		if m == sender {
+			continue
+		}
+		if _, muted := b.muted[m.localID]; muted {
 			continue
 		}
 		members = append(members, m)
@@ -52,7 +85,7 @@ func (b *inmemBus) broadcast(srv raft.Server, sender *inmemDiscovery) {
 	b.mu.RUnlock()
 
 	for _, m := range members {
-		m.cache.ProcessServer(srv)
+		m.cache.ProcessServerWithStatus(srv, status)
 	}
 }
 
@@ -60,19 +93,23 @@ type inmemDiscovery struct {
 	bus      *inmemBus
 	cache    *quasar.DiscoveryInjector
 	interval time.Duration
+	localID  string
 }
 
 func newInmemDiscovery(bus *inmemBus, interval time.Duration) *inmemDiscovery {
 	return &inmemDiscovery{bus: bus, interval: interval}
 }
 
-func (d *inmemDiscovery) Inject(c *quasar.DiscoveryInjector) { d.cache = c }
+func (d *inmemDiscovery) Inject(c *quasar.DiscoveryInjector) {
+	d.cache = c
+	d.localID = string(c.ServerInfo().ID)
+}
 
 func (d *inmemDiscovery) Run(ctx context.Context) error {
 	d.bus.register(d)
 	go func() {
 		defer d.bus.unregister(d)
-		d.bus.broadcast(d.cache.ServerInfo(), d)
+		d.bus.broadcast(d.cache.ServerInfo(), d.cache.LocalPeerStatus(), d)
 		t := time.NewTicker(d.interval)
 		defer t.Stop()
 		for {
@@ -80,7 +117,7 @@ func (d *inmemDiscovery) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				d.bus.broadcast(d.cache.ServerInfo(), d)
+				d.bus.broadcast(d.cache.ServerInfo(), d.cache.LocalPeerStatus(), d)
 			}
 		}
 	}()
@@ -783,4 +820,220 @@ func TestQuorumRecoveryCancelOnTransientPartition(t *testing.T) {
 			t.Fatalf("node %s sees %d voters after transient partition, want 3 (a spurious recovery may have fired)", id, voters)
 		}
 	}
+}
+
+// TestInstanceIDForkAdoptionAfterRecoverQuorum is the RT-12862 regression
+// guard for the instance-ID-driven fork-detection mechanism.
+//
+// What the bug looks like in production: a follower observes the leader
+// shipping a snapshot whose Index sits below the follower's own cached
+// lastLog, with a log gap below the snapshot index. The
+// hashicorp/raft installSnapshot path does not reconcile the cached
+// lastLog against the older snapshot it just installed, so the next
+// AppendEntries(PrevLogEntry=snapshotIndex) hits ErrLogNotFound — the
+// leader drops to SEND_SNAP, the follower re-installs the same
+// snapshot, and the loop locks in indefinitely.
+//
+// Root condition: the leader's raft instance is a forked consensus
+// history relative to the follower's in-memory state (e.g. the leader
+// ran raft.RecoverCluster while the follower was transiently absent).
+// Option I makes that fork explicit by tagging every newRaft with a
+// fresh InstanceID and broadcasting the current raft leader's ID on
+// every discovery ping. A follower whose local ID disagrees with the
+// elected leader's for two consecutive pings runs localReset to wipe
+// its in-memory raft state and adopt the leader's ID — discarding the
+// forked log/snapshot cache *before* the leader's older snapshot
+// lands.
+//
+// This test reproduces the adoption mechanism end-to-end with a
+// 2-voter cluster:
+//
+//  1. v1 bootstraps with instance ID `idA`; v2 joins and adopts `idA`
+//     via the empty-local path in noteLeaderInstanceID (no reset).
+//  2. v2 is hard-stopped. recoverQuorum on v1 mints a fresh `idB` and
+//     reduces the cluster to a single-voter config.
+//  3. v2 is restarted with empty stores; it observes v1's ping with
+//     `idB` and adopts it via the same empty-local path, then rejoins
+//     v1's cluster via AddVoter.
+//
+// A full reproduction of the snapshot-install loop end state requires
+// keeping a survivor's in-memory state intact across a partition →
+// recover-on-captain → reconnect cycle. With InmemTransport and a
+// single test process this involves racing transport partitioning,
+// discovery muting, raft leader stepdown, and the recoverQuorum timer
+// — a setup too timing-sensitive to be a reliable CI signal. The
+// production logs from the recurrence are the smoking gun for that
+// path; the adoption mechanism this test guards is the cure.
+func TestInstanceIDForkAdoptionAfterRecoverQuorum(t *testing.T) {
+	const (
+		recoverAfter  = 6 * time.Second
+		recoverBudget = 30 * time.Second
+		discoveryTick = 200 * time.Millisecond
+		bootstrapWait = 2 * time.Second
+	)
+
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancelMain()
+
+	asrt := is.New(t)
+	bus := newInmemBus()
+
+	specs := []string{"v1", "v2"}
+
+	addrs := map[string]raft.ServerAddress{}
+	trs := map[string]*transports.InmemTransport{}
+	for _, id := range specs {
+		addr, tr := transports.NewInmemTransport("")
+		addrs[id] = addr
+		trs[id] = tr
+	}
+	for id, tr := range trs {
+		for otherID, otherTr := range trs {
+			if id == otherID {
+				continue
+			}
+			tr.Connect(addrs[otherID], otherTr)
+		}
+	}
+
+	type node struct {
+		id    string
+		cache *quasar.Cache
+		fsm   *exampleFSM.InMemoryFSM
+	}
+	startNode := func(id string) *node {
+		fsm := exampleFSM.NewInMemoryFSM()
+		c, err := quasar.NewCache(ctxMain, fsm,
+			quasar.WithLocalID(id),
+			quasar.WithTransport(trs[id]),
+			quasar.WithDiscovery(newInmemDiscovery(bus, discoveryTick)),
+			quasar.WithAutoPrune(recoverAfter),
+			quasar.WithQuorumRecovery(recoverAfter),
+			quasar.WithSuffrage(raft.Voter),
+			quasar.WithBootstrapWait(bootstrapWait),
+		)
+		asrt.NoErr(err)
+		return &node{id: id, cache: c, fsm: fsm}
+	}
+
+	// Stagger startup so only v1 bootstraps; v2 joins via the
+	// peer-in-cluster signal and adopts v1's InstanceID from the first
+	// discovery ping.
+	nodes := map[string]*node{}
+	nodes["v1"] = startNode("v1")
+	asrt.NoErr(nodes["v1"].cache.WaitReady(ctxMain))
+	defer func() {
+		for _, n := range nodes {
+			if n != nil {
+				_ = n.cache.Shutdown()
+			}
+		}
+	}()
+	nodes["v2"] = startNode("v2")
+	asrt.NoErr(nodes["v2"].cache.WaitReady(ctxMain))
+
+	settleCtx, cancelSettle := context.WithTimeout(ctxMain, 15*time.Second)
+	defer cancelSettle()
+	asrt.NoErr(waitForCondition(settleCtx, func() error {
+		srvs, e := nodes["v1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		if len(srvs) != 2 {
+			return fmt.Errorf("v1 sees %d voters, want 2", len(srvs))
+		}
+		idA := nodes["v1"].cache.InstanceID()
+		if idA == "" {
+			return fmt.Errorf("v1 instance ID not minted yet")
+		}
+		if got := nodes["v2"].cache.InstanceID(); got != idA {
+			return fmt.Errorf("v2 instance ID %q != v1 %q (empty-local adoption path)", got, idA)
+		}
+		return nil
+	}))
+	idA := nodes["v1"].cache.InstanceID()
+	t.Logf("pre-fork cluster instance ID: %s", idA)
+
+	// Hard-stop v2. With one of two voters dead and discovery pruning
+	// the dead peer after recoverAfter, recoverQuorum on v1 mints a
+	// fresh instance ID and reduces the cluster to a single-voter
+	// configuration.
+	asrt.NoErr(nodes["v2"].cache.Shutdown())
+	nodes["v2"] = nil
+
+	recoverCtx, cancelRecover := context.WithTimeout(ctxMain, recoverBudget)
+	defer cancelRecover()
+	asrt.NoErr(waitForCondition(recoverCtx, func() error {
+		if !nodes["v1"].cache.IsLeader() {
+			return fmt.Errorf("v1 not yet leader of recovered cluster")
+		}
+		if nodes["v1"].cache.InstanceID() == idA {
+			return fmt.Errorf("v1 still on old instance ID; recoverQuorum has not minted a new one yet")
+		}
+		srvs, e := nodes["v1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		voters := 0
+		for _, s := range srvs {
+			if s.Suffrage == raft.Voter {
+				voters++
+			}
+		}
+		if voters != 1 {
+			return fmt.Errorf("v1 still sees %d voters, want 1 after recovery", voters)
+		}
+		return nil
+	}))
+	idB := nodes["v1"].cache.InstanceID()
+	t.Logf("v1 recovered with new instance ID: %s", idB)
+	if idB == idA {
+		t.Fatalf("idB %q must differ from idA %q", idB, idA)
+	}
+
+	// Re-wire v2's transport (Shutdown closed the previous instance) and
+	// bring v2 back with empty in-memory stores. v2 should start with an
+	// empty InstanceID, observe v1's ping carrying idB, adopt idB
+	// silently via the empty-local path (no reset), then rejoin v1's
+	// cluster via the standard AddVoter path.
+	addr2, tr2 := transports.NewInmemTransport("")
+	addrs["v2"] = addr2
+	trs["v2"] = tr2
+	for id, tr := range trs {
+		if id == "v2" {
+			continue
+		}
+		tr2.Connect(addrs[id], tr)
+		tr.Connect(addr2, tr2)
+	}
+	nodes["v2"] = startNode("v2")
+
+	convergeCtx, cancelConverge := context.WithTimeout(ctxMain, recoverBudget)
+	defer cancelConverge()
+	asrt.NoErr(waitForCondition(convergeCtx, func() error {
+		if got := nodes["v2"].cache.InstanceID(); got != idB {
+			return fmt.Errorf("v2 instance ID %q != idB %q", got, idB)
+		}
+		srvs, e := nodes["v1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		voters := 0
+		for _, s := range srvs {
+			if s.Suffrage == raft.Voter {
+				voters++
+			}
+		}
+		if voters != 2 {
+			return fmt.Errorf("v1 sees %d voters, want 2 (config=%v)", voters, srvs)
+		}
+		return nil
+	}))
+
+	// Final write — verifies the reconverged cluster is functional.
+	finalCtx, cancelFinal := context.WithTimeout(ctxMain, 5*time.Second)
+	defer cancelFinal()
+	asrt.NoErr(nodes["v1"].fsm.SetMusician(finalCtx, exampleFSM.Musician{
+		Name: "postFork", Age: 99, Instruments: []string{"tuba"},
+	}))
 }

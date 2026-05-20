@@ -25,11 +25,14 @@ message RaftStatus {
   bool has_leader = 1;
   // Indicates the number of voters in the sender's raft cluster.
   uint32 num_voters_in_config = 2;
-  // Sender's local raft.LastIndex() at the moment the ping was emitted.
-  // Used by the quorum-recovery captain selection (RT-12862) to prefer
-  // the most up-to-date alive voter as captain, so a recovered single-voter
-  // cluster never has its snapshot regressed behind a survivor's log.
-  uint64 last_index = 3;
+  // Identifies the sender's local raft instance — a UUID minted whenever
+  // the cache creates a new raft via NewCache or recoverQuorum, adopted
+  // by localReset when the leader's value is observed. A follower whose
+  // local instance ID differs from the current leader's reported value
+  // is sitting on a forked consensus history and must localReset before
+  // the leader's older snapshot lands on top of its stale log cache
+  // (RT-12862).
+  string instance_id = 3;
 }
 
 enum ServerSuffrage {
