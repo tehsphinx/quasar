@@ -387,6 +387,13 @@ func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.Ser
 
 	addr, id := s.raft().LeaderWithID()
 	if id == "" {
+		// Fail fast when quorum can't currently form. Waiting up to
+		// noLeaderTimeout would just delay an inevitable timeout — no
+		// election can complete without quorum, and recovery (if
+		// configured) runs on its own clock.
+		if !s.quorumReachable(time.Now(), s.aliveCutoff()) {
+			return "", "", ErrNoLeader
+		}
 		if r := s.waitForLeader(ctx); r != nil {
 			return "", "", r
 		}
@@ -702,13 +709,9 @@ func (s *Cache) runQuorumRecoveryWatch(ctx context.Context) {
 	// Alive-window for "is this peer dead per discovery". Decoupled from
 	// recoverQuorumAfter: the recovery threshold is a deliberate safety
 	// buffer against flaps, but it does not need to also be the cutoff for
-	// "we last saw the peer ping this recently". When auto-prune is
-	// configured, pruneAfter is the canonical dead-peer threshold; fall
-	// back to recoverQuorumAfter only if pruneAfter is zero.
-	aliveCutoff := s.cfg.pruneAfter
-	if aliveCutoff <= 0 {
-		aliveCutoff = after
-	}
+	// "we last saw the peer ping this recently". Same resolution as
+	// getLeaderWait so the shedder and the recovery captain agree.
+	aliveCutoff := s.aliveCutoff()
 
 	for {
 		rft, ctxRaft := s.getRaftWithCtx()
@@ -933,6 +936,102 @@ func (s *Cache) recoverQuorum() error {
 	return nil
 }
 
+// aliveVoter is one entry in a voterScan's alive list.
+type aliveVoter struct {
+	id        raft.ServerID
+	lastIndex uint64
+}
+
+// voterScan summarizes the current raft voter configuration measured
+// against discovery's alive picture. configVoters counts every voter in
+// the configuration; aliveVoters lists only voters confirmed alive within
+// the caller's aliveCutoff window (self is always included with
+// rft.LastIndex()). selfIsVoter records whether the local node is a voter
+// in the configuration.
+type voterScan struct {
+	configVoters int
+	aliveVoters  []aliveVoter
+	selfIsVoter  bool
+}
+
+// scanVoters walks the current raft voter configuration and queries
+// discovery for per-peer liveness within aliveCutoff. Returns ok=false when
+// the raft configuration is unavailable (raft not yet wired up or
+// GetConfiguration errored) so callers can fall back to a safe default
+// instead of acting on a partial picture.
+func (s *Cache) scanVoters(now time.Time, aliveCutoff time.Duration) (voterScan, bool) {
+	rft := s.raft()
+	if rft == nil {
+		return voterScan{}, false
+	}
+	cfgFut := rft.GetConfiguration()
+	if err := cfgFut.Error(); err != nil {
+		return voterScan{}, false
+	}
+
+	pruneBefore := now.Add(-aliveCutoff)
+	selfLastIndex := rft.LastIndex()
+
+	var scan voterScan
+	for _, srv := range cfgFut.Configuration().Servers {
+		if srv.Suffrage != raft.Voter {
+			continue
+		}
+		scan.configVoters++
+		if string(srv.ID) == s.localID {
+			scan.selfIsVoter = true
+			scan.aliveVoters = append(scan.aliveVoters, aliveVoter{id: srv.ID, lastIndex: selfLastIndex})
+			continue
+		}
+		lastIndex, alive := s.discovery.isAliveSince(srv.ID, pruneBefore)
+		if !alive {
+			continue
+		}
+		scan.aliveVoters = append(scan.aliveVoters, aliveVoter{id: srv.ID, lastIndex: lastIndex})
+	}
+	return scan, true
+}
+
+// aliveCutoff resolves the discovery-side "this peer is still alive" window
+// the same way runQuorumRecoveryWatch does, so the request-shedding path in
+// getLeaderWait and the recovery captain operate on the same view.
+func (s *Cache) aliveCutoff() time.Duration {
+	if s.cfg.pruneAfter > 0 {
+		return s.cfg.pruneAfter
+	}
+	if s.cfg.recoverQuorumAfter > 0 {
+		return s.cfg.recoverQuorumAfter
+	}
+	return noLeaderTimeout
+}
+
+// quorumReachable reports whether enough voters are alive (per discovery)
+// to form a quorum on the current raft voter configuration. Returns true
+// in any "no information" case (raft not ready, no configured voters, no
+// discovery configured) so the caller falls back to its normal wait
+// rather than aborting on a partial picture. Returns false only when we
+// have concrete evidence quorum cannot currently form — the signal
+// getLeaderWait uses to fail fast instead of waiting noLeaderTimeout for
+// an election that cannot happen.
+//
+// Discovery is the sole feed for the per-peer liveness signal: when it
+// is not configured (e.g. static WithServers setups), lastSeen stays
+// empty by construction and a reachability call would be meaningless.
+func (s *Cache) quorumReachable(now time.Time, aliveCutoff time.Duration) bool {
+	if s.cfg.discovery == nil {
+		return true
+	}
+	scan, ok := s.scanVoters(now, aliveCutoff)
+	if !ok {
+		return true
+	}
+	if scan.configVoters == 0 {
+		return true
+	}
+	quorum := scan.configVoters/2 + 1
+	return quorum <= len(scan.aliveVoters)
+}
+
 // shouldRecoverQuorum returns true when this voter is stranded and the
 // recovery procedure should run. The leaderless-duration threshold is the
 // caller's responsibility (the recovery watcher arms a time.Timer for that);
@@ -970,65 +1069,45 @@ func (s *Cache) shouldRecoverQuorum(now time.Time, aliveCutoff time.Duration) bo
 	//     survivors stay in the captain's new config and get pulled to
 	//     the recovered state via InstallSnapshot once the captain wins
 	//     its election.
-	rft := s.raft()
-	if rft == nil {
+	scan, ok := s.scanVoters(now, aliveCutoff)
+	if !ok {
 		return false
 	}
-	cfgFut := rft.GetConfiguration()
-	if err := cfgFut.Error(); err != nil {
+	if !scan.selfIsVoter || scan.configVoters == 0 {
 		return false
 	}
+	quorum := scan.configVoters/2 + 1
+	if quorum <= len(scan.aliveVoters) {
+		return false
+	}
+	return electCaptain(scan.aliveVoters, raft.ServerID(s.localID)) == raft.ServerID(s.localID)
+}
 
-	var (
-		configVoters     int
-		aliveVoters      int
-		selfInConfig     bool
-		captain          = s.localID
-		captainLastIndex = rft.LastIndex()
-		pruneBefore      = now.Add(-aliveCutoff)
-	)
-	for _, srv := range cfgFut.Configuration().Servers {
-		if srv.Suffrage != raft.Voter {
-			continue
-		}
-		configVoters++
-		var (
-			alive     bool
-			lastIndex uint64
-		)
-		if string(srv.ID) == s.localID {
-			selfInConfig = true
-			alive = true
-			lastIndex = captainLastIndex
-		} else {
-			lastIndex, alive = s.discovery.isAliveSince(srv.ID, pruneBefore)
-		}
-		if !alive {
-			continue
-		}
-		aliveVoters++
-		if string(srv.ID) == s.localID {
-			continue
-		}
-		// Prefer the alive voter with the highest reported LastIndex; on
-		// ties, prefer the lowest ID. Initial captain is self, so we
-		// only replace when a peer strictly wins on (lastIndex, -ID).
-		if captainLastIndex < lastIndex  ||
-			(lastIndex == captainLastIndex && string(srv.ID) < captain) {
-			captain = string(srv.ID)
-			captainLastIndex = lastIndex
+// electCaptain picks the recovery captain among the alive voters: the one
+// with the highest reported raft.LastIndex(), ties broken by lowest ID.
+// Starts the candidate at selfID so self wins on equal terms — matching
+// the "only replace when a peer strictly wins on (lastIndex, -ID)"
+// semantics the original loop encoded.
+func electCaptain(alive []aliveVoter, selfID raft.ServerID) raft.ServerID {
+	captain := selfID
+	var captainLast uint64
+	for _, v := range alive {
+		if v.id == selfID {
+			captainLast = v.lastIndex
+			break
 		}
 	}
-	if !selfInConfig || configVoters == 0 {
-		// Either we are not in the configuration as a voter (degenerate),
-		// or there is nothing to recover. Skip.
-		return false
+	for _, v := range alive {
+		if v.id == selfID {
+			continue
+		}
+		if captainLast < v.lastIndex ||
+			(v.lastIndex == captainLast && v.id < captain) {
+			captain = v.id
+			captainLast = v.lastIndex
+		}
 	}
-	quorum := configVoters/2 + 1
-	if quorum <= aliveVoters {
-		return false
-	}
-	return captain == s.localID
+	return captain
 }
 
 func (s *Cache) raft() *raft.Raft {
