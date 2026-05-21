@@ -28,10 +28,19 @@ func newRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, stableStore raft
 
 // raftConfig returns the raft.Config to use for this cache, applying the
 // quasar-level overrides on top of the user-supplied or default raft config.
+//
+// When the caller did not supply a *raft.Config, PreVote is forced off to keep
+// behaviour stable on mixed-version clusters (peers without the prevote subject
+// would respond with nats.ErrNoResponders, which raft v1.7.x records as
+// Granted=false, preventing pre-vote quorum). Operators that want PreVote on
+// pass a *raft.Config via WithRaftConfig with PreVoteDisabled left at its
+// zero value (false) — and do so only once every voter is on a build that
+// implements the WithPreVote transport.
 func raftConfig(cfg options) *raft.Config {
 	conf := cfg.raftConfig
 	if conf == nil {
 		conf = raft.DefaultConfig()
+		conf.PreVoteDisabled = true
 	}
 	conf.LocalID = raft.ServerID(cfg.localID)
 	conf.Logger = cfg.getLogger()

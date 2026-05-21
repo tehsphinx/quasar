@@ -139,8 +139,9 @@ func (i *InmemTransport) RemoveServer(ctx context.Context, _ raft.ServerID, targ
 }
 
 var (
-	_ raft.Transport = (*InmemTransport)(nil)
-	_ Transport      = (*InmemTransport)(nil)
+	_ raft.Transport   = (*InmemTransport)(nil)
+	_ Transport        = (*InmemTransport)(nil)
+	_ raft.WithPreVote = (*InmemTransport)(nil)
 )
 
 // NewInmemTransportWithTimeout is used to initialize a new transport and
@@ -232,6 +233,24 @@ func (i *InmemTransport) RequestVote(_ raft.ServerID, target raft.ServerAddress,
 	// Copy the result back
 	//nolint:forcetypeassert // can't be anything else.
 	out := rpcResp.Response.(*raft.RequestVoteResponse)
+	*resp = *out
+	return nil
+}
+
+// RequestPreVote implements the raft.WithPreVote interface.
+func (i *InmemTransport) RequestPreVote(_ raft.ServerID, target raft.ServerAddress, args *raft.RequestPreVoteRequest,
+	resp *raft.RequestPreVoteResponse,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), i.timeout)
+	defer cancel()
+
+	rpcResp, err := i.makeRPC(ctx, target, args, nil, consumeRaft)
+	if err != nil {
+		return err
+	}
+
+	//nolint:forcetypeassert // can't be anything else.
+	out := rpcResp.Response.(*raft.RequestPreVoteResponse)
 	*resp = *out
 	return nil
 }

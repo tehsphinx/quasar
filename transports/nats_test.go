@@ -232,6 +232,74 @@ func TestNATSTransport_RequestVote(t *testing.T) {
 	}
 }
 
+func TestNATSTransport_RequestPreVote(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	trans1, err := makeNATSTransport(ctx, t, "test-cache", "server1")
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	defer func() {
+		if trans1 != nil {
+			trans1.conn.Close()
+		}
+	}()
+
+	rpcCh := trans1.Consumer()
+
+	args := raft.RequestPreVoteRequest{
+		Term:         42,
+		LastLogIndex: 200,
+		LastLogTerm:  41,
+		RPCHeader:    raft.RPCHeader{Addr: []byte("butters")},
+	}
+
+	resp := raft.RequestPreVoteResponse{
+		Term:      42,
+		Granted:   true,
+		RPCHeader: raft.RPCHeader{Addr: []byte("stan")},
+	}
+
+	go func() {
+		select {
+		case rpc := <-rpcCh:
+			req, ok := rpc.Command.(*raft.RequestPreVoteRequest)
+			if !ok {
+				t.Errorf("unexpected command type %T", rpc.Command)
+				return
+			}
+			if !reflect.DeepEqual(req, &args) {
+				t.Errorf("command mismatch: %#v %#v", *req, args)
+				return
+			}
+			rpc.Respond(&resp, nil)
+		case <-time.After(200 * time.Millisecond):
+			t.Errorf("timeout")
+			return
+		}
+	}()
+
+	trans2, err := makeNATSTransport(ctx, t, "test-cache", "server2")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer func() {
+		if trans2 != nil {
+			trans2.conn.Close()
+		}
+	}()
+
+	var out raft.RequestPreVoteResponse
+	if err := trans2.RequestPreVote("id1", trans1.LocalAddr(), &args, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if !reflect.DeepEqual(resp, out) {
+		t.Fatalf("command mismatch: %#v %#v", resp, out)
+	}
+}
+
 func TestNATSTransport_TimeoutNow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

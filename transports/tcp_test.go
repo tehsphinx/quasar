@@ -598,6 +598,66 @@ func TestNetworkTransport_RequestVote(t *testing.T) {
 	}
 }
 
+func TestNetworkTransport_RequestPreVote(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for _, useAddrProvider := range []bool{true, false} {
+		trans1, err := makeTransport(ctx, t, useAddrProvider, "localhost:0")
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		defer trans1.Close()
+		rpcCh := trans1.Consumer()
+
+		args := raft.RequestPreVoteRequest{
+			Term:         42,
+			LastLogIndex: 200,
+			LastLogTerm:  41,
+			RPCHeader:    raft.RPCHeader{Addr: []byte("butters")},
+		}
+
+		resp := raft.RequestPreVoteResponse{
+			Term:    42,
+			Granted: true,
+		}
+
+		go func() {
+			select {
+			case rpc := <-rpcCh:
+				req, ok := rpc.Command.(*raft.RequestPreVoteRequest)
+				if !ok {
+					t.Errorf("unexpected command type %T", rpc.Command)
+					return
+				}
+				if !reflect.DeepEqual(req, &args) {
+					t.Errorf("command mismatch: %#v %#v", *req, args)
+					return
+				}
+				rpc.Respond(&resp, nil)
+			case <-time.After(200 * time.Millisecond):
+				t.Errorf("timeout")
+				return
+			}
+		}()
+
+		trans2, err := makeTransport(ctx, t, useAddrProvider, string(trans1.LocalAddr()))
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		defer trans2.Close()
+
+		var out raft.RequestPreVoteResponse
+		if err := trans2.RequestPreVote("id1", trans1.LocalAddr(), &args, &out); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		if !reflect.DeepEqual(resp, out) {
+			t.Fatalf("command mismatch: %#v %#v", resp, out)
+		}
+	}
+}
+
 func TestNetworkTransport_InstallSnapshot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

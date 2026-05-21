@@ -75,6 +75,27 @@ message RequestVoteResponse {
   bool granted = 4;
 }
 
+message RequestPreVoteRequest {
+  RPCHeader header = 1;
+
+  // Provide the term and our id
+  uint64 term = 2;
+
+  // Used to ensure safety
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RequestPreVoteResponse {
+  RPCHeader header = 1;
+
+  // Newer term if leader is out of date.
+  uint64 term = 2;
+
+  // Is the pre-vote granted.
+  bool granted = 3;
+}
+
 message InstallSnapshotRequest {
   RPCHeader header = 1;
   uint32 snapshot_version = 6;

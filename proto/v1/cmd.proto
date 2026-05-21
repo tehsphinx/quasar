@@ -19,6 +19,7 @@ message Command {
     RequestVoteRequest request_vote = 4;
     InstallSnapshotRequest install_snapshot = 5;
     TimeoutNowRequest timeout_now = 6;
+    RequestPreVoteRequest request_pre_vote = 10;
   }
 }
 
@@ -36,6 +37,7 @@ message CommandResponse {
     RequestVoteResponse request_vote = 4;
     InstallSnapshotResponse install_snapshot = 5;
     TimeoutNowResponse timeout_now = 6;
+    RequestPreVoteResponse request_pre_vote = 10;
   }
 }
 

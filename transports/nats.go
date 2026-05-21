@@ -20,6 +20,12 @@ const (
 	base10            = 10
 )
 
+var (
+	_ Transport        = (*NATSTransport)(nil)
+	_ raft.Transport   = (*NATSTransport)(nil)
+	_ raft.WithPreVote = (*NATSTransport)(nil)
+)
+
 // NewNATSTransport creates a new NATS based transport.
 func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverName string, opts ...NATSOption) (*NATSTransport, error) {
 	config := getNATSOptions(opts)
@@ -78,6 +84,10 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	subPreVote, err := s.conn.Subscribe(subjPrefix+".request.prevote", s.handlePreVote(ctx))
+	if err != nil {
+		return err
+	}
 	subStore, err := s.conn.Subscribe(subjPrefix+".cache.store", s.handleStore(ctx))
 	if err != nil {
 		return err
@@ -108,6 +118,7 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 		_ = subEntries.Unsubscribe()
 		_ = subHeartbeat.Unsubscribe()
 		_ = subVote.Unsubscribe()
+		_ = subPreVote.Unsubscribe()
 		_ = subStore.Unsubscribe()
 		_ = subResetCache.Unsubscribe()
 		_ = subRemoveServer.Unsubscribe()
@@ -541,6 +552,57 @@ func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress,
 
 	*resp = *protoResp.GetRequestVote().Convert()
 	return nil
+}
+
+// RequestPreVote sends the appropriate RPC to the target node.
+//
+// Implements raft.WithPreVote.
+func (s *NATSTransport) RequestPreVote(_ raft.ServerID, address raft.ServerAddress, request *raft.RequestPreVoteRequest,
+	resp *raft.RequestPreVoteResponse,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
+	subj := fmt.Sprintf("quasar.%s.%s.request.prevote", s.cacheName, address)
+
+	var protoResp pb.CommandResponse
+	if err := s.requestSmall(ctx, subj, pb.ToRequestPreVoteRequest(request), &protoResp); err != nil {
+		return err
+	}
+
+	*resp = *protoResp.GetRequestPreVote().Convert()
+	return nil
+}
+
+func (s *NATSTransport) handlePreVote(ctx context.Context) func(*nats.Msg) {
+	return func(msg *nats.Msg) {
+		var protoMsg pb.RequestPreVoteRequest
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+			s.handleError(msg, fmt.Errorf("failed to decode incoming command: %w", r))
+			return
+		}
+
+		chResp := make(chan raft.RPCResponse, 1)
+		rpc := raft.RPC{
+			RespChan: chResp,
+			Command:  protoMsg.Convert(),
+		}
+
+		s.chConsume <- rpc
+
+		bts, err := s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
+			resp, _ := i.(*raft.RequestPreVoteResponse)
+			return &pb.CommandResponse{Resp: &pb.CommandResponse_RequestPreVote{RequestPreVote: pb.ToRequestPreVoteResponse(resp)}}
+		})
+		if err != nil {
+			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
+			return
+		}
+
+		if r := msg.Respond(bts); r != nil {
+			s.logger.Error("failed to send response", "error", r)
+		}
+	}
 }
 
 func (s *NATSTransport) handleVote(ctx context.Context) func(*nats.Msg) {

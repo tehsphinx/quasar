@@ -117,6 +117,44 @@ func (x *RequestVoteResponse) Convert() *raft.RequestVoteResponse {
 	}
 }
 
+// ToRequestPreVoteRequest converts the *raft.RequestPreVoteRequest to a *pb.RequestPreVoteRequest.
+func ToRequestPreVoteRequest(in *raft.RequestPreVoteRequest) *RequestPreVoteRequest {
+	return &RequestPreVoteRequest{
+		Header:       ToRPCHeader(in.GetRPCHeader()),
+		Term:         in.Term,
+		LastLogIndex: in.LastLogIndex,
+		LastLogTerm:  in.LastLogTerm,
+	}
+}
+
+// Convert converts the *pb.RequestPreVoteRequest to a *raft.RequestPreVoteRequest.
+func (x *RequestPreVoteRequest) Convert() *raft.RequestPreVoteRequest {
+	return &raft.RequestPreVoteRequest{
+		RPCHeader:    x.GetHeader().Convert(),
+		Term:         x.GetTerm(),
+		LastLogIndex: x.GetLastLogIndex(),
+		LastLogTerm:  x.GetLastLogTerm(),
+	}
+}
+
+// ToRequestPreVoteResponse converts the *raft.RequestPreVoteResponse to a *pb.RequestPreVoteResponse.
+func ToRequestPreVoteResponse(in *raft.RequestPreVoteResponse) *RequestPreVoteResponse {
+	return &RequestPreVoteResponse{
+		Header:  ToRPCHeader(in.GetRPCHeader()),
+		Term:    in.Term,
+		Granted: in.Granted,
+	}
+}
+
+// Convert converts the *pb.RequestPreVoteResponse to a *raft.RequestPreVoteResponse.
+func (x *RequestPreVoteResponse) Convert() *raft.RequestPreVoteResponse {
+	return &raft.RequestPreVoteResponse{
+		RPCHeader: x.GetHeader().Convert(),
+		Term:      x.GetTerm(),
+		Granted:   x.GetGranted(),
+	}
+}
+
 // ToInstallSnapshotRequest converts the *raft.InstallSnapshotRequest to a *pb.InstallSnapshotRequest.
 func ToInstallSnapshotRequest(in *raft.InstallSnapshotRequest) *InstallSnapshotRequest {
 	return &InstallSnapshotRequest{

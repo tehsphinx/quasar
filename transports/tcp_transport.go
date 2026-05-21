@@ -27,6 +27,11 @@ const (
 	rpcLatestUID
 	rpcResetCache
 	rpcRemoveServer
+	// rpcRequestPreVote is appended after the existing constants instead of
+	// matching hashicorp/raft's net_transport.go position (=4) so the on-wire
+	// byte tags of the prior quasar RPCs (rpcStore..rpcRemoveServer) stay
+	// stable for nodes still on the previous build.
+	rpcRequestPreVote
 
 	// connReceiveBufferSize is the size of the buffer we will use for reading RPC requests into
 	// on followers.
@@ -100,8 +105,9 @@ func getConfig(stream raft.StreamLayer, cfg tcpOptions) *raft.NetworkTransportCo
 }
 
 var (
-	_ Transport      = (*TCPTransport)(nil)
-	_ raft.Transport = (*TCPTransport)(nil)
+	_ Transport        = (*TCPTransport)(nil)
+	_ raft.Transport   = (*TCPTransport)(nil)
+	_ raft.WithPreVote = (*TCPTransport)(nil)
 )
 
 // TCPTransport provides a network based transport that can be
@@ -413,6 +419,16 @@ func (s *TCPTransport) RequestVote(id raft.ServerID, target raft.ServerAddress, 
 	return s.genericRPC(ctx, id, target, rpcRequestVote, args, resp)
 }
 
+// RequestPreVote implements the raft.WithPreVote interface.
+func (s *TCPTransport) RequestPreVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestPreVoteRequest,
+	resp *raft.RequestPreVoteResponse,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
+	return s.genericRPC(ctx, id, target, rpcRequestPreVote, args, resp)
+}
+
 // genericRPC handles a simple request/response RPC.
 func (s *TCPTransport) genericRPC(ctx context.Context, id raft.ServerID, target raft.ServerAddress, rpcType uint8,
 	args interface{}, resp interface{},
@@ -627,6 +643,13 @@ func (s *TCPTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, enc *c
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "RequestVote"}}
+	case rpcRequestPreVote:
+		var req raft.RequestPreVoteRequest
+		if err := dec.Decode(&req); err != nil {
+			return err
+		}
+		rpc.Command = &req
+		labels = []metrics.Label{{Name: "rpcType", Value: "RequestPreVote"}}
 	case rpcInstallSnapshot:
 		var req raft.InstallSnapshotRequest
 		if err := dec.Decode(&req); err != nil {
