@@ -248,6 +248,7 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 			case observation := <-chPeerChange:
 				switch obs := observation.Data.(type) {
 				case raft.PeerObservation:
+					s.cache.invalidateQuorumProbeCache()
 					if obs.Removed {
 						if obs.Peer.Suffrage == raft.Voter {
 							// Is the equivalent of decreasing by 1.
@@ -262,6 +263,7 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 					}
 					s.setApplied(obs.Peer.ID)
 				case raft.LeaderObservation:
+					s.cache.invalidateQuorumProbeCache()
 					if obs.LeaderID != raft.ServerID(s.cache.localID) {
 						continue
 					}

@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	applyTimout            = 5 * time.Second
+	applyTimeout           = 5 * time.Second
 	defaultNoLeaderTimeout = 8 * time.Second
 	observationChanSize    = 5
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
@@ -29,6 +29,12 @@ const (
 	// latency on a leaderless-but-healthy request (during a normal
 	// election) is negligible compared to noLeaderTimeout.
 	quorumProbeTimeout = 250 * time.Millisecond
+	// quorumProbeCacheTTL caps how long a probe result is reused before
+	// the next leaderless request triggers a fresh probe. Event-based
+	// invalidation (PeerObservation / LeaderObservation) is the primary
+	// mechanism; the TTL is the safety net for the case where a peer
+	// recovers without an accompanying raft observation.
+	quorumProbeCacheTTL = 4 * time.Second
 )
 
 var (
@@ -225,6 +231,14 @@ type Cache struct {
 	suffrage  raft.ServerSuffrage
 	logger    hclog.Logger
 
+	// quorumProbe* cache the last quorumProbeReachable result so a burst
+	// of leaderless requests doesn't re-fan-out one LatestUID RPC per
+	// voter per call. quorumProbeAt zero means "no cached value";
+	// invalidateQuorumProbeCache resets it on raft Peer/Leader changes.
+	quorumProbeM       sync.Mutex
+	quorumProbeAt      time.Time
+	quorumProbeReached bool
+
 	ctx   context.Context
 	close context.CancelFunc
 }
@@ -311,7 +325,7 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 		return nil, 0, fmt.Errorf("failed to marshal command: %w", err)
 	}
 
-	fut := s.raft().Apply(bts, getTimeout(ctx, applyTimout))
+	fut := s.raft().Apply(bts, getTimeout(ctx, applyTimeout))
 	if r := fut.Error(); r != nil {
 		return nil, 0, fmt.Errorf("applying failed with: %w", r)
 	}
@@ -1043,10 +1057,25 @@ func (s *Cache) aliveCutoff() time.Duration {
 // any peer regardless of leadership (see consume) — making it a free
 // liveness probe without a dedicated RPC.
 //
+// Concurrent callers serialize on quorumProbeM and share the result
+// via the cache so a burst of leaderless requests pays one probe burst,
+// not one per call. The cache is invalidated on raft Peer/Leader
+// observations (see invalidateQuorumProbeCache) and expires after
+// quorumProbeCacheTTL as a safety net when a peer recovers without an
+// accompanying raft event.
+//
 // Returns true ("no information" fallback to the normal leader wait)
-// when raft is not ready, the configuration is unavailable, or no
-// voters are configured.
+// when raft is not ready or the configuration is unavailable; these
+// transient/structural cases are not cached because re-checking is
+// cheap and the cached state could mask a fast recovery.
 func (s *Cache) quorumProbeReachable(ctx context.Context, timeout time.Duration) bool {
+	s.quorumProbeM.Lock()
+	defer s.quorumProbeM.Unlock()
+
+	if !s.quorumProbeAt.IsZero() && time.Since(s.quorumProbeAt) < quorumProbeCacheTTL {
+		return s.quorumProbeReached
+	}
+
 	rft := s.raft()
 	if rft == nil {
 		// local raft might be re-initialising. Wait a bit.
@@ -1064,6 +1093,17 @@ func (s *Cache) quorumProbeReachable(ctx context.Context, timeout time.Duration)
 			voters = append(voters, srv)
 		}
 	}
+	reached := s.probeVoters(ctx, timeout, voters)
+	s.quorumProbeReached = reached
+	s.quorumProbeAt = time.Now()
+	return reached
+}
+
+// probeVoters fans out a short-timeout LatestUID RPC to each non-self
+// voter and reports whether enough respond to form a quorum. Self
+// counts as alive when present in the voter set. Returns false when
+// the voter set is empty (no quorum is possible without voters).
+func (s *Cache) probeVoters(ctx context.Context, timeout time.Duration, voters []raft.Server) bool {
 	if len(voters) == 0 {
 		return false
 	}
@@ -1096,6 +1136,20 @@ func (s *Cache) quorumProbeReachable(ctx context.Context, timeout time.Duration)
 		}
 	}
 	return false
+}
+
+// invalidateQuorumProbeCache marks the cached quorumProbeReachable
+// result as stale so the next call re-probes. Called from the raft
+// observation goroutine when a Peer or Leader event changes the
+// reachability picture (voter added/removed, leader elected or
+// stepped down). May briefly contend with an in-flight probe; the
+// observer's chPeerChange is non-blocking so any event dropped while
+// the cache mutex is held will be corrected on the next event or by
+// the TTL.
+func (s *Cache) invalidateQuorumProbeCache() {
+	s.quorumProbeM.Lock()
+	s.quorumProbeAt = time.Time{}
+	s.quorumProbeM.Unlock()
 }
 
 // recovery procedure should run. The leaderless-duration threshold is the
