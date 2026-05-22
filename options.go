@@ -36,6 +36,7 @@ type options struct {
 	pruneAfter         time.Duration
 	recoverQuorumAfter time.Duration
 	bootstrapWait      time.Duration
+	noLeaderTimeout    time.Duration
 	hclogLogger        hclog.Logger
 	slogLogger         *slog.Logger
 
@@ -48,6 +49,7 @@ func getOptions(opts []Option) options {
 		cacheName: "quasar",
 		localID:   uuid.NewString(),
 		suffrage:  raft.Voter,
+		noLeaderTimeout: defaultNoLeaderTimeout,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -233,6 +235,17 @@ func WithQuorumRecovery(after time.Duration) Option {
 func WithBootstrapWait(after time.Duration) Option {
 	return func(o *options) {
 		o.bootstrapWait = after
+	}
+}
+
+// WithNoLeaderTimeout overrides how long applyRemote waits for a leader to be
+// elected before returning ErrNoLeader. Also used as the final fallback for the
+// discovery alive-window when neither WithAutoPrune nor WithQuorumRecovery is
+// set, so the request-shedding path and the recovery captain stay aligned.
+// A zero value keeps the built-in default.
+func WithNoLeaderTimeout(timeout time.Duration) Option {
+	return func(o *options) {
+		o.noLeaderTimeout = timeout
 	}
 }
 

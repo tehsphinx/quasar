@@ -19,9 +19,9 @@ import (
 )
 
 const (
-	applyTimout         = 5 * time.Second
-	noLeaderTimeout     = 8 * time.Second
-	observationChanSize = 5
+	applyTimout            = 5 * time.Second
+	defaultNoLeaderTimeout = 8 * time.Second
+	observationChanSize    = 5
 )
 
 var (
@@ -386,7 +386,7 @@ func (s *Cache) applyRemote(ctx context.Context, command *pb.Command) (*pb.Comma
 }
 
 func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.ServerID, error) {
-	ctx, cancel := context.WithTimeout(ctx, noLeaderTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.noLeaderTimeout)
 	defer cancel()
 
 	addr, id := s.raft().LeaderWithID()
@@ -1023,7 +1023,7 @@ func (s *Cache) aliveCutoff() time.Duration {
 	if s.cfg.recoverQuorumAfter > 0 {
 		return s.cfg.recoverQuorumAfter
 	}
-	return noLeaderTimeout
+	return s.cfg.noLeaderTimeout
 }
 
 // quorumReachable reports whether enough voters are alive (per discovery)
