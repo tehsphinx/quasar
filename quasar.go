@@ -22,6 +22,13 @@ const (
 	applyTimout            = 5 * time.Second
 	defaultNoLeaderTimeout = 8 * time.Second
 	observationChanSize    = 5
+	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
+	// getLeaderWait to detect quorum loss without waiting for the
+	// discovery alive-window to expire. Sized for a healthy LAN: long
+	// enough to absorb a transient blip, short enough that the added
+	// latency on a leaderless-but-healthy request (during a normal
+	// election) is negligible compared to noLeaderTimeout.
+	quorumProbeTimeout = 250 * time.Millisecond
 )
 
 var (
@@ -394,8 +401,11 @@ func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.Ser
 		// Fail fast when quorum can't currently form. Waiting up to
 		// noLeaderTimeout would just delay an inevitable timeout — no
 		// election can complete without quorum, and recovery (if
-		// configured) runs on its own clock.
-		if !s.quorumReachable(time.Now(), s.aliveCutoff()) {
+		// configured) runs on its own clock. An active probe is used
+		// instead of the discovery-cached lastSeen view so quorum loss
+		// is detected as soon as peers stop responding rather than
+		// only after the pruneAfter / aliveCutoff window has elapsed.
+		if !s.quorumProbeReachable(ctx, quorumProbeTimeout) {
 			return "", "", ErrNoLeader
 		}
 		if r := s.waitForLeader(ctx); r != nil {
@@ -1026,34 +1036,68 @@ func (s *Cache) aliveCutoff() time.Duration {
 	return s.cfg.noLeaderTimeout
 }
 
-// quorumReachable reports whether enough voters are alive (per discovery)
-// to form a quorum on the current raft voter configuration. Returns true
-// in any "no information" case (raft not ready, no configured voters, no
-// discovery configured) so the caller falls back to its normal wait
-// rather than aborting on a partial picture. Returns false only when we
-// have concrete evidence quorum cannot currently form — the signal
-// getLeaderWait uses to fail fast instead of waiting noLeaderTimeout for
-// an election that cannot happen.
+// quorumProbeReachable actively probes each non-self voter in the
+// current raft configuration with a short-timeout LatestUID RPC and
+// reports whether enough peers respond to form a quorum. Self always
+// counts as alive. Reuses LatestUID because its handler responds from
+// any peer regardless of leadership (see consume) — making it a free
+// liveness probe without a dedicated RPC.
 //
-// Discovery is the sole feed for the per-peer liveness signal: when it
-// is not configured (e.g. static WithServers setups), lastSeen stays
-// empty by construction and a reachability call would be meaningless.
-func (s *Cache) quorumReachable(now time.Time, aliveCutoff time.Duration) bool {
-	if s.cfg.discovery == nil {
+// Returns true ("no information" fallback to the normal leader wait)
+// when raft is not ready, the configuration is unavailable, or no
+// voters are configured.
+func (s *Cache) quorumProbeReachable(ctx context.Context, timeout time.Duration) bool {
+	rft := s.raft()
+	if rft == nil {
+		// local raft might be re-initialising. Wait a bit.
 		return true
 	}
-	scan, ok := s.scanVoters(now, aliveCutoff)
-	if !ok {
+	cfgFut := rft.GetConfiguration()
+	if err := cfgFut.Error(); err != nil {
+		// local raft might be re-initialising. Wait a bit.
 		return true
 	}
-	if scan.configVoters == 0 {
-		return true
+
+	var voters []raft.Server
+	for _, srv := range cfgFut.Configuration().Servers {
+		if srv.Suffrage == raft.Voter {
+			voters = append(voters, srv)
+		}
 	}
-	quorum := scan.configVoters/2 + 1
-	return quorum <= len(scan.aliveVoters)
+	if len(voters) == 0 {
+		return false
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	alive := 0
+	pending := 0
+	results := make(chan bool, len(voters))
+	for _, srv := range voters {
+		if string(srv.ID) == s.localID {
+			alive++
+			continue
+		}
+		pending++
+		go func(srv raft.Server) {
+			_, err := s.transport.LatestUID(probeCtx, srv.ID, srv.Address, &pb.LatestUid{})
+			results <- err == nil
+		}(srv)
+	}
+
+	quorum := len(voters)/2 + 1
+	for i := 0; i < pending; i++ {
+		if <-results {
+			alive++
+			if alive >= quorum {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// shouldRecoverQuorum returns true when this voter is stranded and the
 // recovery procedure should run. The leaderless-duration threshold is the
 // caller's responsibility (the recovery watcher arms a time.Timer for
 // that); shouldRecoverQuorum only re-confirms there is still no leader
