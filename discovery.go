@@ -310,10 +310,6 @@ func (s *DiscoveryInjector) registerPruning(ctx context.Context, after time.Dura
 }
 
 func (s *DiscoveryInjector) pruneExpiredServers(pruneBefore time.Time) {
-	if !s.cache.IsLeader() {
-		return
-	}
-
 	expired := s.getExpiredServers(pruneBefore)
 	if len(expired) == 0 {
 		return
@@ -321,9 +317,13 @@ func (s *DiscoveryInjector) pruneExpiredServers(pruneBefore time.Time) {
 
 	go func(expired []raft.Server) {
 		for _, srv := range expired {
-			if err := s.removeServer(srv.ID); err != nil {
-				continue
+			if s.cache.IsLeader() {
+				// only remove from raft when leader
+				if err := s.removeServer(srv.ID); err != nil {
+					continue
+				}
 			}
+			// always remove from discovery -- unless we are the leader and removal failed
 			s.deleteServer(srv.ID)
 			s.removeApplied(srv.ID)
 		}
