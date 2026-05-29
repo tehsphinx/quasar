@@ -48,13 +48,16 @@ type natsPersistedQueue struct {
 	maxAge        time.Duration
 	maxDeliver    int
 	replicas      int
+	manageStream  bool
 
 	// stream is created/opened lazily on the first publish or consumer
 	// start so callers don't have to coordinate which transport
-	// instance "owns" the stream.
-	streamOnce sync.Once
-	streamErr  error
-	stream     jetstream.Stream
+	// instance "owns" the stream. streamM guards the lazy resolution and
+	// caches only successful results, so a non-managing node that
+	// publishes before the managing node has created the stream simply
+	// fails that write and retries on the next publish.
+	streamM sync.Mutex
+	stream  jetstream.Stream
 
 	// consumerM serializes Start/StopPersistedConsumer on this
 	// transport.
@@ -66,11 +69,12 @@ type natsPersistedQueue struct {
 // for the persisted-FIFO mode. Populated by WithNATSPersistedQueue and
 // applied in NewNATSTransport via newNatsPersistedQueue.
 type natsPersistedQueueConfig struct {
-	streamName string
-	ackWait    time.Duration
-	maxAge     time.Duration
-	maxDeliver int
-	replicas   int
+	streamName   string
+	ackWait      time.Duration
+	maxAge       time.Duration
+	maxDeliver   int
+	replicas     int
+	manageStream bool
 }
 
 // newNatsPersistedQueue constructs the queue helper attached to a
@@ -103,31 +107,51 @@ func newNatsPersistedQueue(conn *nats.Conn, cacheName string, cfg natsPersistedQ
 		maxDeliver:    cfg.maxDeliver,
 		maxAge:        cfg.maxAge,
 		replicas:      cfg.replicas,
+		manageStream:  cfg.manageStream,
 	}, nil
 }
 
-// ensureStream creates the persisted-FIFO stream (WorkQueuePolicy) if it
-// doesn't exist yet, or opens the existing one. Memoised so concurrent
-// publishers / consumers cooperate on the first call.
+// ensureStream resolves the persisted-FIFO stream (WorkQueuePolicy) and
+// caches it for subsequent publishers / consumers. When manageStream is
+// set this node creates the stream (or updates it to the configured
+// shape); otherwise it only binds to an already-existing stream and never
+// creates or mutates it, leaving ownership of the stream config (replicas,
+// retention) to the managing node. Only successful resolutions are cached,
+// so a non-managing node that publishes before the managing node has
+// created the stream fails that write and retries on the next call.
 func (q *natsPersistedQueue) ensureStream(ctx context.Context) (jetstream.Stream, error) {
-	q.streamOnce.Do(func() {
-		stream, err := q.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+	q.streamM.Lock()
+	defer q.streamM.Unlock()
+
+	if q.stream != nil {
+		return q.stream, nil
+	}
+
+	var (
+		stream jetstream.Stream
+		err    error
+	)
+	if q.manageStream {
+		stream, err = q.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 			Name:      q.streamName,
 			Subjects:  []string{q.subjectFilter},
 			Retention: jetstream.WorkQueuePolicy,
-			MaxAge:    q.ackWait,
+			MaxAge:    q.maxAge,
 			Replicas:  q.replicas,
-			// Storage left at default (file). Replicas left at 1 — this
-			// is configurable at the JetStream-cluster level and is
-			// orthogonal to quasar's raft consensus.
+			// Storage left at default (file).
 		})
 		if err != nil {
-			q.streamErr = fmt.Errorf("create persisted stream %q: %w", q.streamName, err)
-			return
+			return nil, fmt.Errorf("create persisted stream %q: %w", q.streamName, err)
 		}
-		q.stream = stream
-	})
-	return q.stream, q.streamErr
+	} else {
+		stream, err = q.js.Stream(ctx, q.streamName)
+		if err != nil {
+			return nil, fmt.Errorf("open persisted stream %q: %w", q.streamName, err)
+		}
+	}
+
+	q.stream = stream
+	return q.stream, nil
 }
 
 // publish marshals cmd onto the JS work-queue and blocks on a NATS

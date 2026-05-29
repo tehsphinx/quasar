@@ -19,7 +19,9 @@ import (
 // JetStream enabled and returns a transport configured for
 // persisted-FIFO mode. Skips the test when NATS or JetStream isn't
 // available locally.
-func makeNATSPersistedTransport(ctx context.Context, t *testing.T, cacheName, serverName, streamName string) *NATSTransport {
+func makeNATSPersistedTransport(ctx context.Context, t *testing.T, cacheName, serverName, streamName string,
+	queueOpts ...PersistedQueueOption,
+) *NATSTransport {
 	t.Helper()
 
 	nc, err := nats.Connect(natsURL, nats.Timeout(natsTimeout))
@@ -40,7 +42,7 @@ func makeNATSPersistedTransport(ctx context.Context, t *testing.T, cacheName, se
 		ctx, nc, cacheName, serverName,
 		WithNATSLogger(newTestLogger(t)),
 		WithNATSTimeout(natsTimeout),
-		WithNATSPersistedQueue(streamName),
+		WithNATSPersistedQueue(streamName, queueOpts...),
 	)
 	if err != nil {
 		nc.Close()
@@ -124,6 +126,59 @@ func TestNATSPersistedQueue_ReplyError(t *testing.T) {
 	asrt.Equal(err.Error(), applyErr.Error())
 
 	asrt.NoErr(leader.StopPersistedConsumer())
+}
+
+// TestNATSPersistedQueue_StreamManaged verifies that a non-managing
+// transport (WithPersistedStreamManaged(false), used by nonvoters) never
+// creates the stream: its publish fails until a managing transport
+// (the voter) has created it, after which the same non-managing transport
+// binds to the existing stream and publishes successfully.
+func TestNATSPersistedQueue_StreamManaged(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	asrt := is.New(t)
+	streamName := fmt.Sprintf("quasar_test_queue_%d", time.Now().UnixNano())
+
+	// Independent js handle to observe stream existence directly.
+	nc, err := nats.Connect(natsURL, nats.Timeout(natsTimeout))
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	asrt.NoErr(err)
+	if _, e := js.AccountInfo(ctx); e != nil {
+		t.Skipf("JetStream not enabled on server: %v", e)
+	}
+
+	// Nonvoter: must not create the stream.
+	nonvoter := makeNATSPersistedTransport(ctx, t, "test-cache", "nonvoter", streamName,
+		WithPersistedStreamManaged(false))
+
+	// Publishing before the stream exists fails, and crucially does not
+	// create the stream nor permanently cache the failure.
+	_, err = nonvoter.StorePersisted(ctx, &pb.Store{Key: "k"})
+	asrt.True(err != nil)
+	_, err = js.Stream(ctx, streamName)
+	asrt.True(errors.Is(err, jetstream.ErrStreamNotFound))
+
+	// Voter (manager) creates the stream and drains it.
+	voter := makeNATSPersistedTransport(ctx, t, "test-cache", "voter", streamName)
+	ch, err := voter.StartPersistedConsumer(ctx)
+	asrt.NoErr(err)
+	go func() {
+		for item := range ch {
+			_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 7})
+		}
+	}()
+
+	// The same nonvoter now binds to the existing stream and succeeds.
+	resp, err := nonvoter.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")})
+	asrt.NoErr(err)
+	asrt.Equal(resp.Uid, uint64(7))
+
+	asrt.NoErr(voter.StopPersistedConsumer())
 }
 
 // TestNATSPersistedQueue_NotConfigured confirms transports built

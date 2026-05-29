@@ -104,6 +104,18 @@ func WithPersistedReplicas(n int) PersistedQueueOption {
 	}
 }
 
+// WithPersistedStreamManaged controls whether this node creates and updates
+// the JetStream stream backing the persisted-FIFO queue. When false, the node
+// only binds to an already-existing stream and never creates or mutates it —
+// use this for nonvoters, which can never become leader and must not race the
+// voter that owns the stream's configuration (e.g. replicas). Defaults to true
+// (backwards-compatible: every node manages the stream).
+func WithPersistedStreamManaged(managed bool) PersistedQueueOption {
+	return func(cfg *natsPersistedQueueConfig) {
+		cfg.manageStream = managed
+	}
+}
+
 // WithNATSPersistedQueue enables persisted-FIFO mode on the NATS
 // transport. streamName names the JetStream WorkQueuePolicy stream
 // that backs the queue; pass an empty string to use the default
@@ -120,10 +132,11 @@ func WithPersistedReplicas(n int) PersistedQueueOption {
 func WithNATSPersistedQueue(streamName string, opts ...PersistedQueueOption) NATSOption {
 	return func(cfg *natsOptions) {
 		qc := natsPersistedQueueConfig{
-			streamName: streamName,
-			ackWait:    defaultPersistedAckWait,
-			maxDeliver: defaultPersistedMaxDeliver,
-			maxAge:     defaultPersistedMaxAge,
+			streamName:   streamName,
+			ackWait:      defaultPersistedAckWait,
+			maxDeliver:   defaultPersistedMaxDeliver,
+			maxAge:       defaultPersistedMaxAge,
+			manageStream: true,
 		}
 		for _, o := range opts {
 			o(&qc)
