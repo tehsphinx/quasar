@@ -278,8 +278,9 @@ func (c *natsPersistedConsumer) run(ctx context.Context) {
 // consumer should continue, false if it should exit.
 func (c *natsPersistedConsumer) consume(ctx context.Context, msg jetstream.Msg) bool {
 	item := &natsPersistedItem{
-		queue: c.queue,
-		msg:   msg,
+		queue:   c.queue,
+		msg:     msg,
+		settled: make(chan struct{}),
 	}
 	c.setInflight(item)
 	defer c.clearInflight(item)
@@ -374,12 +375,6 @@ type natsPersistedItem struct {
 	settled     chan struct{}
 }
 
-func (i *natsPersistedItem) ensureSettleChan() {
-	if i.settled == nil {
-		i.settled = make(chan struct{})
-	}
-}
-
 func (i *natsPersistedItem) Command() *pb.Store {
 	return i.command
 }
@@ -395,7 +390,6 @@ func (i *natsPersistedItem) ReplyError(_ context.Context, err error) error {
 func (i *natsPersistedItem) Nack(_ context.Context) error {
 	var ackErr error
 	i.settledOnce.Do(func() {
-		i.ensureSettleChan()
 		ackErr = i.msg.Nak()
 		close(i.settled)
 	})
@@ -405,7 +399,6 @@ func (i *natsPersistedItem) Nack(_ context.Context) error {
 func (i *natsPersistedItem) terminate(protoResp *pb.CommandResponse, ack bool) error {
 	var err error
 	i.settledOnce.Do(func() {
-		i.ensureSettleChan()
 		bts, mErr := proto.Marshal(protoResp)
 		if mErr != nil {
 			err = mErr
