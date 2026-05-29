@@ -3,6 +3,7 @@ package transports
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -13,6 +14,11 @@ const (
 	defaultTimout    = 5 * time.Second
 	consumerChanSize = 16
 )
+
+// ErrPersistedNotSupported is returned by transports that do not implement
+// the persisted-FIFO mode when StorePersisted / StartPersistedConsumer is
+// invoked on them. Callers should check SupportsPersisted() first.
+var ErrPersistedNotSupported = errors.New("transport does not support persisted FIFO")
 
 // Transport defines an extended raft.Transport with additional commands for the cache.
 type Transport interface {
@@ -32,6 +38,76 @@ type Transport interface {
 
 	// RemoveServer asks the leader to remove a server from the raft configuration.
 	RemoveServer(ctx context.Context, id raft.ServerID, target raft.ServerAddress, command *pb.RemoveServer) (*pb.RemoveServerResponse, error)
+
+	// SupportsPersisted reports whether this transport instance is configured
+	// with a persisted-FIFO backing store (NATS JetStream work-queue for the
+	// NATS transport, an in-memory FIFO channel for the Inmem transport).
+	//
+	// When true, the cache routes ALL Store commands (leader's own writes
+	// included) through StorePersisted / StartPersistedConsumer instead of
+	// the synchronous leader-RPC path. The single in-flight item on the
+	// queue provides strict cluster-wide FIFO ordering of writes, and a
+	// missing leader is no longer a write blocker — the publish lands in
+	// the persisted store and the next leader's consumer applies it.
+	//
+	// Transports that do not support persisted-FIFO must return false here
+	// and may return ErrPersistedNotSupported from StorePersisted /
+	// StartPersistedConsumer.
+	SupportsPersisted() bool
+
+	// StorePersisted publishes a Store command into the persisted-FIFO
+	// stream and waits for the leader's reply (success+UID or apply error).
+	// The publish path itself is leader-agnostic; the reply travels back
+	// over an out-of-band channel (NATS request-reply inbox for the NATS
+	// transport, per-call result channel for the Inmem transport).
+	//
+	// Returns when the leader replies, when ctx is done, or when the
+	// transport-level publish fails.
+	StorePersisted(ctx context.Context, command *pb.Store) (*pb.StoreResponse, error)
+
+	// StartPersistedConsumer begins draining the persisted-FIFO stream on
+	// this node and returns a channel of PersistedItem. Called by the
+	// quasar cache when this node becomes leader. Each item must be
+	// terminated by ReplySuccess, ReplyError, or Nack — the queue's
+	// single-in-flight-item invariant blocks the next delivery until
+	// that happens.
+	//
+	// Calling StartPersistedConsumer when the transport doesn't support
+	// persisted-FIFO returns ErrPersistedNotSupported.
+	StartPersistedConsumer(ctx context.Context) (<-chan PersistedItem, error)
+
+	// StopPersistedConsumer stops the consumer started by
+	// StartPersistedConsumer. The in-flight item (if any) is Nak'd so the
+	// next consumer (typically the new leader after a leadership flip)
+	// picks it up without waiting for the AckWait window to expire.
+	StopPersistedConsumer() error
+}
+
+// PersistedItem is a single Store command delivered by
+// StartPersistedConsumer. The consumer must terminate every item by
+// calling exactly one of ReplySuccess / ReplyError / Nack — the
+// persisted stream's MaxAckPending = 1 invariant pauses delivery until
+// the in-flight item is settled.
+type PersistedItem interface {
+	// Command returns the underlying Store command.
+	Command() *pb.Store
+
+	// ReplySuccess sends the apply result back to the publisher and acks
+	// the underlying queue item. The next item is delivered after the
+	// current one is acked.
+	ReplySuccess(ctx context.Context, resp *pb.StoreResponse) error
+
+	// ReplyError sends an apply error back to the publisher and acks the
+	// queue item. Apply errors are terminal for the publisher's call —
+	// JetStream will not redeliver, because the payload itself was
+	// rejected by the FSM rather than failing to reach a leader.
+	ReplyError(ctx context.Context, err error) error
+
+	// Nack returns the item to the queue for immediate redelivery to the
+	// next consumer. Used when the consumer is shutting down mid-flight
+	// (e.g. leader step-down) so the next leader doesn't have to wait
+	// for the AckWait window to expire.
+	Nack(ctx context.Context) error
 }
 
 func snapshotTimeout(origTimeout time.Duration, size int64) time.Duration {

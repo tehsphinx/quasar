@@ -1,0 +1,449 @@
+package transports
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/tehsphinx/quasar/pb/v1"
+	"google.golang.org/protobuf/proto"
+)
+
+// Default tuning for the persisted-FIFO consumer. Sized to match the
+// gatexcache plan: AckWait * MaxDeliver ≈ 40s total redelivery horizon
+// (~2× quorumRecoveryAfter), with MaxAckPending = 1 giving strict
+// in-order delivery at the cost of throughput. Operators can tune
+// AckWait / MaxDeliver per call site via WithNATSPersistedQueue
+// options; MaxAckPending is fixed at 1 by design (D4).
+const (
+	defaultPersistedAckWait    = 10 * time.Second
+	defaultPersistedMaxDeliver = 4
+	defaultPersistedMaxAge     = 1 * time.Hour
+
+	persistedConsumerNamePrefix = "quasar-cache-consumer"
+
+	// persistedReplyHeader carries the publisher's reply-inbox subject
+	// across the JetStream hop. We can't use the wire-level Reply field
+	// because JetStream rewrites it to the ack-inbox subject when the
+	// message is delivered to a consumer.
+	persistedReplyHeader = "Quasar-Reply"
+)
+
+// natsPersistedQueue is the JetStream-backed persisted-FIFO mode for a
+// NATSTransport. One instance per transport; the underlying JS stream
+// is cluster-wide (every voter / nonvoter shares the same stream),
+// each transport publishes into it and only the leader claims the
+// pull consumer.
+type natsPersistedQueue struct {
+	conn          *nats.Conn
+	js            jetstream.JetStream
+	streamName    string
+	subject       string
+	subjectFilter string
+	ackWait       time.Duration
+	maxAge        time.Duration
+	maxDeliver    int
+	replicas      int
+
+	// stream is created/opened lazily on the first publish or consumer
+	// start so callers don't have to coordinate which transport
+	// instance "owns" the stream.
+	streamOnce sync.Once
+	streamErr  error
+	stream     jetstream.Stream
+
+	// consumerM serializes Start/StopPersistedConsumer on this
+	// transport.
+	consumerM sync.Mutex
+	consumer  *natsPersistedConsumer
+}
+
+// natsPersistedQueueConfig captures the construction-time parameters
+// for the persisted-FIFO mode. Populated by WithNATSPersistedQueue and
+// applied in NewNATSTransport via newNatsPersistedQueue.
+type natsPersistedQueueConfig struct {
+	streamName string
+	ackWait    time.Duration
+	maxAge     time.Duration
+	maxDeliver int
+	replicas   int
+}
+
+// newNatsPersistedQueue constructs the queue helper attached to a
+// NATSTransport. Returns nil when cfg is the zero-value (i.e. when the
+// transport was built without WithNATSPersistedQueue).
+//
+// JetStream stream names cannot contain `.`; subjects can. The default
+// stream name encodes the cache name with underscores, while the
+// publish subject uses the dotted form to keep wire subjects aligned
+// with the rest of the quasar NATS conventions.
+func newNatsPersistedQueue(conn *nats.Conn, cacheName string, cfg natsPersistedQueueConfig) (*natsPersistedQueue, error) {
+	streamName := cfg.streamName
+	if streamName == "" {
+		streamName = fmt.Sprintf("quasar_%s_queue", sanitizeStreamName(cacheName))
+	}
+	subject := fmt.Sprintf("quasar.%s.queue", cacheName)
+
+	js, err := jetstream.New(conn)
+	if err != nil {
+		return nil, fmt.Errorf("init jetstream: %w", err)
+	}
+
+	return &natsPersistedQueue{
+		conn:          conn,
+		js:            js,
+		streamName:    streamName,
+		subject:       subject + ".msg",
+		subjectFilter: subject + ".>",
+		ackWait:       cfg.ackWait,
+		maxDeliver:    cfg.maxDeliver,
+		maxAge:        cfg.maxAge,
+		replicas:      cfg.replicas,
+	}, nil
+}
+
+// ensureStream creates the persisted-FIFO stream (WorkQueuePolicy) if it
+// doesn't exist yet, or opens the existing one. Memoised so concurrent
+// publishers / consumers cooperate on the first call.
+func (q *natsPersistedQueue) ensureStream(ctx context.Context) (jetstream.Stream, error) {
+	q.streamOnce.Do(func() {
+		stream, err := q.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+			Name:      q.streamName,
+			Subjects:  []string{q.subjectFilter},
+			Retention: jetstream.WorkQueuePolicy,
+			MaxAge:    q.ackWait,
+			Replicas:  q.replicas,
+			// Storage left at default (file). Replicas left at 1 — this
+			// is configurable at the JetStream-cluster level and is
+			// orthogonal to quasar's raft consensus.
+		})
+		if err != nil {
+			q.streamErr = fmt.Errorf("create persisted stream %q: %w", q.streamName, err)
+			return
+		}
+		q.stream = stream
+	})
+	return q.stream, q.streamErr
+}
+
+// publish marshals cmd onto the JS work-queue and blocks on a NATS
+// request-reply inbox for the leader's reply.
+func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store) (*pb.StoreResponse, error) {
+	if _, err := q.ensureStream(ctx); err != nil {
+		return nil, err
+	}
+
+	bts, err := proto.Marshal(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("marshal persisted store: %w", err)
+	}
+
+	inbox := nats.NewInbox()
+	// Subscribe before publishing — once the leader processes the
+	// item it'll publish on the inbox, and we want to be listening.
+	sub, err := q.conn.SubscribeSync(inbox)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe persisted reply inbox: %w", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	msg := nats.NewMsg(q.subject)
+	msg.Header.Set(persistedReplyHeader, inbox)
+	msg.Data = bts
+	if _, err = q.js.PublishMsg(ctx, msg); err != nil {
+		return nil, fmt.Errorf("publish persisted store: %w", err)
+	}
+
+	replyMsg, err := sub.NextMsgWithContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var protoResp pb.CommandResponse
+	if r := proto.Unmarshal(replyMsg.Data, &protoResp); r != nil {
+		return nil, fmt.Errorf("decode persisted reply: %w", r)
+	}
+	if errStr := protoResp.GetError(); errStr != "" {
+		return nil, errors.New(errStr)
+	}
+	return protoResp.GetStore(), nil
+}
+
+// startConsumer creates / opens the pull consumer and begins draining
+// the queue. Returns a channel of PersistedItem; close signals consumer
+// shutdown. Only one consumer is active per node at a time; concurrent
+// callers reuse the active consumer.
+func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan PersistedItem, error) {
+	q.consumerM.Lock()
+	defer q.consumerM.Unlock()
+
+	if q.consumer != nil {
+		return q.consumer.items, nil
+	}
+
+	stream, err := q.ensureStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Durable consumer name keyed to the stream so a leadership flip
+	// resumes from the same pending state instead of starting from the
+	// beginning. The leader-flip handover happens by cancelling the
+	// previous consumer's puller (which Naks any in-flight item) and
+	// starting a fresh pull on the same durable.
+	consumerCfg := jetstream.ConsumerConfig{
+		Durable:       persistedConsumerNamePrefix,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxAckPending: 1,
+		AckWait:       q.ackWait,
+		MaxDeliver:    q.maxDeliver,
+	}
+	jsConsumer, err := stream.CreateOrUpdateConsumer(ctx, consumerCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create persisted consumer: %w", err)
+	}
+
+	pullCtx, cancel := context.WithCancel(context.Background())
+	mctx, err := jsConsumer.Messages()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("start persisted messages context: %w", err)
+	}
+
+	items := make(chan PersistedItem)
+	c := &natsPersistedConsumer{
+		queue:  q,
+		items:  items,
+		cancel: cancel,
+		mctx:   mctx,
+	}
+	q.consumer = c
+
+	go c.run(pullCtx)
+	return items, nil
+}
+
+// stopConsumer cancels the active consumer goroutine and Naks the
+// in-flight item (if any) so the next leader picks it up immediately.
+func (q *natsPersistedQueue) stopConsumer() error {
+	q.consumerM.Lock()
+	defer q.consumerM.Unlock()
+	if q.consumer == nil {
+		return nil
+	}
+	c := q.consumer
+	q.consumer = nil
+	c.stop()
+	return nil
+}
+
+// natsPersistedConsumer wraps the JS Messages pull context and the
+// outgoing PersistedItem channel.
+type natsPersistedConsumer struct {
+	queue  *natsPersistedQueue
+	items  chan PersistedItem
+	cancel context.CancelFunc
+	mctx   jetstream.MessagesContext
+
+	inflightM sync.Mutex
+	inflight  *natsPersistedItem
+}
+
+// run is the puller loop: pull one message, hand it to the consumer
+// channel, repeat. With MaxAckPending = 1, JetStream itself enforces
+// the strict-FIFO single-in-flight invariant; we just need to keep up
+// the conventional ack/nak protocol.
+func (c *natsPersistedConsumer) run(ctx context.Context) {
+	defer close(c.items)
+	defer c.mctx.Stop()
+	for {
+		msg, err := c.mctx.Next()
+		if err != nil {
+			// Either ctx canceled (Stop drained the context) or the
+			// consumer is being torn down. Either way, exit.
+			return
+		}
+
+		if ok := c.consume(ctx, msg); !ok {
+			return
+		}
+	}
+}
+
+// consume is the puller loop's message handler. It returns true if the
+// consumer should continue, false if it should exit.
+func (c *natsPersistedConsumer) consume(ctx context.Context, msg jetstream.Msg) bool {
+	item := &natsPersistedItem{
+		queue: c.queue,
+		msg:   msg,
+	}
+	c.setInflight(item)
+	defer c.clearInflight(item)
+
+	// Decode the command. If decoding fails we cannot deliver
+	// it to the consumer loop meaningfully — reject with
+	// `Term` (ack as a terminal failure so JetStream doesn't
+	// redeliver poison messages indefinitely) and continue.
+	var protoMsg pb.Store
+	if r := proto.Unmarshal(msg.Data(), &protoMsg); r != nil {
+		_ = c.replyDecodeError(item, r)
+		return true
+	}
+	item.command = &protoMsg
+
+	select {
+	case c.items <- item:
+	case <-ctx.Done():
+		// Consumer is going away. Nak the in-flight item so the
+		// next claimant gets it without waiting for AckWait.
+		_ = item.Nack(context.Background())
+		return false
+	}
+	// Wait for the consumer to settle the item before fetching
+	// the next one. With MaxAckPending = 1 the next Next() call
+	// would block on the server side anyway, but waiting locally
+	// also gives us a deterministic place to observe ctx
+	// cancellation against an unsettled inflight item.
+	select {
+	case <-item.settled:
+	case <-ctx.Done():
+		_ = item.Nack(context.Background())
+		return false
+	}
+	return true
+}
+
+func (c *natsPersistedConsumer) setInflight(item *natsPersistedItem) {
+	c.inflightM.Lock()
+	c.inflight = item
+	c.inflightM.Unlock()
+}
+
+func (c *natsPersistedConsumer) clearInflight(item *natsPersistedItem) {
+	c.inflightM.Lock()
+	if c.inflight == item {
+		c.inflight = nil
+	}
+	c.inflightM.Unlock()
+}
+
+func (c *natsPersistedConsumer) stop() {
+	c.cancel()
+	c.mctx.Stop()
+	c.inflightM.Lock()
+	in := c.inflight
+	c.inflightM.Unlock()
+	if in != nil {
+		_ = in.Nack(context.Background())
+	}
+}
+
+func (c *natsPersistedConsumer) replyDecodeError(item *natsPersistedItem, decodeErr error) error {
+	protoResp := &pb.CommandResponse{Error: decodeErr.Error()}
+	bts, _ := proto.Marshal(protoResp)
+	if reply := persistedReplyInbox(item.msg); reply != "" {
+		_ = c.queue.conn.Publish(reply, bts)
+	}
+	return item.msg.Ack()
+}
+
+// persistedReplyInbox extracts the publisher's reply-inbox subject from
+// the message header, falling back to the wire-level Reply field for
+// forward compatibility (in case the producer changes how it stamps
+// the reply target).
+func persistedReplyInbox(msg jetstream.Msg) string {
+	if hdr := msg.Headers(); hdr != nil {
+		if v := hdr.Get(persistedReplyHeader); v != "" {
+			return v
+		}
+	}
+	return msg.Reply()
+}
+
+// natsPersistedItem implements PersistedItem on top of a JetStream Msg.
+type natsPersistedItem struct {
+	queue   *natsPersistedQueue
+	msg     jetstream.Msg
+	command *pb.Store
+
+	settledOnce sync.Once
+	settled     chan struct{}
+}
+
+func (i *natsPersistedItem) ensureSettleChan() {
+	if i.settled == nil {
+		i.settled = make(chan struct{})
+	}
+}
+
+func (i *natsPersistedItem) Command() *pb.Store {
+	return i.command
+}
+
+func (i *natsPersistedItem) ReplySuccess(_ context.Context, resp *pb.StoreResponse) error {
+	return i.terminate(&pb.CommandResponse{Resp: &pb.CommandResponse_Store{Store: resp}}, true)
+}
+
+func (i *natsPersistedItem) ReplyError(_ context.Context, err error) error {
+	return i.terminate(&pb.CommandResponse{Error: err.Error()}, true)
+}
+
+func (i *natsPersistedItem) Nack(_ context.Context) error {
+	var ackErr error
+	i.settledOnce.Do(func() {
+		i.ensureSettleChan()
+		ackErr = i.msg.Nak()
+		close(i.settled)
+	})
+	return ackErr
+}
+
+func (i *natsPersistedItem) terminate(protoResp *pb.CommandResponse, ack bool) error {
+	var err error
+	i.settledOnce.Do(func() {
+		i.ensureSettleChan()
+		bts, mErr := proto.Marshal(protoResp)
+		if mErr != nil {
+			err = mErr
+			// Even on marshal failure we need to ack to avoid
+			// poison-message redelivery storms; the publisher will
+			// time out and surface its own error.
+			_ = i.msg.Ack()
+			close(i.settled)
+			return
+		}
+		if reply := persistedReplyInbox(i.msg); reply != "" {
+			if pErr := i.queue.conn.Publish(reply, bts); pErr != nil {
+				err = pErr
+			}
+		}
+		if ack {
+			if aErr := i.msg.Ack(); aErr != nil && err == nil {
+				err = aErr
+			}
+		}
+		close(i.settled)
+	})
+	return err
+}
+
+// sanitizeStreamName replaces JetStream-illegal characters (dots,
+// spaces, asterisks, greater-than) with underscores so a dotted cache
+// name still produces a valid default stream name.
+func sanitizeStreamName(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '.', ' ', '*', '>':
+			out = append(out, '_')
+		default:
+			out = append(out, c)
+		}
+	}
+	return string(out)
+}

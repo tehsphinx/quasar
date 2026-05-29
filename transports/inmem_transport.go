@@ -55,6 +55,12 @@ type InmemTransport struct {
 	peers          map[raft.ServerAddress]*InmemTransport
 	pipelines      []*inmemPipeline
 
+	// hub is the optional persisted-FIFO queue. When non-nil, the
+	// quasar cache routes every Store call through the hub instead
+	// of the synchronous makeRPC path. Shared across every transport
+	// in a test cluster via ConnectInmemQueueHub.
+	hub *InmemQueueHub
+
 	m       sync.RWMutex
 	timeout time.Duration
 }
@@ -172,6 +178,60 @@ func NewInmemTransport(addr raft.ServerAddress) (raft.ServerAddress, *InmemTrans
 // SetHeartbeatHandler is used to set optional fast-path for
 // heartbeats, not supported for this transport.
 func (i *InmemTransport) SetHeartbeatHandler(cb func(raft.RPC)) {
+}
+
+// SupportsPersisted reports whether the Inmem transport is configured
+// with a persisted-FIFO queue hub (see WithInmemPersistedQueue and
+// ConnectInmemQueueHub). Defaults to false; tests opt in by attaching
+// a shared *inmemQueueHub before constructing the cache.
+func (i *InmemTransport) SupportsPersisted() bool {
+	return i.queueHub() != nil
+}
+
+// StorePersisted publishes a Store command into the Inmem persisted-FIFO
+// hub and waits for the leader's reply.
+func (i *InmemTransport) StorePersisted(ctx context.Context, command *pb.Store) (*pb.StoreResponse, error) {
+	hub := i.queueHub()
+	if hub == nil {
+		return nil, ErrPersistedNotSupported
+	}
+	return hub.publish(ctx, command)
+}
+
+// StartPersistedConsumer claims the persisted-FIFO consumer for this
+// node and returns the channel of items the leader should drain.
+func (i *InmemTransport) StartPersistedConsumer(ctx context.Context) (<-chan PersistedItem, error) {
+	hub := i.queueHub()
+	if hub == nil {
+		return nil, ErrPersistedNotSupported
+	}
+	return hub.startConsumer(ctx, i)
+}
+
+// StopPersistedConsumer releases this node's claim on the persisted-FIFO
+// consumer, NAKing the in-flight item (if any) so the next claimant
+// picks it up immediately.
+func (i *InmemTransport) StopPersistedConsumer() error {
+	hub := i.queueHub()
+	if hub == nil {
+		return nil
+	}
+	return hub.stopConsumer(i)
+}
+
+func (i *InmemTransport) queueHub() *InmemQueueHub {
+	i.m.RLock()
+	defer i.m.RUnlock()
+	return i.hub
+}
+
+// AttachQueueHub wires this Inmem transport to the given persisted-FIFO
+// hub. Use ConnectInmemQueueHub from tests to wire a whole cluster at
+// once.
+func (i *InmemTransport) AttachQueueHub(hub *InmemQueueHub) {
+	i.m.Lock()
+	defer i.m.Unlock()
+	i.hub = hub
 }
 
 // Consumer implements the Transport interface.

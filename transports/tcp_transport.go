@@ -514,6 +514,31 @@ func (s *TCPTransport) TimeoutNow(id raft.ServerID, target raft.ServerAddress, a
 	return s.genericRPC(ctx, id, target, rpcTimeoutNow, args, resp)
 }
 
+// SupportsPersisted reports whether the TCP transport implements
+// persisted-FIFO mode. It does not — there is no durable queue layered
+// on top of the TCP stream, so writes always travel through the
+// synchronous Store RPC and a missing leader still returns ErrNoLeader.
+func (s *TCPTransport) SupportsPersisted() bool {
+	return false
+}
+
+// StorePersisted always returns ErrPersistedNotSupported for the TCP
+// transport.
+func (s *TCPTransport) StorePersisted(_ context.Context, _ *pb.Store) (*pb.StoreResponse, error) {
+	return nil, ErrPersistedNotSupported
+}
+
+// StartPersistedConsumer always returns ErrPersistedNotSupported for the
+// TCP transport.
+func (s *TCPTransport) StartPersistedConsumer(_ context.Context) (<-chan PersistedItem, error) {
+	return nil, ErrPersistedNotSupported
+}
+
+// StopPersistedConsumer is a no-op for the TCP transport.
+func (s *TCPTransport) StopPersistedConsumer() error {
+	return nil
+}
+
 // listen is used to handling incoming connections.
 func (s *TCPTransport) listen() {
 	const baseDelay = 5 * time.Millisecond

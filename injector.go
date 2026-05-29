@@ -48,8 +48,12 @@ func (s *FSMInjector) WaitForKnownLatest(ctx context.Context) error {
 // Store stores the given byte slice in the cache. It invokes the store method of the cache instance.
 // It returns the unique identifier (UID) associated with the stored data and
 // any error encountered during the operation.
-func (s *FSMInjector) Store(ctx context.Context, bts []byte) (uint64, error) {
-	return s.cache.store(ctx, "", bts)
+//
+// Variadic StoreOption arguments configure how the call interacts with a
+// transport that supports persisted-FIFO mode (see WithRetry). Options
+// are no-ops on transports that do not implement persisted-FIFO.
+func (s *FSMInjector) Store(ctx context.Context, bts []byte, opts ...StoreOption) (uint64, error) {
+	return s.cache.store(ctx, "", bts, opts...)
 }
 
 // IsLeader returns if the cache is the current leader. This is not a verified

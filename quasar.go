@@ -43,6 +43,14 @@ var (
 
 	// ErrWaitFor indicates a timeout occurred while waiting for a UID to be applied.
 	ErrWaitFor = errors.New("timeout waiting for UID to be applied")
+
+	// ErrRetrying indicates that a Store command was successfully
+	// published to the persisted-FIFO transport but the leader's reply
+	// did not arrive within the caller's context deadline. JetStream-level
+	// redelivery (MaxDeliver × AckWait) continues; the next leader will
+	// eventually apply the command. Returned only when the caller asked
+	// for at-least-once semantics with WithRetry().
+	ErrRetrying = errors.New("failed to apply: retrying in background")
 )
 
 // NewCache instantiates a new Cache. In contrast to NewKVCache (which holds []byte) this is meant
@@ -108,6 +116,10 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 
 	if cfg.recoverQuorumAfter > 0 && cfg.suffrage == raft.Voter {
 		go c.runQuorumRecoveryWatch(ctx)
+	}
+
+	if transport.SupportsPersisted() {
+		go c.runPersistedConsumer(ctx)
 	}
 
 	go c.consume(ctx, transport.CacheConsumer())
@@ -283,9 +295,9 @@ func (s *Cache) GetServerList() ([]raft.Server, error) {
 	return configuration.Servers, nil
 }
 
-func (s *Cache) store(ctx context.Context, key string, data []byte) (uint64, error) {
+func (s *Cache) store(ctx context.Context, key string, data []byte, opts ...StoreOption) (uint64, error) {
 	cmd := cmdStore(key, data)
-	_, uid, err := s.apply(ctx, cmd)
+	_, uid, err := s.apply(ctx, cmd, resolveStoreOpts(opts))
 	return uid, err
 }
 
@@ -295,7 +307,7 @@ func (s *Cache) masterLastIndex(ctx context.Context) (uint64, error) {
 	}
 
 	cmd := cmdLatestUID()
-	_, uid, err := s.apply(ctx, cmd)
+	_, uid, err := s.apply(ctx, cmd, storeOpts{})
 	if err != nil {
 		return 0, err
 	}
@@ -307,7 +319,17 @@ func (s *Cache) localLastIndex() uint64 {
 	return s.raft().LastIndex()
 }
 
-func (s *Cache) apply(ctx context.Context, cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
+// apply is the central dispatcher for cache commands. When the configured
+// transport supports persisted-FIFO mode, Store commands are routed through
+// the queue (every write, leader's own included, so the queue's single
+// in-flight item provides cluster-wide FIFO ordering). Non-Store commands
+// and transports without persisted mode keep the existing leader-local /
+// leader-RPC split.
+func (s *Cache) apply(ctx context.Context, cmd *pb.Command, opts storeOpts) (*pb.CommandResponse, uint64, error) {
+	if storeCmd := cmd.GetStore(); storeCmd != nil && s.transport.SupportsPersisted() {
+		return s.routePersisted(ctx, storeCmd, opts)
+	}
+
 	if s.IsLeader() {
 		return s.applyLocal(ctx, cmd)
 	}

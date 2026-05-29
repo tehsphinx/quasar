@@ -161,6 +161,31 @@ func (s *DRPCTransport) LatestUID(ctx context.Context, id raft.ServerID, target 
 	panic("implement me")
 }
 
+// SupportsPersisted reports whether the DRPC transport supports
+// persisted-FIFO mode. It does not — the DRPC transport is a stub today,
+// and persisted-FIFO is implemented only for the NATS and Inmem
+// transports.
+func (s *DRPCTransport) SupportsPersisted() bool {
+	return false
+}
+
+// StorePersisted always returns ErrPersistedNotSupported for the DRPC
+// transport.
+func (s *DRPCTransport) StorePersisted(_ context.Context, _ *pb.Store) (*pb.StoreResponse, error) {
+	return nil, ErrPersistedNotSupported
+}
+
+// StartPersistedConsumer always returns ErrPersistedNotSupported for the
+// DRPC transport.
+func (s *DRPCTransport) StartPersistedConsumer(_ context.Context) (<-chan PersistedItem, error) {
+	return nil, ErrPersistedNotSupported
+}
+
+// StopPersistedConsumer is a no-op for the DRPC transport.
+func (s *DRPCTransport) StopPersistedConsumer() error {
+	return nil
+}
+
 // RemoveServer asks the leader to remove a server from the raft configuration.
 func (s *DRPCTransport) RemoveServer(ctx context.Context, id raft.ServerID, target raft.ServerAddress,
 	command *pb.RemoveServer,

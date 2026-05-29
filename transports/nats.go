@@ -40,6 +40,13 @@ func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverNam
 		chConsume:      make(chan raft.RPC, consumerChanSize),
 		chConsumeCache: make(chan raft.RPC, consumerChanSize),
 	}
+	if config.persistedQueue != nil {
+		q, err := newNatsPersistedQueue(conn, cacheName, *config.persistedQueue)
+		if err != nil {
+			return nil, err
+		}
+		s.queue = q
+	}
 	if err := s.listen(ctx); err != nil {
 		return nil, err
 	}
@@ -66,6 +73,12 @@ type NATSTransport struct {
 
 	requestIDCounter uint64
 	maxMsgSize       int
+
+	// queue is the optional persisted-FIFO mode binding. Set by
+	// WithNATSPersistedQueue and resolved against the connection on
+	// the first call to StorePersisted / StartPersistedConsumer. nil
+	// when the transport was constructed without persisted-FIFO.
+	queue *natsPersistedQueue
 }
 
 func (s *NATSTransport) listen(ctx context.Context) error {
@@ -676,6 +689,45 @@ func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, 
 
 	*resp = *protoResp.GetTimeoutNow().Convert()
 	return nil
+}
+
+// SupportsPersisted reports whether this NATSTransport instance has been
+// configured with a persisted-FIFO mode via WithNATSPersistedQueue. When
+// false, the cache uses the synchronous Store RPC path; missing leader
+// returns ErrNoLeader. When true, every Store flows through the JS
+// work-queue stream and the queue itself handles leaderless windows.
+func (s *NATSTransport) SupportsPersisted() bool {
+	return s.queue != nil
+}
+
+// StorePersisted publishes a Store command into the JS work-queue stream
+// and waits for the leader's reply via a NATS request-reply inbox.
+// Returns ErrPersistedNotSupported when the transport wasn't constructed
+// with WithNATSPersistedQueue.
+func (s *NATSTransport) StorePersisted(ctx context.Context, command *pb.Store) (*pb.StoreResponse, error) {
+	if s.queue == nil {
+		return nil, ErrPersistedNotSupported
+	}
+	return s.queue.publish(ctx, command)
+}
+
+// StartPersistedConsumer begins draining the persisted-FIFO stream on
+// this node. Called by the cache when this node becomes leader.
+func (s *NATSTransport) StartPersistedConsumer(ctx context.Context) (<-chan PersistedItem, error) {
+	if s.queue == nil {
+		return nil, ErrPersistedNotSupported
+	}
+	return s.queue.startConsumer(ctx)
+}
+
+// StopPersistedConsumer stops the consumer started by
+// StartPersistedConsumer and NAKs the in-flight item so the next leader
+// picks it up without waiting for AckWait to elapse.
+func (s *NATSTransport) StopPersistedConsumer() error {
+	if s.queue == nil {
+		return nil
+	}
+	return s.queue.stopConsumer()
 }
 
 func (s *NATSTransport) handleTimeoutNow(ctx context.Context) func(*nats.Msg) {
