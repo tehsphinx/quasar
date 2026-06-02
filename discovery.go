@@ -3,6 +3,7 @@ package quasar
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,6 +88,15 @@ type DiscoveryInjector struct {
 	// raft emits as well). Read non-blocking from LocalPeerStatus so NATS
 	// callbacks never have to wait on raft's main loop.
 	voterCount atomic.Uint32
+
+	// startedAt is the UnixNano timestamp at which discovery (re)started on
+	// the current raft instance. It anchors the grace window for the
+	// config-driven prune sweep (see graceElapsed): until a full prune window
+	// has elapsed the lastSeen map is still being refilled by incoming pings
+	// and must not be trusted to declare a configured peer dead. Reset on
+	// every regObservation so a recoverQuorum-rebuilt raft gets a fresh
+	// window.
+	startedAt atomic.Int64
 }
 
 // Name returns the caches name. This name identifies a cache and separates it from other caches on the network.
@@ -235,6 +245,12 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 	// bootstrap configuration that raft applies via the same path).
 	s.voterCount.Store(0)
 
+	// Anchor a fresh grace window for the config-driven prune sweep: lastSeen
+	// starts cold on a (re)started raft and needs a full prune window of
+	// incoming pings before it can be trusted to declare a configured peer
+	// dead.
+	s.startedAt.Store(time.Now().UnixNano())
+
 	go func() {
 		defer func() {
 			rft.DeregisterObserver(observer)
@@ -311,6 +327,18 @@ func (s *DiscoveryInjector) registerPruning(ctx context.Context, after time.Dura
 
 func (s *DiscoveryInjector) pruneExpiredServers(pruneBefore time.Time) {
 	expired := s.getExpiredServers(pruneBefore)
+
+	// Leader only: also reconcile the committed raft configuration. A peer
+	// that is a configured member but never pings discovery is absent from
+	// the ping-driven servers map, so the sweep above can never see it.
+	//
+	// Gated on graceElapsed so a node that has just (re)started does not
+	// mistake a still-alive peer that simply has not pinged us yet for a dead
+	// one.
+	if s.cache.IsLeader() && s.graceElapsed(pruneBefore) {
+		expired = s.appendExpiredConfigServers(expired, pruneBefore)
+	}
+
 	if len(expired) == 0 {
 		return
 	}
@@ -347,6 +375,45 @@ func (s *DiscoveryInjector) getExpiredServers(pruneBefore time.Time) []raft.Serv
 			continue
 		}
 
+		expired = append(expired, srv)
+	}
+
+	return expired
+}
+
+// graceElapsed reports whether discovery has been running on the current raft
+// instance for at least a full prune window.
+func (s *DiscoveryInjector) graceElapsed(pruneBefore time.Time) bool {
+	started := s.startedAt.Load()
+	if started == 0 {
+		return false
+	}
+	return time.Unix(0, started).Before(pruneBefore)
+}
+
+// appendExpiredConfigServers returns the peers in the committed raft configuration
+// -- excluding self and anything already in skip -- that have not pinged
+// discovery within the prune window.
+func (s *DiscoveryInjector) appendExpiredConfigServers(expired []raft.Server, pruneBefore time.Time) []raft.Server {
+	rft := s.cache.raft()
+	if rft == nil {
+		return nil
+	}
+	cfgFut := rft.GetConfiguration()
+	if err := cfgFut.Error(); err != nil {
+		return nil
+	}
+
+	for _, srv := range cfgFut.Configuration().Servers {
+		if srv.ID == raft.ServerID(s.cache.localID) {
+			continue
+		}
+		if s.isAliveSince(srv.ID, pruneBefore) {
+			continue
+		}
+		if slices.ContainsFunc(expired, func(s raft.Server) bool { return s.ID == srv.ID }) {
+			continue
+		}
 		expired = append(expired, srv)
 	}
 
