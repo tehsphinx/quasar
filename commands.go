@@ -19,6 +19,12 @@ func cmdLatestUID() *pb.Command {
 	}}
 }
 
+func cmdReset() *pb.Command {
+	return &pb.Command{Cmd: &pb.Command_ResetCache{
+		ResetCache: &pb.ResetCache{},
+	}}
+}
+
 func cmdRemoveServer(id string) *pb.Command {
 	return &pb.Command{Cmd: &pb.Command_RemoveServer{
 		RemoveServer: &pb.RemoveServer{

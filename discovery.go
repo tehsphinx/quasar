@@ -40,8 +40,8 @@ func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 // the cache creates a new raft via NewCache or recoverQuorum. A follower
 // whose local instance ID differs from the *current* raft leader's
 // reported InstanceID is sitting on a forked consensus history and must
-// localReset before the leader's older snapshot lands on top of its stale
-// log cache (RT-12862).
+// reinit its raft before the leader's older snapshot lands on top of its
+// stale log cache (RT-12862).
 type PeerStatus struct {
 	HasLeader         bool
 	NumVotersInConfig uint32
@@ -183,16 +183,6 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 	fut := addServerFn(srv.ID, srv.Address, 0, 0)
 	if r := fut.Error(); r != nil {
 		return r
-	}
-
-	if s.cache.getLastResetID() != "" {
-		resp, r := s.cache.sendReset(context.Background(), srv)
-		if r != nil {
-			return r
-		}
-		if resp.GetError() != "" {
-			return errors.New(resp.GetError())
-		}
 	}
 
 	return nil

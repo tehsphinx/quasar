@@ -840,8 +840,8 @@ func TestQuorumRecoveryCancelOnTransientPartition(t *testing.T) {
 // Option I makes that fork explicit by tagging every newRaft with a
 // fresh InstanceID and broadcasting the current raft leader's ID on
 // every discovery ping. A follower whose local ID disagrees with the
-// elected leader's for two consecutive pings runs localReset to wipe
-// its in-memory raft state and adopt the leader's ID — discarding the
+// elected leader's for two consecutive pings runs reinitRaftAdoptingInstance
+// to wipe its in-memory raft state and adopt the leader's ID — discarding the
 // forked log/snapshot cache *before* the leader's older snapshot
 // lands.
 //

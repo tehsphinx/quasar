@@ -229,7 +229,6 @@ type Cache struct {
 	raftMutex     sync.RWMutex
 	ctxRaft       context.Context
 	closeRaft     context.CancelFunc
-	lastResetID   string
 	instanceID    string
 	raftLocker    *raft.Raft
 	logStore      raft.LogStore
@@ -256,8 +255,8 @@ type Cache struct {
 }
 
 // newStores (re)creates the in-memory raft stores and stashes them on the
-// cache so they can be reused across raft restarts (localReset, quorum
-// recovery). Stores are local to the *raft.Raft instance, so a fresh raft
+// cache so they can be reused across raft restarts (reinitRaftAdoptingInstance,
+// quorum recovery). Stores are local to the *raft.Raft instance, so a fresh raft
 // requires fresh stores; the recovery path is the exception (it reuses the
 // existing stores via raft.RecoverCluster).
 func (s *Cache) newStores() {
@@ -423,6 +422,12 @@ func (s *Cache) applyRemote(ctx context.Context, command *pb.Command) (*pb.Comma
 			return nil, 0, err
 		}
 		return respRemoveServer(resp), 0, nil
+	case *pb.Command_ResetCache:
+		resp, err := s.transport.ResetCache(ctx, id, addr, cmd.ResetCache)
+		if err != nil {
+			return nil, 0, err
+		}
+		return respResetCache(resp), 0, nil
 	}
 
 	return nil, 0, errors.New("leader request type not implemented")
@@ -571,7 +576,7 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 				uid, err = s.store(ctx, cmd.Key, cmd.Data)
 				resp = &pb.StoreResponse{Uid: uid}
 			case *pb.ResetCache:
-				err = s.localReset(cmd.Uuid, "")
+				err = s.reset(ctx)
 				resp = &pb.ResetCacheResponse{Uuid: cmd.Uuid}
 			case *pb.RemoveServer:
 				err = s.removeServer(cmd.Id)
@@ -633,89 +638,42 @@ func (s *Cache) removeServer(id string) error {
 	return fut.Error()
 }
 
-// Reset resets calls Reset the cache on all servers.
+// Reset clears the cache content on every node by proposing a reset command
+// through the raft log. Like any committed entry it replicates to all current
+// members, is captured by post-reset snapshots, and replays on restart /
+// catch-up — so a reset can never be regressed by a snapshot restore or by
+// quorum recovery (this is the RT-12994 fix for a cleared device re-appearing
+// after a snapshot restore). Issued against a healthy cluster: it requires a
+// leader+quorum to commit; with no leader it returns ErrNoLeader and the
+// operator should recover quorum first.
 func (s *Cache) Reset(ctx context.Context) error {
-	servers, err := s.GetServerList()
-	if err != nil {
-		return err
-	}
-
 	s.logger.Info("cache reset triggered")
-
-	var (
-		retErrs    []error
-		foundLocal bool
-		resetID    = uuid.NewString()
-	)
-	for _, server := range servers {
-		if server.ID == raft.ServerID(s.localID) {
-			foundLocal = true
-			if r := s.localReset(resetID, ""); r != nil {
-				retErrs = append(retErrs, r)
-			}
-			continue
-		}
-
-		resp, r := s.sendReset(ctx, server)
-		if r != nil {
-			retErrs = append(retErrs, r)
-			continue
-		}
-		if resp.GetError() != "" {
-			retErrs = append(retErrs, errors.New(resp.GetError()))
-		}
-	}
-	if !foundLocal {
-		if r := s.localReset(resetID, ""); r != nil {
-			retErrs = append(retErrs, r)
-		}
-	}
-
-	return errors.Join(retErrs...)
+	return s.reset(ctx)
 }
 
-func (s *Cache) sendReset(ctx context.Context, server raft.Server) (*pb.ResetCacheResponse, error) {
-	resp, r := s.transport.ResetCache(ctx, server.ID, server.Address, &pb.ResetCache{
-		Uuid: s.getLastResetID(),
-	})
-	return resp, r
+// reset proposes the reset command through the normal apply path: applied
+// locally when this node is the leader, otherwise forwarded to the leader
+// (consume's ResetCache case calls back here on the leader side). The FSM
+// (gatexcache) decides what its Reset() actually clears.
+func (s *Cache) reset(ctx context.Context) error {
+	_, _, err := s.apply(ctx, cmdReset(), storeOpts{})
+	return err
 }
 
-// localReset reinitializes the follower's raft state. resetID is the FSM
-// reset UUID (already-applied resets are no-ops); adoptInstanceID, when
-// non-empty, replaces this cache's instance ID so the post-reset raft
-// reports the adopted ID on the next discovery ping and the mismatch
-// watcher stays quiet. Two callers pass a non-empty adoptInstanceID:
-//   - adoptLeaderInstance, when this node observed a forked-history
-//     ping from the current raft leader (RT-12862);
-//   - any future caller that has independently determined the cluster's
-//     instance ID.
-//
-// All other callers pass "" and keep the existing instance ID, which is
-// the correct behavior for cluster-wide Reset commands (the cluster's
-// consensus history is preserved across the reset).
-func (s *Cache) localReset(resetID, adoptInstanceID string) error {
-	if resetID == s.getLastResetID() {
-		return nil
-	}
-	s.setLastResetID(resetID)
-
+// reinitRaftAdoptingInstance tears down the local raft and rebuilds it on
+// fresh stores while adopting the given instance ID. This is the
+// fork-history recovery primitive (RT-12862): adoptLeaderInstance calls it
+// when this node observed a forked-history ping from the current raft leader.
+// It first drops stale FSM content the leader's snapshot might not overwrite,
+// then discards the forked in-memory log/snapshot that would otherwise trap
+// this node in a snapshot-regression catchup loop on top of the leader's
+// (possibly older) snapshot. After reinit the leader still has us in its raft
+// configuration, so its heartbeats catch the fresh raft up via the standard
+// AppendEntries / InstallSnapshot probe-back path — no bootstrap here.
+func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string) error {
 	if err := s.fsm.applyReset(); err != nil {
 		return err
 	}
-
-	if s.IsLeader() {
-		// don't reset raft itself on leader.
-		s.logger.Info("cache reset: FSM cleared; keeping raft state because this node is leader",
-			"local-id", s.localID,
-			"reset-id", resetID,
-		)
-		return nil
-	}
-	s.logger.Info("cache reset: FSM cleared; reinitializing raft because this node is a follower",
-		"local-id", s.localID,
-		"reset-id", resetID,
-	)
 
 	s.fsm.applyRaftReset()
 	s.raft().Shutdown()
@@ -731,11 +689,6 @@ func (s *Cache) localReset(resetID, adoptInstanceID string) error {
 	}
 	s.setRaft(rft)
 	s.discovery.run(s.ctx, rft)
-
-	// No bootstrap here: localReset is a follower re-init after a Reset
-	// command. The leader still has us in its raft configuration, so its
-	// heartbeats will catch the fresh raft up via the standard
-	// AppendEntries / InstallSnapshot probe-back path.
 	return nil
 }
 
@@ -784,7 +737,7 @@ func (s *Cache) runQuorumRecoveryWatch(ctx context.Context) {
 
 // watchQuorumOnRaft runs the event-driven recovery loop against a single
 // raft instance. It returns when either ctx (cache shutdown) or ctxRaft
-// (this raft was replaced — e.g. by recoverQuorum or localReset) is done,
+// (this raft was replaced — e.g. by recoverQuorum or reinitRaftAdoptingInstance) is done,
 // so the caller can re-register on the new raft.
 func (s *Cache) watchQuorumOnRaft(ctx, ctxRaft context.Context, rft *raft.Raft, after, aliveCutoff time.Duration) {
 	chObs := make(chan raft.Observation, observationChanSize)
@@ -957,13 +910,13 @@ func (s *Cache) recoverQuorum() error {
 	// transport for the new raft instance we're about to spin up on top of
 	// the same transport. raft.Shutdown() itself is synchronous enough —
 	// it sets the shutdown flag and closes the channel that all internal
-	// goroutines select on. Cache.localReset uses the same pattern.
+	// goroutines select on. reinitRaftAdoptingInstance uses the same pattern.
 	rft.Shutdown()
 
 	// Mint a fresh instance ID — recoverQuorum forks the consensus
 	// history line on purpose (RT-12862). Surviving peers compare the
 	// captain's new ID against their own on the next discovery ping;
-	// any mismatch triggers their localReset, which wipes the stale
+	// any mismatch triggers their reinitRaftAdoptingInstance, which wipes the stale
 	// in-memory log/snapshot state that would otherwise trap them in a
 	// snapshot-regression catchup loop on top of the captain's
 	// (possibly older) recovered snapshot.
@@ -1221,20 +1174,6 @@ func (s *Cache) setRaft(rft *raft.Raft) {
 	s.raftLocker = rft
 }
 
-func (s *Cache) getLastResetID() string {
-	s.raftMutex.RLock()
-	defer s.raftMutex.RUnlock()
-
-	return s.lastResetID
-}
-
-func (s *Cache) setLastResetID(resetID string) {
-	s.raftMutex.Lock()
-	defer s.raftMutex.Unlock()
-
-	s.lastResetID = resetID
-}
-
 // InstanceID returns this cache's current raft instance ID — a UUID that
 // identifies the consensus history line the local raft belongs to. Empty
 // until the cache has either bootstrapped its own cluster, run
@@ -1335,7 +1274,8 @@ func (s *Cache) adoptLeaderInstance(leaderID raft.ServerID, leaderInstanceID str
 		"leader-instance-id", leaderInstanceID,
 		"local-instance-id", s.getInstanceID(),
 	)
-	if err := s.localReset(uuid.NewString(), leaderInstanceID); err != nil {
+
+	if err := s.reinitRaftAdoptingInstance(leaderInstanceID); err != nil {
 		s.logger.Error("instance-id reset failed", "error", err)
 	}
 }

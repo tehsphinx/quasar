@@ -12,9 +12,10 @@ import (
 // or applying any discovery-driven configuration. Bootstrap of the initial
 // cluster configuration is intentionally deferred to the caller: newCache drives
 // the bootstrap decision after discovery has had a chance to learn whether an
-// existing cluster is already out there (see Cache.bootstrap), localReset
-// rejoins as a follower and relies on the leader's heartbeats, and the quorum
-// recovery path has already populated the stores via raft.RecoverCluster.
+// existing cluster is already out there (see Cache.bootstrap),
+// reinitRaftAdoptingInstance rejoins as a follower and relies on the leader's
+// heartbeats, and the quorum recovery path has already populated the stores
+// via raft.RecoverCluster.
 func newRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, stableStore raft.StableStore,
 	snapshotStore raft.SnapshotStore, transport transports.Transport,
 ) (*raft.Raft, error) {

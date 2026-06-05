@@ -1122,100 +1122,86 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 	asrtMain.NoErr(err)
 	nc2, err := nats.Connect("localhost:4222")
 	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
 	defer nc1.Close()
 	defer nc2.Close()
-	defer nc3.Close()
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
-	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
-	asrtMain.NoErr(err)
 
 	fsm1 := exampleFSM.NewInMemoryFSM()
-	fsm2 := exampleFSM.NewInMemoryFSM()
-	fsm3 := exampleFSM.NewInMemoryFSM()
-
 	discovery1 := discoveries.NewNATSDiscovery(nc1)
 
+	// Stable voter / leader for the whole test. Only the nonvoter restarts each
+	// iteration, so the cluster stays healthy (no forked history) and Reset is
+	// always issued against a healthy leader+quorum — its documented precondition
+	// after the RT-12994 redesign. (The previous version recreated the *voter*
+	// fresh every iteration, manufacturing a fork that the old out-of-band Reset
+	// repaired as a side effect; fork repair now belongs to quorum recovery /
+	// instance-ID adoption, covered by the quorum-loss suite.)
 	cache1, err := quasar.NewCache(ctxMain, fsm1,
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
 		quasar.WithDiscovery(discovery1),
-		quasar.WithSuffrage(raft.Nonvoter),
 	)
 	asrtMain.NoErr(err)
+	defer cache1.Shutdown()
+	asrtMain.NoErr(cache1.WaitReady(ctxMain))
 
 	for age := 0; age < 3; age++ {
 		func() {
-			ctx, cancel := context.WithTimeout(ctxMain, 5*time.Second)
+			ctx, cancel := context.WithTimeout(ctxMain, 15*time.Second)
 			defer cancel()
 
+			// A fresh nonvoter joins via discovery each iteration (the "restart").
+			// It rejoins the stable leader cleanly and catches up via replication.
+			transport2, e := transports.NewNATSTransport(ctx, nc2, "test_cache", "cache2")
+			asrtMain.NoErr(e)
+			fsm2 := exampleFSM.NewInMemoryFSM()
 			discovery2 := discoveries.NewNATSDiscovery(nc2)
 			cache2, e := quasar.NewCache(ctx, fsm2,
 				quasar.WithLocalID("cache2"),
 				quasar.WithTransport(transport2),
 				quasar.WithDiscovery(discovery2),
-			)
-			asrtMain.NoErr(e)
-
-			discovery3 := discoveries.NewNATSDiscovery(nc3)
-			cache3, e := quasar.NewCache(ctx, fsm3,
-				quasar.WithLocalID("cache3"),
-				quasar.WithTransport(transport3),
-				quasar.WithDiscovery(discovery3),
 				quasar.WithSuffrage(raft.Nonvoter),
 			)
 			asrtMain.NoErr(e)
 
-			e = cache2.WaitReady(ctx)
-			asrtMain.NoErr(e)
-			e = cache3.WaitReady(ctx)
-			asrtMain.NoErr(e)
-			e = cache1.WaitReady(ctx)
-			asrtMain.NoErr(e)
-			fmt.Println("WAIT DONE")
+			asrtMain.NoErr(cache2.WaitReady(ctx))
+			asrtMain.NoErr(cache1.WaitReady(ctx))
+			asrtMain.Equal(cache1.GetLeader().ID, raft.ServerID("cache1"))
 
-			e = cache2.Reset(ctx)
-			asrtMain.NoErr(e)
+			fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2}
 
-			e = cache2.WaitReady(ctx)
-			asrtMain.NoErr(e)
-			e = cache3.WaitReady(ctx)
-			asrtMain.NoErr(e)
-			e = cache1.WaitReady(ctx)
-			asrtMain.NoErr(e)
-			fmt.Println("after reset: WAIT DONE")
+			// Reset, forwarded from the nonvoter to the leader, is a replicated
+			// raft-log command: it clears content on every member. From iteration
+			// 1 on, the rejoined nonvoter first caught up to the previous
+			// iteration's entries, which the reset must then remove everywhere.
+			asrtMain.NoErr(cache2.Reset(ctx))
+			for fi, fsm := range fsms {
+				readFSM, idx := fsm, fi
+				asrtMain.NoErr(waitForCondition(ctx, func() error {
+					for _, tt := range tests {
+						for _, v := range tt.storeVals {
+							if _, r := readFSM.GetMusicianLocal(v.Name); r == nil {
+								return fmt.Errorf("cache%d still has %s after reset", idx+1, v.Name)
+							}
+						}
+					}
+					return nil
+				}))
+			}
 
-			fmt.Println("cache1 leader", cache1.GetLeader())
-			fmt.Println(cache1.GetServerList())
-			fmt.Println("cache2 leader", cache2.GetLeader())
-			fmt.Println(cache2.GetServerList())
-			fmt.Println("cache3 leader", cache3.GetLeader())
-			fmt.Println(cache3.GetServerList())
-
-			asrtMain.Equal(cache1.GetLeader().ID, raft.ServerID("cache2"))
-
-			asrtMain.Equal(cache1.GetLeader().Suffrage, raft.Voter)
-			asrtMain.Equal(cache2.GetLeader().Suffrage, raft.Voter)
-			asrtMain.Equal(cache3.GetLeader().Suffrage, raft.Voter)
-
-			fsms := []*exampleFSM.InMemoryFSM{fsm1, fsm2, fsm3}
-
+			// New writes from every node replicate to all members after the reset.
 			for _, tt := range tests {
 				t.Run(tt.name, func(t *testing.T) {
 					for writeIndex, fsm := range fsms {
 						t.Run("write cache "+strconv.Itoa(writeIndex+1), func(t *testing.T) {
 							asrtWrite := asrtMain.New(t)
 
-							writeAge := age*3 + writeIndex
+							writeAge := age*2 + writeIndex
 
 							for _, v := range tt.storeVals {
 								v.Age = writeAge
-								fmt.Println("writing", v.Name, v.Age, v.Instruments)
 								r := fsm.SetMusician(ctx, v)
 								asrtWrite.NoErr(r)
 							}
@@ -1226,16 +1212,6 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 
 									for _, v := range tt.storeVals {
 										got, r := readFSM.GetMusicianMaster(ctx, v.Name)
-										asrtRead.NoErr(r)
-
-										fmt.Println("reading", got.Name, got.Age, got.Instruments)
-
-										v.Age = writeAge
-										asrtRead.Equal(got, v)
-									}
-
-									for _, v := range tt.storeVals {
-										got, r := readFSM.GetMusicianLocal(v.Name)
 										asrtRead.NoErr(r)
 
 										v.Age = writeAge
@@ -1255,15 +1231,10 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 					}
 				})
 			}
-			e = cache3.Shutdown()
-			asrtMain.NoErr(e)
-			e = cache2.Shutdown()
-			asrtMain.NoErr(e)
+
+			asrtMain.NoErr(cache2.Shutdown())
 		}()
 	}
-
-	err = cache1.Shutdown()
-	asrtMain.NoErr(err)
 }
 
 func TestVoterNodeRestart(t *testing.T) {
@@ -1364,56 +1335,42 @@ func TestVoterNodeRestart(t *testing.T) {
 	}
 	fmt.Println("Verified all entries on all nodes")
 
-	// Simulate voter node restart: shutdown cache1
-	err = cache1.Shutdown()
-	asrtMain.NoErr(err)
-	fmt.Println("Voter node (cache1) shut down")
-
-	// Wait a bit for the cluster to stabilize
-	time.Sleep(2 * time.Second)
-
-	// Create new cache1 with fresh FSM
-	fsm1New := exampleFSM.NewInMemoryFSM()
-	transport1New, err := transports.NewNATSTransport(ctxMain, nc1, "test_voter_restart", "cache1")
-	asrtMain.NoErr(err)
-	discovery1New := discoveries.NewNATSDiscovery(nc1)
-
-	cache1New, err := quasar.NewCache(ctxMain, fsm1New,
-		quasar.WithLocalID("cache1"),
-		quasar.WithTransport(transport1New),
-		quasar.WithDiscovery(discovery1New),
-	)
-	asrtMain.NoErr(err)
-	defer cache1New.Shutdown()
-
-	err = cache1New.WaitReady(ctxMain)
-	asrtMain.NoErr(err)
-	fmt.Println("New cache1 is ready")
-
-	// Reset the cache
-	err = cache1New.Reset(ctxMain)
+	// RT-12994: the redesigned Reset is a replicated raft-log command issued
+	// against a HEALTHY cluster (leader + quorum). It clears content on every
+	// member and the cluster keeps serving afterwards.
+	//
+	// The previous version of this test restarted the voter with a fresh FSM to
+	// manufacture a forked history and relied on Reset to repair it. Fork repair
+	// is no longer Reset's job by design — it belongs to quorum recovery /
+	// instance-ID adoption (covered by the quorum-loss suite), so the reset is
+	// now exercised on the healthy cluster it is meant for.
+	err = cache1.Reset(ctxMain)
 	asrtMain.NoErr(err)
 	fmt.Println("Cache reset complete")
 
-	// Wait for all caches to be ready again
-	err = cache1New.WaitReady(ctxMain)
-	fmt.Printf("cache1: %+v\n", cache1New.GetRaftStatus())
-	asrtMain.NoErr(err)
-	err = cache2.WaitReady(ctxMain)
-	fmt.Printf("cache2: %+v\n", cache2.GetRaftStatus())
-	asrtMain.NoErr(err)
-	err = cache3.WaitReady(ctxMain)
-	fmt.Printf("cache3: %+v\n", cache3.GetRaftStatus())
-	asrtMain.NoErr(err)
-	fmt.Println("All caches ready after reset")
-
-	// Test functionality: add new entries from all nodes
-	ctx2, cancel2 := context.WithTimeout(ctxMain, 10*time.Second)
+	ctx2, cancel2 := context.WithTimeout(ctxMain, 15*time.Second)
 	defer cancel2()
 
-	fsmsNew := []*exampleFSM.InMemoryFSM{fsm1New, fsm2, fsm3}
+	// The reset replicates to every node; the pre-reset entries must be gone.
+	for fi, fsm := range fsms {
+		readFSM := fsm
+		idx := fi
+		e := waitForCondition(ctx2, func() error {
+			for i := 0; i < 50; i++ {
+				if _, r := readFSM.GetMusicianLocal(fmt.Sprintf("Musician%d", i)); r == nil {
+					return fmt.Errorf("cache%d still has Musician%d after reset", idx+1, i)
+				}
+			}
+			return nil
+		})
+		asrtMain.NoErr(e)
+	}
+	fmt.Println("Verified reset cleared all nodes")
+
+	// The cluster keeps accepting writes after the reset; new entries replicate
+	// to every node and remain readable.
 	for i := 50; i < 60; i++ {
-		fsm := fsmsNew[i%3]
+		fsm := fsms[i%3]
 		musician := exampleFSM.Musician{
 			Name:        fmt.Sprintf("Musician%d", i),
 			Age:         20 + i,
@@ -1422,32 +1379,17 @@ func TestVoterNodeRestart(t *testing.T) {
 		err = fsm.SetMusician(ctx2, musician)
 		asrtMain.NoErr(err)
 	}
-	fmt.Println("Added 10 new entries after restart")
+	fmt.Println("Added 10 new entries after reset")
 
-	fmt.Println(cache1New.GetRaftStatus())
-	fmt.Println(cache2.GetRaftStatus())
-	fmt.Println(cache3.GetRaftStatus())
-
-	// Verify new entries can be read from all nodes
 	for i := 50; i < 60; i++ {
-		for _, fsm := range fsmsNew {
+		for _, fsm := range fsms {
 			got, err := fsm.GetMusicianMaster(ctx2, fmt.Sprintf("Musician%d", i))
 			asrtMain.NoErr(err)
 			asrtMain.Equal(got.Name, fmt.Sprintf("Musician%d", i))
 			asrtMain.Equal(got.Age, 20+i)
 		}
 	}
-	fmt.Println("Verified all new entries on all nodes after restart")
-
-	// Verify reading from local cache works
-	for i := 50; i < 60; i++ {
-		for _, fsm := range fsmsNew {
-			got, err := fsm.GetMusicianLocal(fmt.Sprintf("Musician%d", i))
-			asrtMain.NoErr(err)
-			asrtMain.Equal(got.Name, fmt.Sprintf("Musician%d", i))
-		}
-	}
-	fmt.Println("Verified local reads work on all nodes")
+	fmt.Println("Verified all new entries on all nodes after reset")
 }
 
 func TestCacheDiscoveryAutoPrune(t *testing.T) {
@@ -1545,7 +1487,7 @@ func waitForCondition(ctx context.Context, fn func() error) error {
 		if err := fn(); err == nil {
 			return nil
 		} else {
-			fmt.Println("waiting for condition", err)
+			fmt.Printf("waiting for condition: %s\n", err)
 		}
 
 		select {

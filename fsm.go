@@ -92,6 +92,8 @@ func (s *fsmWrapper) apply(log *raft.Log, command *pb.Command) (*pb.CommandRespo
 	switch cmd := command.GetCmd().(type) {
 	case *pb.Command_Store:
 		return s.store(log, cmd.Store)
+	case *pb.Command_ResetCache:
+		return nil, s.applyReset()
 	default:
 		// fmt.Printf("%+v\n", command)
 		return nil, errors.New("fsmWrapper.apply: command not implemented")

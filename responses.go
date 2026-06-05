@@ -27,3 +27,11 @@ func respRemoveServer(cmd *pb.RemoveServerResponse) *pb.CommandResponse {
 		},
 	}
 }
+
+func respResetCache(cmd *pb.ResetCacheResponse) *pb.CommandResponse {
+	return &pb.CommandResponse{
+		Resp: &pb.CommandResponse_ResetCache{
+			ResetCache: cmd,
+		},
+	}
+}
