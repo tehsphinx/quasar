@@ -480,25 +480,6 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 		return err
 	}
 
-	if s.IsLeader() {
-		// If we ourselves became leader, attempt leadership transfer.
-		// This way we avoid new cache taking leadership of older instances.
-		s.logger.Info("WaitReady: local node holds leadership after restart; attempting voluntary leadership transfer",
-			"local-id", s.localID,
-		)
-		fut := s.raft().LeadershipTransfer()
-		if r := fut.Error(); r != nil {
-			s.logger.Info("WaitReady: voluntary leadership transfer failed; staying leader",
-				"local-id", s.localID,
-				"error", r.Error(),
-			)
-		}
-
-		if err := s.waitForLeader(ctx); err != nil {
-			return err
-		}
-	}
-
 	// wait for master index to be applied locally
 	uid, err := s.masterLastIndex(ctx)
 	if err != nil {
