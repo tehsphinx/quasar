@@ -190,11 +190,11 @@ func TestKVCacheClusterNATS(t *testing.T) {
 	nc3, err := nats.Connect("localhost:4222")
 	asrtMain.NoErr(err)
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, t.Name(), "cache3")
 	asrtMain.NoErr(err)
 
 	cache1, err := quasar.NewKVCache(ctxMain,

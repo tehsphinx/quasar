@@ -21,6 +21,15 @@ import (
 const (
 	applyTimeout           = 5 * time.Second
 	defaultNoLeaderTimeout = 8 * time.Second
+	// defaultBootstrapWait is how long a discovery-based voter waits at
+	// startup for an existing cluster to announce itself before
+	// bootstrapping a single-node cluster (see WithBootstrapWait). Sized to
+	// cover the discovery ping cadence (the NATS discovery pings every
+	// 2-5s) so a restarting voter reliably observes an established peer and
+	// rejoins as a follower instead of racing into a competing single-node
+	// universe. The wait aborts as soon as a peer is seen, so only a genuine
+	// cold start (no cluster out there yet) pays the full duration.
+	defaultBootstrapWait = 5 * time.Second
 	observationChanSize    = 5
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the

@@ -46,10 +46,11 @@ type options struct {
 
 func getOptions(opts []Option) options {
 	cfg := options{
-		cacheName: "quasar",
-		localID:   uuid.NewString(),
-		suffrage:  raft.Voter,
+		cacheName:       "quasar",
+		localID:         uuid.NewString(),
+		suffrage:        raft.Voter,
 		noLeaderTimeout: defaultNoLeaderTimeout,
+		bootstrapWait:   defaultBootstrapWait,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -228,10 +229,12 @@ func WithQuorumRecovery(after time.Duration) Option {
 // any peer is observed, so it only costs the full `after` in the cold-start
 // case where there genuinely is nothing else out there yet.
 //
-// Only effective when a Discovery is configured. A zero value preserves the
-// pre-RT-12775 behavior of unconditionally bootstrapping the local node at
-// startup, which can race with an existing cluster and create competing
-// single-node universes on restart.
+// Only effective when a Discovery is configured. Defaults to
+// defaultBootstrapWait (5s) so discovery-based voters are safe by default;
+// pass a zero value to explicitly opt out and restore the pre-RT-12775
+// behavior of unconditionally bootstrapping the local node at startup, which
+// can race with an existing cluster and create competing single-node
+// universes on restart.
 func WithBootstrapWait(after time.Duration) Option {
 	return func(o *options) {
 		o.bootstrapWait = after

@@ -332,11 +332,11 @@ func TestCacheClusterNATS(t *testing.T) {
 	defer nc2.Close()
 	defer nc3.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache1", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache1", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache1", "cache3")
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, t.Name(), "cache3")
 	asrtMain.NoErr(err)
 
 	fsm1 := exampleFSM.NewInMemoryFSM()
@@ -452,9 +452,9 @@ func TestNatsFail(t *testing.T) {
 	defer nc1.Close()
 	defer nc2.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache1", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache1", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
 
 	fsm1 := exampleFSM.NewInMemoryFSM()
@@ -558,11 +558,11 @@ func TestInstallSnapshot(t *testing.T) {
 	defer nc2.Close()
 	defer nc3.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache2", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache2", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache2", "cache3")
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, t.Name(), "cache3")
 	asrtMain.NoErr(err)
 
 	raftCfg := raft.DefaultConfig()
@@ -685,11 +685,11 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 	defer nc2.Close()
 	defer nc3.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, t.Name(), "cache3")
 	asrtMain.NoErr(err)
 
 	fsm1 := exampleFSM.NewInMemoryFSM()
@@ -704,6 +704,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
 		quasar.WithDiscovery(discovery1),
+		quasar.WithName(t.Name()),
 	)
 	asrtMain.NoErr(err)
 	defer cache1.Shutdown()
@@ -712,6 +713,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 		quasar.WithLocalID("cache2"),
 		quasar.WithTransport(transport2),
 		quasar.WithDiscovery(discovery2),
+		quasar.WithName(t.Name()),
 	)
 	asrtMain.NoErr(err)
 	defer cache2.Shutdown()
@@ -720,6 +722,7 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 		quasar.WithLocalID("cache3"),
 		quasar.WithTransport(transport3),
 		quasar.WithDiscovery(discovery3),
+		quasar.WithName(t.Name()),
 	)
 	asrtMain.NoErr(err)
 	defer cache3.Shutdown()
@@ -823,7 +826,7 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 	defer nc2.Close()
 	defer nc3.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
 	fsm1 := exampleFSM.NewInMemoryFSM()
 	discovery1 := discoveries.NewNATSDiscovery(nc1)
@@ -831,12 +834,13 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
 		quasar.WithDiscovery(discovery1),
+		quasar.WithName(t.Name()),
 		quasar.WithSuffrage(raft.Nonvoter),
 	)
 	asrtMain.NoErr(err)
 	defer cache1.Shutdown()
 
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
 	fsm2 := exampleFSM.NewInMemoryFSM()
 	discovery2 := discoveries.NewNATSDiscovery(nc2)
@@ -844,12 +848,13 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 		quasar.WithLocalID("cache2"),
 		quasar.WithTransport(transport2),
 		quasar.WithDiscovery(discovery2),
+		quasar.WithName(t.Name()),
 		quasar.WithSuffrage(raft.Nonvoter),
 	)
 	asrtMain.NoErr(err)
 	defer cache2.Shutdown()
 
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, t.Name(), "cache3")
 	asrtMain.NoErr(err)
 	fsm3 := exampleFSM.NewInMemoryFSM()
 	discovery3 := discoveries.NewNATSDiscovery(nc3)
@@ -857,6 +862,7 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 		quasar.WithLocalID("cache3"),
 		quasar.WithTransport(transport3),
 		quasar.WithDiscovery(discovery3),
+		quasar.WithName(t.Name()),
 	)
 	asrtMain.NoErr(err)
 	defer cache3.Shutdown()
@@ -972,11 +978,11 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 	defer nc2.Close()
 	defer nc3.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_cache", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_cache", "cache3")
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, t.Name(), "cache3")
 	asrtMain.NoErr(err)
 
 	fsm1 := exampleFSM.NewInMemoryFSM()
@@ -989,6 +995,7 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
 		quasar.WithDiscovery(discovery1),
+		quasar.WithName(t.Name()),
 	)
 	asrtMain.NoErr(err)
 
@@ -1002,6 +1009,7 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 				quasar.WithLocalID("cache2"),
 				quasar.WithTransport(transport2),
 				quasar.WithDiscovery(discovery2),
+				quasar.WithName(t.Name()),
 			)
 			asrtMain.NoErr(e)
 
@@ -1010,6 +1018,7 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 				quasar.WithLocalID("cache3"),
 				quasar.WithTransport(transport3),
 				quasar.WithDiscovery(discovery3),
+				quasar.WithName(t.Name()),
 			)
 			asrtMain.NoErr(e)
 
@@ -1125,7 +1134,7 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 	defer nc1.Close()
 	defer nc2.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_cache", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
 
 	fsm1 := exampleFSM.NewInMemoryFSM()
@@ -1142,6 +1151,7 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
 		quasar.WithDiscovery(discovery1),
+		quasar.WithName(t.Name()),
 	)
 	asrtMain.NoErr(err)
 	defer cache1.Shutdown()
@@ -1154,7 +1164,7 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 
 			// A fresh nonvoter joins via discovery each iteration (the "restart").
 			// It rejoins the stable leader cleanly and catches up via replication.
-			transport2, e := transports.NewNATSTransport(ctx, nc2, "test_cache", "cache2")
+			transport2, e := transports.NewNATSTransport(ctx, nc2, t.Name(), "cache2")
 			asrtMain.NoErr(e)
 			fsm2 := exampleFSM.NewInMemoryFSM()
 			discovery2 := discoveries.NewNATSDiscovery(nc2)
@@ -1162,6 +1172,7 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 				quasar.WithLocalID("cache2"),
 				quasar.WithTransport(transport2),
 				quasar.WithDiscovery(discovery2),
+				quasar.WithName(t.Name()),
 				quasar.WithSuffrage(raft.Nonvoter),
 			)
 			asrtMain.NoErr(e)
@@ -1253,11 +1264,11 @@ func TestVoterNodeRestart(t *testing.T) {
 	defer nc2.Close()
 	defer nc3.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_voter_restart", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_voter_restart", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_voter_restart", "cache3")
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, t.Name(), "cache3")
 	asrtMain.NoErr(err)
 
 	fsm1 := exampleFSM.NewInMemoryFSM()
@@ -1273,6 +1284,7 @@ func TestVoterNodeRestart(t *testing.T) {
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
 		quasar.WithDiscovery(discovery1),
+		quasar.WithName(t.Name()),
 	)
 	asrtMain.NoErr(err)
 	defer cache1.Shutdown()
@@ -1282,6 +1294,7 @@ func TestVoterNodeRestart(t *testing.T) {
 		quasar.WithLocalID("cache2"),
 		quasar.WithTransport(transport2),
 		quasar.WithDiscovery(discovery2),
+		quasar.WithName(t.Name()),
 		quasar.WithSuffrage(raft.Nonvoter),
 	)
 	asrtMain.NoErr(err)
@@ -1291,6 +1304,7 @@ func TestVoterNodeRestart(t *testing.T) {
 		quasar.WithLocalID("cache3"),
 		quasar.WithTransport(transport3),
 		quasar.WithDiscovery(discovery3),
+		quasar.WithName(t.Name()),
 		quasar.WithSuffrage(raft.Nonvoter),
 	)
 	asrtMain.NoErr(err)
@@ -1408,11 +1422,11 @@ func TestCacheDiscoveryAutoPrune(t *testing.T) {
 	defer nc2.Close()
 	defer nc3.Close()
 
-	transport1, err := transports.NewNATSTransport(ctxMain, nc1, "test_auto_prune", "cache1")
+	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
-	transport2, err := transports.NewNATSTransport(ctxMain, nc2, "test_auto_prune", "cache2")
+	transport2, err := transports.NewNATSTransport(ctxMain, nc2, t.Name(), "cache2")
 	asrtMain.NoErr(err)
-	transport3, err := transports.NewNATSTransport(ctxMain, nc3, "test_auto_prune", "cache3")
+	transport3, err := transports.NewNATSTransport(ctxMain, nc3, t.Name(), "cache3")
 	asrtMain.NoErr(err)
 
 	fsm1 := exampleFSM.NewInMemoryFSM()
@@ -1423,6 +1437,7 @@ func TestCacheDiscoveryAutoPrune(t *testing.T) {
 		quasar.WithLocalID("cache1"),
 		quasar.WithTransport(transport1),
 		quasar.WithDiscovery(discoveries.NewNATSDiscovery(nc1)),
+		quasar.WithName(t.Name()),
 		quasar.WithAutoPrune(6*time.Second),
 	)
 	asrtMain.NoErr(err)
@@ -1432,6 +1447,7 @@ func TestCacheDiscoveryAutoPrune(t *testing.T) {
 		quasar.WithLocalID("cache2"),
 		quasar.WithTransport(transport2),
 		quasar.WithDiscovery(discoveries.NewNATSDiscovery(nc2)),
+		quasar.WithName(t.Name()),
 		quasar.WithAutoPrune(6*time.Second),
 	)
 	asrtMain.NoErr(err)
@@ -1441,6 +1457,7 @@ func TestCacheDiscoveryAutoPrune(t *testing.T) {
 		quasar.WithLocalID("cache3"),
 		quasar.WithTransport(transport3),
 		quasar.WithDiscovery(discoveries.NewNATSDiscovery(nc3)),
+		quasar.WithName(t.Name()),
 		quasar.WithAutoPrune(6*time.Second),
 	)
 	asrtMain.NoErr(err)

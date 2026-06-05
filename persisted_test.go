@@ -172,7 +172,17 @@ func TestPersistedFIFO_WithoutHub_StaysOnLegacyPath(t *testing.T) {
 
 	readCtx, cancelR := context.WithTimeout(ctxMain, 3*time.Second)
 	defer cancelR()
-	got, err := fsm2.GetMusicianKnownLatest(readCtx, "Legacy")
-	asrt.NoErr(err)
-	asrt.Equal(got.Name, "Legacy")
+	// GetMusicianKnownLatest only waits for the nonvoter's already-known
+	// index, so under load the legacy-path replication to n2 can lag the
+	// read. Retry until it lands (like TestPersistedFIFO_ThreeNodeWriteFromAnyNode).
+	asrt.NoErr(waitForCondition(readCtx, func() error {
+		got, e := fsm2.GetMusicianKnownLatest(readCtx, "Legacy")
+		if e != nil {
+			return e
+		}
+		if got.Name != "Legacy" {
+			return fmt.Errorf("missing %q", "Legacy")
+		}
+		return nil
+	}))
 }
