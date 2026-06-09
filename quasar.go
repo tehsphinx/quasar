@@ -711,11 +711,30 @@ func (s *Cache) HardReset(ctx context.Context) error {
 			retErrs = append(retErrs, r)
 		}
 	}
-	if r := s.localHardReset(resetID); r != nil {
+	if r := s.localInitiatorReset(resetID); r != nil {
 		retErrs = append(retErrs, r)
 	}
 
 	return errors.Join(retErrs...)
+}
+
+// localInitiatorReset clears the FSM on the node that initiates a HardReset but
+// always KEEPS its raft, regardless of whether it currently holds leadership.
+// The initiator is the node that must lead the cluster back: every remote peer
+// is wiped to fresh stores, so if the initiator wiped its own raft too no node
+// would retain a configuration and there would be nobody to bootstrap recovery
+// — the cluster would deadlock with empty configs (RT-13034). Keeping the
+// initiator's raft lets it (re)win the election against the now-reset peers and
+// catch them up via the standard heartbeat / AppendEntries path.
+func (s *Cache) localInitiatorReset(resetID string) error {
+	if resetID != "" && resetID == s.getLastResetID() {
+		return nil
+	}
+	s.setLastResetID(resetID)
+
+	s.logger.Info("hard reset: FSM cleared; keeping raft state on the reset initiator",
+		"local-id", s.localID, "reset-id", resetID)
+	return s.fsm.applyReset()
 }
 
 // sendHardReset sends an out-of-band hard ResetCache RPC to a single remote
