@@ -239,6 +239,7 @@ type Cache struct {
 	ctxRaft       context.Context
 	closeRaft     context.CancelFunc
 	instanceID    string
+	lastResetID   string
 	raftLocker    *raft.Raft
 	logStore      raft.LogStore
 	stableStore   raft.StableStore
@@ -590,7 +591,11 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 				uid, err = s.store(ctx, cmd.Key, cmd.Data)
 				resp = &pb.StoreResponse{Uid: uid}
 			case *pb.ResetCache:
-				err = s.reset(ctx)
+				if cmd.Hard {
+					err = s.localHardReset(cmd.Uuid)
+				} else {
+					err = s.reset(ctx)
+				}
 				resp = &pb.ResetCacheResponse{Uuid: cmd.Uuid}
 			case *pb.RemoveServer:
 				err = s.removeServer(cmd.Id)
@@ -672,6 +677,84 @@ func (s *Cache) Reset(ctx context.Context) error {
 func (s *Cache) reset(ctx context.Context) error {
 	_, _, err := s.apply(ctx, cmdReset(), storeOpts{})
 	return err
+}
+
+// HardReset forcibly resets the cache AND the underlying raft on every node by
+// sending an out-of-band ResetCache RPC (hard=true) to each server in the
+// configuration — it does NOT go through the raft log. A follower that receives
+// it tears down and rebuilds its raft on fresh stores, discarding the
+// log/term/vote/snapshot that made it ahead; the leader only clears its FSM and
+// catches the wiped followers back up via heartbeats. This is the recovery path
+// for a wedged cluster where the log-based Reset cannot commit because a node is
+// ahead of a freshly (re)started leader and no leader can be elected (RT-13034).
+//
+// A HardReset must be followed by a normal Reset once the cluster is stable
+// again, to re-anchor the reset in the new log history / snapshots — the hard
+// reset clears each FSM out-of-band, which on its own does not carry the
+// snapshot-regression guarantee the log-based reset provides (RT-12994).
+func (s *Cache) HardReset(ctx context.Context) error {
+	servers, err := s.GetServerList()
+	if err != nil {
+		return err
+	}
+
+	s.logger.Info("hard cache reset triggered")
+
+	resetID := uuid.NewString()
+
+	var retErrs []error
+	for _, server := range servers {
+		if server.ID == raft.ServerID(s.localID) {
+			continue
+		}
+		if r := s.sendHardReset(ctx, server, resetID); r != nil {
+			retErrs = append(retErrs, r)
+		}
+	}
+	if r := s.localHardReset(resetID); r != nil {
+		retErrs = append(retErrs, r)
+	}
+
+	return errors.Join(retErrs...)
+}
+
+// sendHardReset sends an out-of-band hard ResetCache RPC to a single remote
+// server. The receiver runs localHardReset on its side (see consume).
+func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID string) error {
+	resp, err := s.transport.ResetCache(ctx, server.ID, server.Address, &pb.ResetCache{
+		Uuid: resetID,
+		Hard: true,
+	})
+	if err != nil {
+		return err
+	}
+	if resp.GetError() != "" {
+		return errors.New(resp.GetError())
+	}
+	return nil
+}
+
+// localHardReset applies a hard reset to this node. resetID deduplicates resets
+// already applied here (an out-of-band RPC racing the addServer resend), so a
+// node is never wiped twice for the same reset. On the leader it only clears the
+// FSM (keeping raft so its heartbeats can catch up the wiped followers); on a
+// follower it reinitializes raft on fresh stores via reinitRaftAdoptingInstance,
+// discarding the log/term/vote/snapshot that made it ahead.
+func (s *Cache) localHardReset(resetID string) error {
+	if resetID != "" && resetID == s.getLastResetID() {
+		return nil
+	}
+	s.setLastResetID(resetID)
+
+	if s.IsLeader() {
+		s.logger.Info("hard reset: FSM cleared; keeping raft state because this node is leader",
+			"local-id", s.localID, "reset-id", resetID)
+		return s.fsm.applyReset()
+	}
+
+	s.logger.Info("hard reset: reinitializing raft because this node is a follower",
+		"local-id", s.localID, "reset-id", resetID)
+	return s.reinitRaftAdoptingInstance("")
 }
 
 // reinitRaftAdoptingInstance tears down the local raft and rebuilds it on
@@ -1224,6 +1307,23 @@ func (s *Cache) setInstanceID(id string) {
 	defer s.raftMutex.Unlock()
 
 	s.instanceID = id
+}
+
+// getLastResetID returns the ID of the most recent hard reset applied to (or
+// initiated by) this node. Used to deduplicate hard resets and to drive the
+// addServer resend so a peer that (re)joins after a HardReset is wiped too.
+func (s *Cache) getLastResetID() string {
+	s.raftMutex.RLock()
+	defer s.raftMutex.RUnlock()
+
+	return s.lastResetID
+}
+
+func (s *Cache) setLastResetID(resetID string) {
+	s.raftMutex.Lock()
+	defer s.raftMutex.Unlock()
+
+	s.lastResetID = resetID
 }
 
 // noteLeaderInstanceID is called by the discovery layer for every received

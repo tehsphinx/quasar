@@ -185,6 +185,15 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 		return r
 	}
 
+	// If a hard reset has happened, wipe any peer that (re)joins afterwards so a
+	// node that was unreachable during the HardReset fan-out — and is therefore
+	// still ahead — cannot re-wedge the cluster on rejoin (RT-13034).
+	if resetID := s.cache.getLastResetID(); resetID != "" {
+		if r := s.cache.sendHardReset(context.Background(), srv, resetID); r != nil {
+			return r
+		}
+	}
+
 	return nil
 }
 

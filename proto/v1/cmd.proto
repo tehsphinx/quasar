@@ -61,6 +61,12 @@ message ResetCache {
   // A random UUID to identify the reset. This is used to make sure that a reset is only done once
   // and applied to all nodes.
   string uuid = 1;
+
+  // hard requests an out-of-band hard reset: the receiving node tears down and rebuilds its raft on
+  // fresh stores (dropping log, term, vote and snapshot) instead of forwarding a log-replicated soft
+  // reset to the leader. Used to recover a cluster where a node is ahead of a freshly (re)started
+  // leader and no leader can be elected (RT-13034).
+  bool hard = 2;
 }
 
 message ResetCacheResponse {

@@ -178,6 +178,141 @@ func TestResetReplicatesAndClearsLateJoiner(t *testing.T) {
 	}
 }
 
+// TestHardResetThenSoftResetClearsCluster exercises the RT-13034 recovery
+// sequence. HardReset is an out-of-band fan-out (NOT a raft-log command): it
+// sends a hard ResetCache RPC to every server, the leader only clears its FSM
+// while every follower tears down and rebuilds its raft on fresh stores
+// (dropping log/term/vote/snapshot) so a node that is ahead of a freshly
+// (re)started leader stops being ahead and the cluster can form again. The hard
+// reset clears FSMs out-of-band but does NOT remove entries from the leader's
+// log, so it must be followed by a normal Reset once the cluster is stable: the
+// soft reset anchors the clear in the log history / snapshots (RT-12994). This
+// test runs the full sequence and asserts the cluster reconverges, the cleared
+// content stays gone, and writes still flow.
+func TestHardResetThenSoftResetClearsCluster(t *testing.T) {
+	const discoveryTick = 200 * time.Millisecond
+
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelMain()
+
+	asrt := is.New(t)
+	bus := newInmemBus()
+
+	specs := []string{"v1", "n2"}
+	addrs := map[string]raft.ServerAddress{}
+	trs := map[string]*transports.InmemTransport{}
+	for _, id := range specs {
+		addr, tr := transports.NewInmemTransport("")
+		addrs[id] = addr
+		trs[id] = tr
+	}
+	for id, tr := range trs {
+		for otherID, otherTr := range trs {
+			if id == otherID {
+				continue
+			}
+			tr.Connect(addrs[otherID], otherTr)
+		}
+	}
+
+	startNode := func(id string, suffrage raft.ServerSuffrage) *resetNode {
+		fsm := exampleFSM.NewInMemoryFSM()
+		c, err := quasar.NewCache(ctxMain, fsm,
+			quasar.WithLocalID(id),
+			quasar.WithTransport(trs[id]),
+			quasar.WithDiscovery(newInmemDiscovery(bus, discoveryTick)),
+			quasar.WithSuffrage(suffrage),
+		)
+		asrt.NoErr(err)
+		return &resetNode{id: id, cache: c, fsm: fsm}
+	}
+
+	nodes := map[string]*resetNode{}
+	nodes["v1"] = startNode("v1", raft.Voter)
+	nodes["n2"] = startNode("n2", raft.Nonvoter)
+	defer func() {
+		for _, n := range nodes {
+			_ = n.cache.Shutdown()
+		}
+	}()
+
+	asrt.NoErr(nodes["v1"].cache.WaitReady(ctxMain))
+	asrt.NoErr(nodes["n2"].cache.WaitReady(ctxMain))
+
+	settleCtx, cancelSettle := context.WithTimeout(ctxMain, 15*time.Second)
+	defer cancelSettle()
+	asrt.NoErr(waitForCondition(settleCtx, func() error {
+		srvs, e := nodes["v1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		if len(srvs) != 2 {
+			return fmt.Errorf("v1 sees %d servers, want 2", len(srvs))
+		}
+		return nil
+	}))
+
+	// Populate and replicate to the follower.
+	writeCtx, cancelWrite := context.WithTimeout(ctxMain, 10*time.Second)
+	defer cancelWrite()
+	for _, name := range []string{"alice", "bob", "carol"} {
+		asrt.NoErr(writeMusician(writeCtx, nodes["v1"].fsm, name))
+	}
+	asrt.NoErr(waitForCondition(writeCtx, func() error {
+		return hasAll(nodes["n2"].fsm, "alice", "bob", "carol")
+	}))
+
+	// Step 1 — HardReset from the leader: fan-out hard RPC to every server. This
+	// tears down and rebuilds the follower's raft on fresh stores. The follower
+	// must reconverge on the leader afterwards (its raft was replaced).
+	asrt.NoErr(nodes["v1"].cache.HardReset(ctxMain))
+
+	reconvCtx, cancelReconv := context.WithTimeout(ctxMain, 15*time.Second)
+	defer cancelReconv()
+	asrt.NoErr(waitForCondition(reconvCtx, func() error {
+		if !nodes["n2"].cache.GetRaftStatus().HasLeader {
+			return fmt.Errorf("n2 has no leader after hard reset")
+		}
+		srvs, e := nodes["v1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		if len(srvs) != 2 {
+			return fmt.Errorf("v1 sees %d servers, want 2 after hard reset", len(srvs))
+		}
+		return nil
+	}))
+
+	// Step 2 — the mandatory soft Reset once the cluster is stable again. It is a
+	// committed log entry, so it clears every FSM and stays cleared across
+	// replication / snapshots (RT-12994).
+	asrt.NoErr(nodes["v1"].cache.Reset(ctxMain))
+
+	clearCtx, cancelClear := context.WithTimeout(ctxMain, 15*time.Second)
+	defer cancelClear()
+	asrt.NoErr(waitForCondition(clearCtx, func() error {
+		if e := allCleared(nodes["v1"].fsm, "alice", "bob", "carol"); e != nil {
+			return fmt.Errorf("v1: %w", e)
+		}
+		if e := allCleared(nodes["n2"].fsm, "alice", "bob", "carol"); e != nil {
+			return fmt.Errorf("n2: %w", e)
+		}
+		return nil
+	}))
+
+	// A post-reset write must replicate to the follower, and the pre-reset
+	// content must stay gone on every node.
+	asrt.NoErr(writeMusician(clearCtx, nodes["v1"].fsm, "dave"))
+	asrt.NoErr(waitForCondition(clearCtx, func() error {
+		return hasAll(nodes["n2"].fsm, "dave")
+	}))
+
+	for _, id := range specs {
+		asrt.NoErr(allCleared(nodes[id].fsm, "alice", "bob", "carol"))
+		asrt.NoErr(hasAll(nodes[id].fsm, "dave"))
+	}
+}
+
 // TestResetSurvivesQuorumRecovery is the regression guard for RT-12994's
 // secondary fault: a reset that cleared content used to be silently reverted
 // by a later snapshot restore / quorum recovery, because the reset was an
