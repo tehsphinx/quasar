@@ -30,7 +30,7 @@ const (
 	// universe. The wait aborts as soon as a peer is seen, so only a genuine
 	// cold start (no cluster out there yet) pays the full duration.
 	defaultBootstrapWait = 5 * time.Second
-	observationChanSize    = 5
+	observationChanSize  = 5
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the
 	// discovery alive-window to expire. Sized for a healthy LAN: long
@@ -407,6 +407,11 @@ func getTimeout(ctx context.Context, timeout time.Duration) time.Duration {
 }
 
 func (s *Cache) applyRemote(ctx context.Context, command *pb.Command) (*pb.CommandResponse, uint64, error) {
+	resp, uid, err := s.applyRemoteCmd(ctx, command)
+	return resp, uid, reattachNoLeader(err)
+}
+
+func (s *Cache) applyRemoteCmd(ctx context.Context, command *pb.Command) (*pb.CommandResponse, uint64, error) {
 	addr, id, err := s.getLeaderWait(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get leader: %w: %w", err, ErrNoLeader)

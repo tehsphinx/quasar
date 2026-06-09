@@ -26,6 +26,7 @@ import (
 func (s *Cache) routePersisted(ctx context.Context, storeCmd *pb.Store, opts storeOpts) (*pb.CommandResponse, uint64, error) {
 	resp, err := s.transport.StorePersisted(ctx, storeCmd)
 	if err != nil {
+		err = reattachNoLeader(err)
 		if opts.retry && ctxTimedOut(ctx, err) {
 			return nil, 0, fmt.Errorf("%w: %w", ErrRetrying, err)
 		}
