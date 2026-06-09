@@ -499,3 +499,86 @@ func TestNATSTransport_Heartbeat_BypassesStuckEntriesPath(t *testing.T) {
 		t.Fatalf("heartbeat did not complete while entries.append was wedged — dedicated heartbeat subscription likely not engaged")
 	}
 }
+
+// TestNATSTransport_Heartbeat_FallsBackToEntriesAppendWhenUnanswered is the
+// RT-13010 regression test. It reproduces a peer that is subscribed to
+// entries.heartbeat but never answers it -- e.g. its heartbeat fast-path
+// (raft SetHeartbeatHandler) is wired to a raft instance torn down during a
+// reinit, so processHeartbeat returns on a closed shutdownCh without
+// responding. The leader must not loop on "context deadline exceeded"
+// forever: after heartbeatTimeout it falls back to entries.append, and the
+// receiver routes that fallback to the live raft's consumer loop (chConsume)
+// -- not back through the dead heartbeatFn -- so the round-trip completes.
+func TestNATSTransport_Heartbeat_FallsBackToEntriesAppendWhenUnanswered(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	trans1, err := makeNATSTransport(ctx, t, "test-cache", "hbfb-server1")
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	defer trans1.conn.Close()
+
+	// Subscribed to entries.heartbeat but deliberately never responds:
+	// models a heartbeat fast-path bound to a shut-down raft.
+	trans1.SetHeartbeatHandler(func(_ raft.RPC) {})
+
+	resp := raft.AppendEntriesResponse{Term: 10, LastLog: 90, Success: true}
+
+	// The live raft: drain the regular consumer and answer. The fallback
+	// heartbeat arrives here once entries.heartbeat times out.
+	var servedViaConsumer atomic.Bool
+	go func() {
+		for {
+			select {
+			case rpc := <-trans1.Consumer():
+				servedViaConsumer.Store(true)
+				rpc.Respond(&resp, nil)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Sender with a short heartbeat timeout so the fallback kicks in quickly.
+	nc, err := nats.Connect(natsURL, nats.Timeout(natsTimeout))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	trans2, err := NewNATSTransport(ctx, nc, "test-cache", "hbfb-server2",
+		WithNATSLogger(newTestLogger(t)),
+		WithNATSTimeout(natsTimeout),
+		WithNATSHeartbeatTimeout(500*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer trans2.conn.Close()
+
+	hbArgs := raft.AppendEntriesRequest{
+		Term:      10,
+		RPCHeader: raft.RPCHeader{Addr: []byte("kenny")},
+	}
+
+	done := make(chan error, 1)
+	var out raft.AppendEntriesResponse
+	go func() {
+		done <- trans2.AppendEntries("id1", trans1.LocalAddr(), &hbArgs, &out)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("heartbeat did not fall back to entries.append: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("heartbeat never completed — fallback to entries.append not engaged")
+	}
+
+	if !reflect.DeepEqual(resp, out) {
+		t.Fatalf("response mismatch: got %#v want %#v", out, resp)
+	}
+	if !servedViaConsumer.Load() {
+		t.Fatalf("fallback heartbeat was not served via the regular consumer (chConsume)")
+	}
+}

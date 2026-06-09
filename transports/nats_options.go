@@ -13,9 +13,10 @@ type NATSOption func(cfg *natsOptions)
 
 func getNATSOptions(opts []NATSOption) natsOptions {
 	cfg := natsOptions{
-		timeout:    defaultTimout,
-		output:     os.Stderr,
-		maxMsgSize: maxPkgSize,
+		timeout:          defaultTimout,
+		heartbeatTimeout: defaultHeartbeatTimeout,
+		output:           os.Stderr,
+		maxMsgSize:       maxPkgSize,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -32,17 +33,29 @@ func getNATSOptions(opts []NATSOption) natsOptions {
 }
 
 type natsOptions struct {
-	output         io.Writer
-	logger         hclog.Logger
-	timeout        time.Duration
-	maxMsgSize     int
-	persistedQueue *natsPersistedQueueConfig
+	output           io.Writer
+	logger           hclog.Logger
+	timeout          time.Duration
+	heartbeatTimeout time.Duration
+	maxMsgSize       int
+	persistedQueue   *natsPersistedQueueConfig
 }
 
 // WithNATSTimeout adds a timout for nats requests. Defaults to 5s. Set to 0 to disable the timeout.
 func WithNATSTimeout(timeout time.Duration) NATSOption {
 	return func(cfg *natsOptions) {
 		cfg.timeout = timeout
+	}
+}
+
+// WithNATSHeartbeatTimeout bounds a single heartbeat AppendEntries round-trip
+// on the dedicated entries.heartbeat subject. When a heartbeat is not answered
+// within this window the leader falls back to entries.append (RT-13010), so it
+// should be small relative to WithNATSTimeout and on the order of raft's
+// HeartbeatTimeout. Defaults to 1s. Set to 0 to reuse the full request timeout.
+func WithNATSHeartbeatTimeout(timeout time.Duration) NATSOption {
+	return func(cfg *natsOptions) {
+		cfg.heartbeatTimeout = timeout
 	}
 }
 

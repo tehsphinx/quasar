@@ -31,14 +31,15 @@ func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverNam
 	config := getNATSOptions(opts)
 
 	s := &NATSTransport{
-		conn:           conn,
-		logger:         config.logger,
-		serverName:     serverName,
-		cacheName:      cacheName,
-		timeout:        config.timeout,
-		maxMsgSize:     config.maxMsgSize,
-		chConsume:      make(chan raft.RPC, consumerChanSize),
-		chConsumeCache: make(chan raft.RPC, consumerChanSize),
+		conn:             conn,
+		logger:           config.logger,
+		serverName:       serverName,
+		cacheName:        cacheName,
+		timeout:          config.timeout,
+		heartbeatTimeout: config.heartbeatTimeout,
+		maxMsgSize:       config.maxMsgSize,
+		chConsume:        make(chan raft.RPC, consumerChanSize),
+		chConsumeCache:   make(chan raft.RPC, consumerChanSize),
 	}
 	if config.persistedQueue != nil {
 		q, err := newNatsPersistedQueue(conn, cacheName, *config.persistedQueue)
@@ -61,9 +62,10 @@ type NATSTransport struct {
 
 	logger hclog.Logger
 
-	serverName string
-	cacheName  string
-	timeout    time.Duration
+	serverName       string
+	cacheName        string
+	timeout          time.Duration
+	heartbeatTimeout time.Duration
 
 	chConsume      chan raft.RPC
 	chConsumeCache chan raft.RPC
@@ -406,16 +408,37 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 	if isHeartbeat(request) {
 		// Try the dedicated heartbeat subject first so the round-trip
 		// can't be blocked by a slow chConsume push on entries.append.
-		// If the peer doesn't subscribe to it (older version), fall back
-		// transparently.
+		//
+		// Bound this attempt by heartbeatTimeout (≈ raft's HeartbeatTimeout)
+		// rather than the full request timeout: a peer can be subscribed to
+		// entries.heartbeat yet never answer -- e.g. its heartbeat fast-path
+		// (raft SetHeartbeatHandler) is wired to a raft instance that was
+		// torn down during a reinit/quorum-recovery, so processHeartbeat
+		// returns on a closed shutdownCh without responding. On ANY failure
+		// -- ErrNoResponders (older peer without the subject) or a
+		// timeout/transport error -- fall through to entries.append, which is
+		// serviced by the live raft's consumer loop and answers normally.
+		// Without this fall-through the leader would log "failed to heartbeat"
+		// every beat forever and the follower would never converge, even
+		// though replication on entries.append is healthy (RT-13010).
+		hbCtx, hbCancel := ctx, context.CancelFunc(func() {})
+		if s.heartbeatTimeout > 0 {
+			hbCtx, hbCancel = context.WithTimeout(ctx, s.heartbeatTimeout)
+		}
 		hbSubj := fmt.Sprintf("quasar.%s.%s.entries.heartbeat", s.cacheName, address)
 		var protoResp pb.CommandResponse
-		if err := s.requestSmall(ctx, hbSubj, pb.ToAppendEntriesRequest(request), &protoResp); err == nil {
+		err := s.requestSmall(hbCtx, hbSubj, pb.ToAppendEntriesRequest(request), &protoResp)
+		hbCancel()
+		if err == nil {
 			*resp = *protoResp.GetAppendEntries().Convert()
 			return nil
-		} else if !errors.Is(err, nats.ErrNoResponders) {
-			s.logger.Error("failed to send heartbeat request", "error", err)
-			return err
+		}
+		if !errors.Is(err, nats.ErrNoResponders) {
+			// Subscribed but unanswered: don't surface this at error level
+			// (it would just re-create the per-beat log flood). Fall back to
+			// entries.append below.
+			s.logger.Debug("heartbeat subject did not answer; falling back to entries.append",
+				"error", err, "peer", address)
 		}
 	}
 
@@ -457,22 +480,7 @@ func (s *NATSTransport) handleEntries(ctx context.Context) func(*nats.Msg) {
 			Command:  req,
 		}
 
-		// Heartbeat fast-path: dispatch zero-entry AppendEntries directly to
-		// the heartbeat handler so they don't queue behind normal entry
-		// traffic on chConsume. Matches the TCP transport (tcp_transport.go)
-		// and hashicorp/raft's own net_transport.go.
-		if isHeartbeat(req) {
-			s.heartbeatFnLock.Lock()
-			fn := s.heartbeatFn
-			s.heartbeatFnLock.Unlock()
-			if fn != nil {
-				fn(rpc)
-			} else {
-				s.chConsume <- rpc
-			}
-		} else {
-			s.chConsume <- rpc
-		}
+		s.chConsume <- rpc
 
 		bts, err := s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
 			resp, _ := i.(*raft.AppendEntriesResponse)

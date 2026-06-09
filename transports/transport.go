@@ -11,8 +11,16 @@ import (
 )
 
 const (
-	defaultTimout    = 5 * time.Second
-	consumerChanSize = 16
+	defaultTimout = 5 * time.Second
+	// defaultHeartbeatTimeout bounds a single heartbeat AppendEntries
+	// round-trip. It is much shorter than defaultTimout (which also covers
+	// snapshot-sized entry appends) and tracks raft's default
+	// HeartbeatTimeout (1s): a follower that does not answer a heartbeat
+	// within this window is treated as not responding on the dedicated
+	// heartbeat subject, and the leader falls back to entries.append
+	// (see NATSTransport.AppendEntries, RT-13010).
+	defaultHeartbeatTimeout = 1 * time.Second
+	consumerChanSize        = 16
 )
 
 // ErrPersistedNotSupported is returned by transports that do not implement
