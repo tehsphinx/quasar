@@ -536,8 +536,10 @@ func (s *NATSTransport) handleHeartbeat(ctx context.Context) func(*nats.Msg) {
 		if fn != nil {
 			fn(rpc)
 		} else {
-			// raft hasn't registered the heartbeat handler yet — fall back
-			// to the regular consumer channel so we don't drop the message.
+			// No live raft is bound: either initial wiring before the first
+			// raft registers, or the window between a reinit's Shutdown and the
+			// new raft's rebind. Route to the consumer so the beat reaches the
+			// live raft (once it drains Consumer()) instead of being dropped.
 			s.chConsume <- rpc
 		}
 

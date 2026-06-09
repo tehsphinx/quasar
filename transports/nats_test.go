@@ -582,3 +582,61 @@ func TestNATSTransport_Heartbeat_FallsBackToEntriesAppendWhenUnanswered(t *testi
 		t.Fatalf("fallback heartbeat was not served via the regular consumer (chConsume)")
 	}
 }
+
+// TestNATSTransport_Heartbeat_NilHandlerRoutesToConsumer covers the transport
+// contract the RT-13010 lifecycle fix relies on. quasar clears the heartbeat
+// fast-path (SetHeartbeatHandler(nil)) the instant it shuts a raft down for a
+// reinit / quorum-recovery, so during the window before the new raft rebinds
+// it the handler is nil. A beat arriving in that window must not be dropped: it
+// is routed to the consumer, which the live raft drains and answers.
+func TestNATSTransport_Heartbeat_NilHandlerRoutesToConsumer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	trans1, err := makeNATSTransport(ctx, t, "test-cache", "hbnil-server1")
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	defer trans1.conn.Close()
+
+	// No live raft bound — models the reinit Shutdown→rebind window.
+	trans1.SetHeartbeatHandler(nil)
+
+	resp := raft.AppendEntriesResponse{Term: 10, LastLog: 90, Success: true}
+
+	// The live raft drains the consumer; the beat is routed here.
+	var servedViaConsumer atomic.Bool
+	go func() {
+		for {
+			select {
+			case rpc := <-trans1.Consumer():
+				servedViaConsumer.Store(true)
+				rpc.Respond(&resp, nil)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	trans2, err := makeNATSTransport(ctx, t, "test-cache", "hbnil-server2")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer trans2.conn.Close()
+
+	hbArgs := raft.AppendEntriesRequest{
+		Term:      10,
+		RPCHeader: raft.RPCHeader{Addr: []byte("kenny")},
+	}
+	var out raft.AppendEntriesResponse
+	if err := trans2.AppendEntries("id1", trans1.LocalAddr(), &hbArgs, &out); err != nil {
+		t.Fatalf("heartbeat with nil handler not served: %v", err)
+	}
+
+	if !reflect.DeepEqual(resp, out) {
+		t.Fatalf("response mismatch: got %#v want %#v", out, resp)
+	}
+	if !servedViaConsumer.Load() {
+		t.Fatalf("nil-handler heartbeat was not served via the consumer (chConsume)")
+	}
+}

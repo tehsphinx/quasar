@@ -691,6 +691,15 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string) error {
 
 	s.fsm.applyRaftReset()
 	s.raft().Shutdown()
+	// Unbind the transport's heartbeat fast-path from the raft we just shut
+	// down. raft's processHeartbeat returns on a closed shutdownCh WITHOUT
+	// responding, so a beat landing on a torn-down instance is silently
+	// dropped and the leader loops on "failed to heartbeat" while this node
+	// never converges (RT-13010). Clearing it here guarantees the fast-path
+	// is never bound to a dead raft: newRaft below rebinds it to the live
+	// instance, and until then (or indefinitely, if newRaft fails) the
+	// transport routes beats to the live consumer instead of dropping them.
+	s.transport.SetHeartbeatHandler(nil)
 
 	s.newStores()
 	if adoptInstanceID != "" {
@@ -926,6 +935,10 @@ func (s *Cache) recoverQuorum() error {
 	// it sets the shutdown flag and closes the channel that all internal
 	// goroutines select on. reinitRaftAdoptingInstance uses the same pattern.
 	rft.Shutdown()
+	// See reinitRaftAdoptingInstance: unbind the heartbeat fast-path from the
+	// raft we just shut down so a beat is never silently dropped by a
+	// torn-down instance. newRaft below rebinds it to the live raft (RT-13010).
+	s.transport.SetHeartbeatHandler(nil)
 
 	// Mint a fresh instance ID — recoverQuorum forks the consensus
 	// history line on purpose (RT-12862). Surviving peers compare the
