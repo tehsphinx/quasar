@@ -207,6 +207,73 @@ func TestGraceWindowSparesSilentConfigMember(t *testing.T) {
 	}
 }
 
+// TestLocalPeerStatusReportsVotersOnEveryNode is the RT-13042 M1 regression
+// test.
+//
+// NumVotersInConfig used to be counted from raft PeerObservation events, which
+// raft emits only on the leader and only for non-self peers. So a follower
+// reported 0 voters and even the leader of a 2-voter cluster reported 1 —
+// the `NumVotersInConfig >= 2` arm of PeerStatus.inEstablishedCluster (the
+// RT-12775 bootstrap gate for the leaderless case) could never fire on any
+// node. The count is now re-derived from the raft configuration snapshot, so
+// every node — leader or follower — must report the full voter count,
+// self included.
+func TestLocalPeerStatusReportsVotersOnEveryNode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	addr1, tr1 := transports.NewInmemTransport("")
+	addr2, tr2 := transports.NewInmemTransport("")
+	tr1.Connect(addr2, tr2)
+	tr2.Connect(addr1, tr1)
+
+	servers := []raft.Server{
+		{ID: "cache1", Address: addr1, Suffrage: raft.Voter},
+		{ID: "cache2", Address: addr2, Suffrage: raft.Voter},
+	}
+
+	c1, err := NewKVCache(ctx,
+		WithLocalID("cache1"),
+		WithTransport(tr1),
+		WithServers(servers),
+	)
+	if err != nil {
+		t.Fatalf("NewKVCache(cache1): %v", err)
+	}
+	defer func() { _ = c1.Shutdown() }()
+
+	c2, err := NewKVCache(ctx,
+		WithLocalID("cache2"),
+		WithTransport(tr2),
+		WithServers(servers),
+	)
+	if err != nil {
+		t.Fatalf("NewKVCache(cache2): %v", err)
+	}
+	defer func() { _ = c2.Shutdown() }()
+
+	if err := c1.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady(cache1): %v", err)
+	}
+	if err := c2.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady(cache2): %v", err)
+	}
+
+	// The refresh runs in the observation goroutine, so poll briefly.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		n1 := c1.discovery.LocalPeerStatus().NumVotersInConfig
+		n2 := c2.discovery.LocalPeerStatus().NumVotersInConfig
+		if n1 == 2 && n2 == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected NumVotersInConfig == 2 on both nodes, got cache1=%d cache2=%d", n1, n2)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func containsServer(servers []raft.Server, id raft.ServerID) bool {
 	for _, s := range servers {
 		if s.ID == id {

@@ -82,11 +82,14 @@ type DiscoveryInjector struct {
 	peerInClusterOnce sync.Once
 	peerInClusterCh   chan struct{}
 
-	// voterCount tracks how many voters are in this node's raft
-	// configuration. Maintained by the regObservation goroutine via raft
-	// PeerObservation events (including the bootstrap configuration, which
-	// raft emits as well). Read non-blocking from LocalPeerStatus so NATS
-	// callbacks never have to wait on raft's main loop.
+	// voterCount caches how many voters are in this node's raft
+	// configuration, self included. Re-derived from rft.GetConfiguration()
+	// (a non-blocking snapshot in raft v1.7.x) at regObservation time and
+	// on every Peer/Leader observation — NOT counted from PeerObservation
+	// events, which raft emits only on the leader and only for non-self
+	// peers, so an event-counted value is 0 on every follower (RT-13042
+	// M1). Read non-blocking from LocalPeerStatus so NATS callbacks never
+	// have to wait on raft's main loop.
 	voterCount atomic.Uint32
 
 	// startedAt is the UnixNano timestamp at which discovery (re)started on
@@ -239,10 +242,10 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 	})
 	rft.RegisterObserver(observer)
 
-	// Reset the voter count for this raft instance; the cached value is
-	// re-derived from observed configuration changes (including the
-	// bootstrap configuration that raft applies via the same path).
-	s.voterCount.Store(0)
+	// Seed the voter count from the new raft instance's configuration so
+	// LocalPeerStatus is correct from the first ping, before any
+	// observation arrives.
+	s.refreshVoterCount(rft)
 
 	// Anchor a fresh grace window for the config-driven prune sweep: lastSeen
 	// starts cold on a (re)started raft and needs a full prune window of
@@ -264,21 +267,16 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 				switch obs := observation.Data.(type) {
 				case raft.PeerObservation:
 					s.cache.invalidateQuorumProbeCache()
+					s.refreshVoterCount(rft)
 					if obs.Removed {
-						if obs.Peer.Suffrage == raft.Voter {
-							// Is the equivalent of decreasing by 1.
-							s.voterCount.Add(^uint32(0))
-						}
 						s.deleteServer(obs.Peer.ID)
 						s.removeApplied(obs.Peer.ID)
 						continue
 					}
-					if obs.Peer.Suffrage == raft.Voter {
-						s.voterCount.Add(1)
-					}
 					s.setApplied(obs.Peer.ID)
 				case raft.LeaderObservation:
 					s.cache.invalidateQuorumProbeCache()
+					s.refreshVoterCount(rft)
 					if obs.LeaderID != raft.ServerID(s.cache.localID) {
 						continue
 					}
@@ -287,6 +285,27 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 			}
 		}
 	}()
+}
+
+// refreshVoterCount re-derives the cached voter count from the raft
+// configuration snapshot (self included). GetConfiguration is non-blocking
+// in raft v1.7.x — it returns an already-resolved future over the latest
+// known configuration — so this is safe to call from the observation
+// goroutine. On a transient configuration error the previous value is kept;
+// the next observation or regObservation re-derives it.
+func (s *DiscoveryInjector) refreshVoterCount(rft *raft.Raft) {
+	cfgFut := rft.GetConfiguration()
+	if err := cfgFut.Error(); err != nil {
+		return
+	}
+
+	var count uint32
+	for _, srv := range cfgFut.Configuration().Servers {
+		if srv.Suffrage == raft.Voter {
+			count++
+		}
+	}
+	s.voterCount.Store(count)
 }
 
 func (s *DiscoveryInjector) addMissingServers() {
