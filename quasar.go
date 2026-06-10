@@ -74,7 +74,7 @@ var (
 // by the cache.
 // An example implementation can be seen in ./examples/generic/exampleFSM/example.go.
 func NewCache(ctx context.Context, fsm FSM, opts ...Option) (*Cache, error) {
-	return newCache(ctx, wrapFSM(fsm), fsm.Inject, opts...)
+	return newCache(ctx, wrapFSM(fsm), fsm.Inject, getOptions(opts))
 }
 
 // newCache builds and starts the cache. inject is the user FSM's Inject method;
@@ -82,9 +82,12 @@ func NewCache(ctx context.Context, fsm FSM, opts ...Option) (*Cache, error) {
 // so the FSM always has its FSMInjector before the first Apply can reach it
 // (m11 — previously Inject ran only after newCache had already wired up raft
 // and the consumer goroutines, racing an early Store/apply).
-func newCache(ctx context.Context, fsm *fsmWrapper, inject func(*FSMInjector), opts ...Option) (*Cache, error) {
+//
+// cfg is the already-resolved options: callers resolve once and thread it
+// through, so the random default localID is generated exactly once rather than
+// re-resolved here (L9).
+func newCache(ctx context.Context, fsm *fsmWrapper, inject func(*FSMInjector), cfg options) (*Cache, error) {
 	ctx, closeCache := context.WithCancel(ctx)
-	cfg := getOptions(opts)
 
 	c := &Cache{
 		cfg:       cfg,

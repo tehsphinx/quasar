@@ -21,7 +21,7 @@ func NewKVCache(ctx context.Context, opts ...Option) (*KVCache, error) {
 
 	fsm := newKeyValueFSM(cfg.kv)
 
-	cache, err := newCache(ctx, wrapFSM(fsm), fsm.Inject, opts...)
+	cache, err := newCache(ctx, wrapFSM(fsm), fsm.Inject, cfg)
 	if err != nil {
 		return nil, err
 	}
