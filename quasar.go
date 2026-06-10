@@ -166,6 +166,14 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 	}
 
 	if cfg.discovery != nil && cfg.suffrage == raft.Voter {
+		if len(cfg.servers) > 0 || cfg.bootstrap {
+			// The discovery branch decides bootstrapping on its own, so an
+			// explicit WithServers/WithBootstrap is silently ignored here.
+			// Surface the misconfiguration instead of leaving the caller to
+			// puzzle over the unexplained behavior (L5).
+			s.logger.Warn("bootstrap: WithServers/WithBootstrap ignored for a discovery-enabled voter",
+				"with-servers", len(cfg.servers), "with-bootstrap", cfg.bootstrap)
+		}
 		if cfg.bootstrapWait > 0 {
 			waitForBootstrapDecision(ctx, s.discovery, cfg.bootstrapWait)
 		}
