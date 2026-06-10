@@ -3,6 +3,7 @@ package quasar
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,14 @@ const minPruneInterval = 500 * time.Millisecond
 // transport-internal deadlines and could block the discovery ping dispatcher
 // indefinitely (m10, see also m17).
 const addServerHardResetTimeout = 5 * time.Second
+
+// addServerCommitTimeout bounds how long addServer waits for an AddVoter /
+// AddNonvoter configuration change to commit. raft's own timeout argument
+// only bounds the enqueue onto the configuration-change channel, not the
+// commit; the future then blocks until the entry commits or the leader steps
+// down (~lease timeout). On a leader that just lost quorum that parks the
+// caller for the whole lease, so bound the commit-wait explicitly (L8).
+const addServerCommitTimeout = 5 * time.Second
 
 // Discovery defines a auto discovery for servers of the cache.
 type Discovery interface {
@@ -189,9 +198,23 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 		return err
 	}
 
-	fut := addServerFn(srv.ID, srv.Address, 0, 0)
-	if r := fut.Error(); r != nil {
-		return r
+	fut := addServerFn(srv.ID, srv.Address, 0, addServerCommitTimeout)
+	// fut.Error() blocks until the config change commits or leadership is
+	// lost; bound that wait so a quorum-less leader does not park this caller
+	// (run per discovery ping since m17) for the full lease timeout. The
+	// future resolves on its own afterward, so the buffered receiver does not
+	// leak (L8).
+	errc := make(chan error, 1)
+	go func() { errc <- fut.Error() }()
+	select {
+	case r := <-errc:
+		if r != nil {
+			return r
+		}
+	case <-time.After(addServerCommitTimeout):
+		return fmt.Errorf("add server %q: timed out waiting for configuration change to commit", srv.ID)
+	case <-s.cache.ctx.Done():
+		return s.cache.ctx.Err()
 	}
 
 	// If a hard reset has happened, wipe any peer that (re)joins afterwards so a
