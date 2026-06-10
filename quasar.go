@@ -1358,6 +1358,13 @@ func (s *Cache) probeVoters(ctx context.Context, timeout time.Duration, voters [
 	}
 
 	quorum := len(voters)/2 + 1
+	// Self alone may already satisfy quorum (single-voter cluster right
+	// after BootstrapCluster or recoverQuorum). The receive loop below
+	// never runs when pending == 0, so check up front to avoid returning
+	// a spurious false that fails the request with ErrNoLeader.
+	if alive >= quorum {
+		return true
+	}
 	for i := 0; i < pending; i++ {
 		if <-results {
 			alive++
