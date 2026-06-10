@@ -51,6 +51,10 @@ func (s *NATSDiscovery) Run(ctx context.Context) error {
 	}
 
 	if r := s.ping(); r != nil {
+		// Clean up the subscription before bailing out — previously an early
+		// ping failure returned without ever installing the unsubscribe path,
+		// leaking the subscription (m18).
+		_ = discoverySub.Unsubscribe()
 		return r
 	}
 
