@@ -490,8 +490,11 @@ func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.Ser
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.noLeaderTimeout)
 	defer cancel()
 
-	addr, id := s.raft().LeaderWithID()
-	if id == "" {
+	for {
+		addr, id := s.raft().LeaderWithID()
+		if id != "" {
+			return addr, id, nil
+		}
 		// Fail fast when quorum can't currently form. Waiting up to
 		// noLeaderTimeout would just delay an inevitable timeout — no
 		// election can complete without quorum, and recovery (if
@@ -505,9 +508,13 @@ func (s *Cache) getLeaderWait(ctx context.Context) (raft.ServerAddress, raft.Ser
 		if r := s.waitForLeader(ctx); r != nil {
 			return "", "", r
 		}
-		addr, id = s.raft().LeaderWithID()
+		// Re-read and loop: leadership can flip back to empty between
+		// waitForLeader returning and this read, which would otherwise
+		// hand the caller an empty address with a nil error (it then sends
+		// an RPC to a subject no one answers). waitForLeader blocks on the
+		// next leader observation, so the loop cannot busy-spin and exits
+		// via ctx expiry or the quorum probe (L2).
 	}
-	return addr, id, nil
 }
 
 // IsLeader returns if the cache is the current leader. This is not a verified
