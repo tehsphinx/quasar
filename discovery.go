@@ -14,6 +14,12 @@ import (
 
 const minPruneInterval = 500 * time.Millisecond
 
+// addServerHardResetTimeout bounds the out-of-band hard-reset RPC sent to a
+// peer that (re)joins after a HardReset. Without a bound it relied entirely on
+// transport-internal deadlines and could block the discovery ping dispatcher
+// indefinitely (m10, see also m17).
+const addServerHardResetTimeout = 5 * time.Second
+
 // Discovery defines a auto discovery for servers of the cache.
 type Discovery interface {
 	Inject(cache *DiscoveryInjector)
@@ -192,7 +198,9 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 	// node that was unreachable during the HardReset fan-out — and is therefore
 	// still ahead — cannot re-wedge the cluster on rejoin (RT-13034).
 	if resetID := s.cache.getLastResetID(); resetID != "" {
-		if r := s.cache.sendHardReset(context.Background(), srv, resetID); r != nil {
+		ctx, cancel := context.WithTimeout(s.cache.ctx, addServerHardResetTimeout)
+		defer cancel()
+		if r := s.cache.sendHardReset(ctx, srv, resetID); r != nil {
 			return r
 		}
 	}
