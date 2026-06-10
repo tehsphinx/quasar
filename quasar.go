@@ -1197,6 +1197,24 @@ func (s *Cache) recoverQuorum() error {
 	// (possibly older) recovered snapshot.
 	s.setInstanceID(uuid.NewString())
 
+	// RecoverCluster restores the newest snapshot into the FSM and then
+	// re-applies every LogCommand after it. We deliberately pass the live
+	// FSM (not a throwaway) to preserve data, so the replay runs on top of
+	// the current state. With a snapshot present, Restore fully replaces
+	// state before the tail replays (FSM contract), so the result is exact.
+	// With NO snapshot yet — common when recovery fires before the first
+	// auto-snapshot — the whole log re-applies on top of state that already
+	// contains those entries; a non-idempotent applier would corrupt itself.
+	// Reset the FSM first so the full-log replay rebuilds the state exactly
+	// (M2).
+	if snaps, err := s.snapshotStore.List(); err != nil {
+		return fmt.Errorf("list snapshots: %w", err)
+	} else if len(snaps) == 0 {
+		if err := s.fsm.applyReset(); err != nil {
+			return fmt.Errorf("reset fsm before log replay: %w", err)
+		}
+	}
+
 	conf := raftConfig(s.cfg)
 	if err := raft.RecoverCluster(conf, s.fsm, s.logStore, s.stableStore, s.snapshotStore,
 		s.transport, raft.Configuration{Servers: keep}); err != nil {

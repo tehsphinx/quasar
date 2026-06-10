@@ -18,6 +18,17 @@ import (
 const uint64Bytes = 8
 
 // FSM defines the fsm to be implemented for the quasar cache.
+//
+// Restore must fully replace the FSM's state with the snapshot contents
+// (not merge into it): quorum recovery restores the newest snapshot and
+// then replays the log tail on top, which is only exact if Restore starts
+// from a clean slate.
+//
+// When WithQuorumRecovery is enabled, ApplyCmd should be idempotent.
+// Recovery before the first auto-snapshot replays the whole log; the
+// library resets the FSM first (see recoverQuorum, M2) so a single replay
+// is exact, but a command whose effect depends on prior state (counters,
+// appends, toggles) is still safest written idempotently.
 type FSM interface {
 	Inject(fsm *FSMInjector)
 	ApplyCmd(cmd []byte) error
