@@ -819,8 +819,12 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 	}
 	reqMsg.Data = bts
 
-	// fmt.Println("request data:", fmt.Sprintf("%+v", msg))
-	response, err := s.conn.RequestWithContext(ctx, subj, bts)
+	// Send the prepared message — NOT the raw bytes. The final part of a
+	// multi-part request carries the request_id / pkg_part headers set
+	// above; sending raw bytes would strip them, so the receiver could
+	// neither validate the final part against the assembly nor detect a
+	// lost middle part (RT-13042 M2).
+	response, err := s.conn.RequestMsgWithContext(ctx, reqMsg)
 	if err != nil {
 		return len(bts), err
 	}

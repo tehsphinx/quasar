@@ -79,6 +79,12 @@ func handleMultiPart(msg *nats.Msg, message *Message) (bool, error) {
 			message.Reset()
 			return false, errors.New("pkg_part mismatch")
 		}
+	} else if !message.IsZero() {
+		// A headerless message is a complete standalone request. An assembly
+		// still in progress here belongs to a sender that died mid-multipart;
+		// drop it instead of gluing the standalone message onto the stale
+		// partial payload (RT-13042 M2).
+		message.Reset()
 	}
 
 	message.Append(msg.Data)
