@@ -130,12 +130,9 @@ func (s *NATSDiscovery) discoveryHandler(msg *nats.Msg) {
 		return
 	}
 
-	if msg.Reply != "" {
-		if e := msg.Respond(bts); e != nil {
-			return
-		}
-		return
-	}
+	// Pings are plain publishes (see ping / runPinging), never request-reply,
+	// so msg.Reply is always empty here — the former msg.Respond branch was
+	// dead (RT-13042 S8). Responses go back out on the shared subject.
 	if r := s.nc.Publish(s.subj, bts); r != nil {
 		return
 	}
