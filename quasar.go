@@ -60,6 +60,13 @@ var (
 	// eventually apply the command. Returned only when the caller asked
 	// for at-least-once semantics with WithRetry().
 	ErrRetrying = errors.New("failed to apply: retrying in background")
+
+	// errNoVotersToRecover is returned by recoverQuorum when the current
+	// configuration has no peer voters to drop, so there is nothing for
+	// recovery to do. It is a benign no-op signal (not a failure): the
+	// recovery watcher re-arms on it instead of treating raft as swapped
+	// and sitting idle while still leaderless (RT-13042 m6).
+	errNoVotersToRecover = errors.New("quorum recovery: no peer voters to drop")
 )
 
 // NewCache instantiates a new Cache. In contrast to NewKVCache (which holds []byte) this is meant
@@ -1010,9 +1017,14 @@ func (s *Cache) watchQuorumOnRaft(ctx, ctxRaft context.Context, rft *raft.Raft, 
 				continue
 			}
 			if err := s.recoverQuorum(); err != nil {
-				s.logger.Error("quorum recovery failed", "error", err)
-				// Re-arm on the same raft so we wait a full window before
-				// trying again. recoverQuorum only swaps raft on success.
+				// errNoVotersToRecover is a benign no-op (nothing to drop);
+				// anything else is a genuine failure worth logging. In both
+				// cases raft was not swapped, so re-arm on the same raft to
+				// wait a full window before retrying — without this the
+				// watcher would sit idle while still leaderless (m6).
+				if !errors.Is(err, errNoVotersToRecover) {
+					s.logger.Error("quorum recovery failed", "error", err)
+				}
 				if !s.hasLeader() {
 					armTimer()
 				}
@@ -1085,8 +1097,9 @@ func (s *Cache) recoverQuorum() error {
 		// No peer voters to drop — there's nothing for recovery to fix
 		// here. The watcher should not normally call us in this state
 		// (shouldRecoverQuorum requires aliveVoters < quorum), but be
-		// defensive.
-		return nil
+		// defensive: signal the no-op explicitly so the watcher re-arms
+		// instead of assuming raft was swapped and sitting idle (m6).
+		return errNoVotersToRecover
 	}
 
 	// Make sure self is in the new configuration even if the old one had us
