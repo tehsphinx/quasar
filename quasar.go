@@ -174,7 +174,7 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 			"bootstrap-wait", cfg.bootstrapWait,
 		)
 		s.setInstanceID(uuid.NewString())
-		rft.BootstrapCluster(raft.Configuration{
+		s.bootstrapCluster(rft, raft.Configuration{
 			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
 		})
 		return nil
@@ -182,17 +182,28 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 
 	if len(cfg.servers) > 0 {
 		s.setInstanceID(uuid.NewString())
-		rft.BootstrapCluster(raft.Configuration{Servers: cfg.servers})
+		s.bootstrapCluster(rft, raft.Configuration{Servers: cfg.servers})
 		return nil
 	}
 
 	if cfg.bootstrap {
 		s.setInstanceID(uuid.NewString())
-		rft.BootstrapCluster(raft.Configuration{
+		s.bootstrapCluster(rft, raft.Configuration{
 			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
 		})
 	}
 	return nil
+}
+
+// bootstrapCluster bootstraps rft and logs the outcome. The future's Error()
+// resolves once raft has stored the bootstrap configuration locally (it does
+// not wait for an election), so blocking here is cheap. Previously the future
+// was discarded, silently swallowing bootstrap failures such as
+// raft.ErrCantBootstrap when state already exists.
+func (s *Cache) bootstrapCluster(rft *raft.Raft, configuration raft.Configuration) {
+	if err := rft.BootstrapCluster(configuration).Error(); err != nil {
+		s.logger.Warn("bootstrap cluster failed", "error", err)
+	}
 }
 
 // waitForBootstrapDecision blocks until discovery has observed a peer that
