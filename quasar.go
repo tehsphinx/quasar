@@ -613,35 +613,50 @@ func (s *Cache) consume(ctx context.Context, ch <-chan raft.RPC) {
 			_ = s.shutdown()
 			return
 		case rpc := <-ch:
-			var (
-				resp interface{}
-				err  error
-			)
-			switch cmd := rpc.Command.(type) {
-			case *pb.Store:
-				var uid uint64
-				uid, err = s.store(ctx, cmd.Key, cmd.Data)
-				resp = &pb.StoreResponse{Uid: uid}
-			case *pb.ResetCache:
-				if cmd.Hard {
-					err = s.localHardReset(cmd.Uuid)
-				} else {
-					err = s.reset(ctx)
-				}
-				resp = &pb.ResetCacheResponse{Uuid: cmd.Uuid}
-			case *pb.RemoveServer:
-				err = s.removeServer(cmd.Id)
-				resp = &pb.RemoveServerResponse{}
-			case *pb.LatestUid:
-				uid := s.localLastIndex()
-				resp = &pb.LatestUidResponse{Uid: uid}
-			}
-
-			rpc.RespChan <- raft.RPCResponse{
-				Response: resp,
-				Error:    err,
-			}
+			// Handle each RPC on its own goroutine so a slow command — a Store
+			// apply (up to applyTimeout) or a localHardReset that rebuilds raft
+			// — does not head-of-line block every other cache RPC on this
+			// consumer, including the LatestUID liveness probes peers use for
+			// quorum detection and the leader's Store forwarding (m8). The
+			// transports serialize per-connection where ordering matters.
+			go s.handleRPC(ctx, rpc)
 		}
+	}
+}
+
+// handleRPC dispatches a single cache RPC and replies on its response channel.
+func (s *Cache) handleRPC(ctx context.Context, rpc raft.RPC) {
+	var (
+		resp interface{}
+		err  error
+	)
+	switch cmd := rpc.Command.(type) {
+	case *pb.Store:
+		var uid uint64
+		uid, err = s.store(ctx, cmd.Key, cmd.Data)
+		resp = &pb.StoreResponse{Uid: uid}
+	case *pb.ResetCache:
+		if cmd.Hard {
+			err = s.localHardReset(cmd.Uuid)
+		} else {
+			err = s.reset(ctx)
+		}
+		resp = &pb.ResetCacheResponse{Uuid: cmd.Uuid}
+	case *pb.RemoveServer:
+		err = s.removeServer(cmd.Id)
+		resp = &pb.RemoveServerResponse{}
+	case *pb.LatestUid:
+		uid := s.localLastIndex()
+		resp = &pb.LatestUidResponse{Uid: uid}
+	default:
+		// Previously an unknown command replied with {nil, nil}, which the
+		// caller could not distinguish from a successful empty response (m8).
+		err = fmt.Errorf("unknown cache command %T", rpc.Command)
+	}
+
+	rpc.RespChan <- raft.RPCResponse{
+		Response: resp,
+		Error:    err,
 	}
 }
 
