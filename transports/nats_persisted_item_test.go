@@ -16,22 +16,25 @@ import (
 
 // fakeJSMsg is a minimal jetstream.Msg that records ack/nak calls.
 type fakeJSMsg struct {
-	acked atomic.Int32
-	naked atomic.Int32
+	acked        atomic.Int32
+	naked        atomic.Int32
+	numDelivered uint64
 }
 
-func (m *fakeJSMsg) Metadata() (*jetstream.MsgMetadata, error)  { return &jetstream.MsgMetadata{}, nil }
-func (m *fakeJSMsg) Data() []byte                               { return nil }
-func (m *fakeJSMsg) Headers() nats.Header                       { return nil }
-func (m *fakeJSMsg) Subject() string                            { return "test.subject" }
-func (m *fakeJSMsg) Reply() string                              { return "" }
-func (m *fakeJSMsg) Ack() error                                 { m.acked.Add(1); return nil }
-func (m *fakeJSMsg) DoubleAck(context.Context) error            { m.acked.Add(1); return nil }
-func (m *fakeJSMsg) Nak() error                                 { m.naked.Add(1); return nil }
-func (m *fakeJSMsg) NakWithDelay(time.Duration) error           { m.naked.Add(1); return nil }
-func (m *fakeJSMsg) InProgress() error                          { return nil }
-func (m *fakeJSMsg) Term() error                                { return nil }
-func (m *fakeJSMsg) TermWithReason(string) error                { return nil }
+func (m *fakeJSMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	return &jetstream.MsgMetadata{NumDelivered: m.numDelivered}, nil
+}
+func (m *fakeJSMsg) Data() []byte                     { return nil }
+func (m *fakeJSMsg) Headers() nats.Header             { return nil }
+func (m *fakeJSMsg) Subject() string                  { return "test.subject" }
+func (m *fakeJSMsg) Reply() string                    { return "" }
+func (m *fakeJSMsg) Ack() error                       { m.acked.Add(1); return nil }
+func (m *fakeJSMsg) DoubleAck(context.Context) error  { m.acked.Add(1); return nil }
+func (m *fakeJSMsg) Nak() error                       { m.naked.Add(1); return nil }
+func (m *fakeJSMsg) NakWithDelay(time.Duration) error { m.naked.Add(1); return nil }
+func (m *fakeJSMsg) InProgress() error                { return nil }
+func (m *fakeJSMsg) Term() error                      { return nil }
+func (m *fakeJSMsg) TermWithReason(string) error      { return nil }
 
 func newTestPersistedItem(msg jetstream.Msg) *natsPersistedItem {
 	return &natsPersistedItem{

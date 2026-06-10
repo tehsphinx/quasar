@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/tehsphinx/quasar/pb/v1"
@@ -14,14 +15,26 @@ import (
 )
 
 // Default tuning for the persisted-FIFO consumer. Sized to match the
-// gatexcache plan: AckWait * MaxDeliver ≈ 40s total redelivery horizon
-// (~2× quorumRecoveryAfter), with MaxAckPending = 1 giving strict
-// in-order delivery at the cost of throughput. Operators can tune
-// AckWait / MaxDeliver per call site via WithNATSPersistedQueue
-// options; MaxAckPending is fixed at 1 by design (D4).
+// gatexcache plan: AckWait * MaxDeliver gives the total redelivery
+// horizon, with MaxAckPending = 1 giving strict in-order delivery at
+// the cost of throughput. Operators can tune AckWait / MaxDeliver per
+// call site via WithNATSPersistedQueue options; MaxAckPending is fixed
+// at 1 by design (D4).
+//
+// MaxDeliver is bumped from the original 4 to 16: with a single shared
+// durable, a leadership flip Naks the in-flight item to hand it over,
+// and each Nack burns one delivery attempt. A short flap (or a brief
+// Nack ping-pong between the outgoing and incoming leader's sessions)
+// could exhaust 4 attempts and — because the stream uses WorkQueue
+// retention with no DLQ — SILENTLY drop a "persisted" write once
+// JetStream stops redelivering. 16 gives a far wider margin without
+// redesigning the durable; a terminal delivery is additionally logged
+// loudly at Error level (see consume) so an operator notices a write
+// that genuinely cannot be applied rather than losing it in silence
+// (RT-13042 M19).
 const (
 	defaultPersistedAckWait    = 10 * time.Second
-	defaultPersistedMaxDeliver = 4
+	defaultPersistedMaxDeliver = 16
 	defaultPersistedMaxAge     = 1 * time.Hour
 
 	persistedConsumerNamePrefix = "quasar-cache-consumer"
@@ -57,6 +70,7 @@ type natsPersistedQueue struct {
 	maxDeliver    int
 	replicas      int
 	manageStream  bool
+	logger        hclog.Logger
 
 	// stream is created/opened lazily on the first publish or consumer
 	// start so callers don't have to coordinate which transport
@@ -105,6 +119,10 @@ func newNatsPersistedQueue(conn *nats.Conn, cacheName string, cfg natsPersistedQ
 		return nil, fmt.Errorf("init jetstream: %w", err)
 	}
 
+	// The persisted queue is constructed without a NATSTransport logger
+	// handle (newNatsPersistedQueue is called before the transport is
+	// fully wired), so default to the standard hclog logger here. The
+	// only thing it is used for is the terminal-delivery Error below.
 	return &natsPersistedQueue{
 		conn:          conn,
 		js:            js,
@@ -116,6 +134,7 @@ func newNatsPersistedQueue(conn *nats.Conn, cacheName string, cfg natsPersistedQ
 		maxAge:        cfg.maxAge,
 		replicas:      cfg.replicas,
 		manageStream:  cfg.manageStream,
+		logger:        hclog.New(&hclog.LoggerOptions{Name: "quasar-persisted"}),
 	}, nil
 }
 
@@ -342,6 +361,23 @@ func (c *natsPersistedConsumer) consume(ctx context.Context, msg jetstream.Msg) 
 	}
 	c.setInflight(item)
 	defer c.clearInflight(item)
+
+	// Terminal-delivery detection (RT-13042 M19): once NumDelivered reaches
+	// MaxDeliver, JetStream will not redeliver this message again. With
+	// WorkQueue retention and no DLQ that means a Nack here (e.g. another
+	// leader flip) drops the "persisted" write for good. We still process
+	// the delivery — most terminal deliveries do apply successfully — but we
+	// log loudly so an operator sees a write that is one Nack away from
+	// being lost rather than losing it silently.
+	if c.queue.maxDeliver > 0 {
+		if meta, mErr := msg.Metadata(); mErr == nil && meta.NumDelivered >= uint64(c.queue.maxDeliver) {
+			c.queue.logger.Error("persisted write reached terminal delivery; a further Nack will silently drop it",
+				"subject", msg.Subject(),
+				"num_delivered", meta.NumDelivered,
+				"max_deliver", c.queue.maxDeliver,
+			)
+		}
+	}
 
 	// Decode the command. If decoding fails we cannot deliver
 	// it to the consumer loop meaningfully — reject with
