@@ -7,6 +7,12 @@ import (
 )
 
 // NewKVCache creates a new key-value based cache.
+//
+// Experimental: KVCache is a thin, illustrative key-value layer over the core
+// Cache and is not yet covered by the same production guarantees (its API may
+// change). Snapshot/Restore/Reset work only when the configured KVStore
+// implements stores.SnapshotKVStore (the in-memory store does); see
+// examples/basic for usage (RT-13042 S6).
 func NewKVCache(ctx context.Context, opts ...Option) (*KVCache, error) {
 	cfg := getOptions(opts)
 	if cfg.kv == nil {
@@ -27,6 +33,9 @@ func NewKVCache(ctx context.Context, opts ...Option) (*KVCache, error) {
 }
 
 // KVCache implements a key-value based cache.
+//
+// Experimental: see NewKVCache. Treat this as example-grade until the API is
+// stabilized (RT-13042 S6).
 type KVCache struct {
 	*Cache
 
