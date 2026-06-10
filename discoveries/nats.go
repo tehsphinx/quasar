@@ -108,7 +108,13 @@ func (s *NATSDiscovery) discoveryHandler(msg *nats.Msg) {
 		return
 	}
 
-	s.cache.ProcessServerWithStatus(sender, peerStatusFromPB(ping.GetRaftStatus()))
+	// Process the ping off the dispatcher goroutine. ProcessServerWithStatus
+	// can block on raft operations (AddVoter, hard-reset resend) for a new
+	// peer, and NATS delivers subscription callbacks serially — running it
+	// inline would head-of-line block every subsequent ping to this node,
+	// making it look dead to peers' prune sweeps (m17). setServer makes the
+	// new-peer decision atomically, so concurrent processing is safe.
+	go s.cache.ProcessServerWithStatus(sender, peerStatusFromPB(ping.GetRaftStatus()))
 
 	if ping.GetIsResponse() {
 		// don't respond to responses
