@@ -100,6 +100,29 @@ func TestLocalHardResetSerializesWithRecovery(t *testing.T) {
 	}
 }
 
+// TestLocalHardResetClearsInstanceID is the RT-13042 m4 regression test.
+// A follower hard reset used to call reinitRaftAdoptingInstance("") while
+// leaving its stale instance ID in place, so the next leader ping mismatched
+// and triggered a second, redundant full wipe via adoptLeaderInstance.
+// localHardReset must clear the instance ID so the follower silently adopts
+// the leader's ID instead.
+func TestLocalHardResetClearsInstanceID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c, _ := newFollowerCache(ctx, t)
+
+	c.setInstanceID("stale-instance-id")
+
+	if err := c.localHardReset("reset-1"); err != nil {
+		t.Fatalf("localHardReset: %v", err)
+	}
+
+	if got := c.getInstanceID(); got != "" {
+		t.Fatalf("expected instance ID cleared after follower hard reset, got %q", got)
+	}
+}
+
 // TestLocalHardResetDeduplicatesConcurrentResets covers the second half of the
 // RT-13042 C3 fix: the resetID dedup used to be a get-then-set across two
 // separate lock acquisitions, so two concurrent identical resets could both

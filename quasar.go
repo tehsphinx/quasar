@@ -800,6 +800,13 @@ func (s *Cache) localHardReset(resetID string) error {
 
 	s.logger.Info("hard reset: reinitializing raft because this node is a follower",
 		"local-id", s.localID, "reset-id", resetID)
+	// Drop our stale instance ID. reinitRaftAdoptingInstance("") rebuilds raft
+	// but, with an empty adopt ID, leaves the old instance ID in place — so the
+	// next leader ping would mismatch and trigger adoptLeaderInstance, a second
+	// redundant full wipe that discards whatever catch-up replication already
+	// happened. With the ID cleared the follower instead silently adopts the
+	// leader's ID via the empty-ID branch in noteLeaderInstanceID (m4).
+	s.setInstanceID("")
 	return s.reinitRaftAdoptingInstance("")
 }
 
