@@ -727,10 +727,9 @@ func (s *Cache) HardReset(ctx context.Context) error {
 // initiator's raft lets it (re)win the election against the now-reset peers and
 // catch them up via the standard heartbeat / AppendEntries path.
 func (s *Cache) localInitiatorReset(resetID string) error {
-	if resetID != "" && resetID == s.getLastResetID() {
+	if !s.markResetID(resetID) {
 		return nil
 	}
-	s.setLastResetID(resetID)
 
 	s.logger.Info("hard reset: FSM cleared; keeping raft state on the reset initiator",
 		"local-id", s.localID, "reset-id", resetID)
@@ -759,11 +758,21 @@ func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID s
 // FSM (keeping raft so its heartbeats can catch up the wiped followers); on a
 // follower it reinitializes raft on fresh stores via reinitRaftAdoptingInstance,
 // discarding the log/term/vote/snapshot that made it ahead.
+//
+// Serialized on recoveryMutex with recoverQuorum and adoptLeaderInstance
+// (RT-13042): a hard reset racing a concurrent quorum recovery or fork
+// adoption — plausible exactly in the wedged states hard reset exists for —
+// could otherwise interleave two Shutdown/newStores/setRaft sequences, with
+// the losing raft instance left running on the shared transport. The resetID
+// dedup check sits inside the lock so a duplicate RPC that waited out an
+// in-flight reset no-ops instead of wiping the node a second time.
 func (s *Cache) localHardReset(resetID string) error {
-	if resetID != "" && resetID == s.getLastResetID() {
+	s.recoveryMutex.Lock()
+	defer s.recoveryMutex.Unlock()
+
+	if !s.markResetID(resetID) {
 		return nil
 	}
-	s.setLastResetID(resetID)
 
 	if s.IsLeader() {
 		s.logger.Info("hard reset: FSM cleared; keeping raft state because this node is leader",
@@ -1340,11 +1349,20 @@ func (s *Cache) getLastResetID() string {
 	return s.lastResetID
 }
 
-func (s *Cache) setLastResetID(resetID string) {
+// markResetID records resetID as the last hard reset applied to (or initiated
+// by) this node, as a single atomic check-and-set. It returns false when
+// resetID was already recorded, i.e. the reset is a duplicate and must not be
+// applied again. The previous separate get-then-set let two concurrent
+// identical resets both pass the dedup check (RT-13042).
+func (s *Cache) markResetID(resetID string) bool {
 	s.raftMutex.Lock()
 	defer s.raftMutex.Unlock()
 
+	if resetID != "" && resetID == s.lastResetID {
+		return false
+	}
 	s.lastResetID = resetID
+	return true
 }
 
 // noteLeaderInstanceID is called by the discovery layer for every received
