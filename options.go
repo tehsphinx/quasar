@@ -248,6 +248,9 @@ func WithBootstrapWait(after time.Duration) Option {
 // A zero value keeps the built-in default.
 func WithNoLeaderTimeout(timeout time.Duration) Option {
 	return func(o *options) {
+		if timeout <= 0 {
+			return
+		}
 		o.noLeaderTimeout = timeout
 	}
 }
