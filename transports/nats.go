@@ -543,12 +543,14 @@ func (s *NATSTransport) handleHeartbeat(ctx context.Context) func(*nats.Msg) {
 			s.chConsume <- rpc
 		}
 
-		bts, err := s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
+		waitCtx, cancel := s.respCtx(ctx)
+		bts, err := s.awaitResponse(waitCtx, chResp, func(i interface{}) *pb.CommandResponse {
 			resp, _ := i.(*raft.AppendEntriesResponse)
 			return &pb.CommandResponse{Resp: &pb.CommandResponse_AppendEntries{
 				AppendEntries: pb.ToAppendEntriesResponse(resp),
 			}}
 		})
+		cancel()
 		if err != nil {
 			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
 			return
@@ -557,6 +559,25 @@ func (s *NATSTransport) handleHeartbeat(ctx context.Context) func(*nats.Msg) {
 			s.logger.Error("failed to send response", "error", r)
 		}
 	}
+}
+
+func (s *NATSTransport) respCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	// Bound the response wait. Callbacks on this subscription run serially
+	// on a single NATS dispatcher goroutine, and raft's processHeartbeat
+	// returns WITHOUT responding once its shutdownCh is closed — so a beat
+	// handed to a raft torn down mid-reinit would otherwise park the
+	// dispatcher forever, permanently wedging the heartbeat subject for
+	// this transport instance (RT-13042). A heartbeat that can't be
+	// answered within the heartbeat window is worthless anyway: the sender
+	// has already fallen back to entries.append.
+	waitTimeout := s.heartbeatTimeout
+	if waitTimeout <= 0 {
+		waitTimeout = s.timeout
+	}
+	if waitTimeout > 0 {
+		return context.WithTimeout(ctx, waitTimeout)
+	}
+	return ctx, func() {}
 }
 
 // RequestVote sends the appropriate RPC to the target node.

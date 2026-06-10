@@ -761,6 +761,17 @@ RESP:
 	// we will differentiate the heartbeat fast path from normal RPCs with labels
 	metrics.MeasureSinceWithLabels([]string{"raft", "net", "rpcEnqueue"}, processStart, labels)
 	respWaitStart := time.Now()
+	// Bound the wait for heartbeats handed to the fast-path: raft's
+	// processHeartbeat returns WITHOUT responding once its shutdownCh is
+	// closed, so a beat handed to a raft torn down mid-reinit would otherwise
+	// pin this connection's goroutine forever (RT-13042). Erroring out closes
+	// the connection; the leader dials a fresh one on the next beat.
+	var hbTimeout <-chan time.Time
+	if isHeartbeat && s.timeout > 0 {
+		timer := time.NewTimer(s.timeout)
+		defer timer.Stop()
+		hbTimeout = timer.C
+	}
 	select {
 	case resp := <-respCh:
 		defer metrics.MeasureSinceWithLabels([]string{"raft", "net", "rpcRespond"}, respWaitStart, labels)
@@ -777,6 +788,8 @@ RESP:
 		if err := enc.Encode(resp.Response); err != nil {
 			return err
 		}
+	case <-hbTimeout:
+		return fmt.Errorf("timed out waiting for heartbeat response")
 	case <-s.shutdownCh:
 		return raft.ErrTransportShutdown
 	}

@@ -583,6 +583,96 @@ func TestNATSTransport_Heartbeat_FallsBackToEntriesAppendWhenUnanswered(t *testi
 	}
 }
 
+// TestNATSTransport_Heartbeat_DispatcherRecoversAfterUnansweredBeat is the
+// RT-13042 (C1) regression test. NATS delivers callbacks for a subscription
+// serially on one dispatcher goroutine. A beat handed to a heartbeat handler
+// that never responds (raft torn down mid-reinit) used to park that goroutine
+// forever in awaitResponse — every later message on entries.heartbeat was then
+// dead for the life of the transport, even after a live raft rebound the
+// handler. The receiver-side wait is now bounded by heartbeatTimeout, so the
+// dispatcher must recover and serve subsequent beats via the fast-path.
+func TestNATSTransport_Heartbeat_DispatcherRecoversAfterUnansweredBeat(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	nc1, err := nats.Connect(natsURL, nats.Timeout(natsTimeout))
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	trans1, err := NewNATSTransport(ctx, nc1, "test-cache", "hbwedge-server1",
+		WithNATSLogger(newTestLogger(t)),
+		WithNATSTimeout(natsTimeout),
+		WithNATSHeartbeatTimeout(500*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer trans1.conn.Close()
+
+	// Dead raft: bound to entries.heartbeat but never answers.
+	trans1.SetHeartbeatHandler(func(_ raft.RPC) {})
+
+	// The live raft's consumer loop: answers the sender's fallback to
+	// entries.append so the first heartbeat round-trip completes.
+	resp := raft.AppendEntriesResponse{Term: 10, Success: true}
+	go func() {
+		for {
+			select {
+			case rpc := <-trans1.Consumer():
+				rpc.Respond(&resp, nil)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	nc2, err := nats.Connect(natsURL, nats.Timeout(natsTimeout))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	trans2, err := NewNATSTransport(ctx, nc2, "test-cache", "hbwedge-server2",
+		WithNATSLogger(newTestLogger(t)),
+		WithNATSTimeout(natsTimeout),
+		WithNATSHeartbeatTimeout(500*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer trans2.conn.Close()
+
+	hbArgs := raft.AppendEntriesRequest{
+		Term:      10,
+		RPCHeader: raft.RPCHeader{Addr: []byte("kenny")},
+	}
+
+	// First beat lands on the dead handler and completes via the
+	// entries.append fallback — and parks the heartbeat dispatcher in
+	// awaitResponse until the receiver-side bound expires.
+	var out raft.AppendEntriesResponse
+	if err := trans2.AppendEntries("id1", trans1.LocalAddr(), &hbArgs, &out); err != nil {
+		t.Fatalf("first heartbeat failed: %v", err)
+	}
+
+	// Reinit finished: a live raft rebinds the fast-path.
+	var fastPath atomic.Bool
+	trans1.SetHeartbeatHandler(func(rpc raft.RPC) {
+		fastPath.Store(true)
+		rpc.Respond(&resp, nil)
+	})
+
+	// Let the receiver's bounded wait (500ms) expire so the dispatcher
+	// goroutine is released before the next beat arrives.
+	time.Sleep(700 * time.Millisecond)
+
+	var out2 raft.AppendEntriesResponse
+	if err := trans2.AppendEntries("id1", trans1.LocalAddr(), &hbArgs, &out2); err != nil {
+		t.Fatalf("heartbeat after handler rebind failed: %v", err)
+	}
+	if !fastPath.Load() {
+		t.Fatalf("heartbeat after rebind was not served via the fast-path — dispatcher still wedged (RT-13042)")
+	}
+}
+
 // TestNATSTransport_Heartbeat_NilHandlerRoutesToConsumer covers the transport
 // contract the RT-13010 lifecycle fix relies on. quasar clears the heartbeat
 // fast-path (SetHeartbeatHandler(nil)) the instant it shuts a raft down for a

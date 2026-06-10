@@ -792,16 +792,17 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string) error {
 	}
 
 	s.fsm.applyRaftReset()
-	s.raft().Shutdown()
-	// Unbind the transport's heartbeat fast-path from the raft we just shut
+	// Unbind the transport's heartbeat fast-path BEFORE shutting the old raft
 	// down. raft's processHeartbeat returns on a closed shutdownCh WITHOUT
 	// responding, so a beat landing on a torn-down instance is silently
 	// dropped and the leader loops on "failed to heartbeat" while this node
-	// never converges (RT-13010). Clearing it here guarantees the fast-path
-	// is never bound to a dead raft: newRaft below rebinds it to the live
-	// instance, and until then (or indefinitely, if newRaft fails) the
-	// transport routes beats to the live consumer instead of dropping them.
+	// never converges (RT-13010). Unbinding first shrinks the window in which
+	// a beat can still be handed to the dying raft (RT-13042): newRaft below
+	// rebinds the fast-path to the live instance, and until then (or
+	// indefinitely, if newRaft fails) the transport routes beats to the live
+	// consumer instead of dropping them.
 	s.transport.SetHeartbeatHandler(nil)
+	s.raft().Shutdown()
 
 	s.newStores()
 	if adoptInstanceID != "" {
@@ -1027,6 +1028,11 @@ func (s *Cache) recoverQuorum() error {
 	s.logger.Warn("quorum lost — forcing raft recovery",
 		"keep", keep, "dropped", dropped)
 
+	// See reinitRaftAdoptingInstance: unbind the heartbeat fast-path BEFORE
+	// shutting the old raft down so a beat is never silently dropped by a
+	// torn-down instance (RT-13010, RT-13042). newRaft below rebinds it to
+	// the live raft.
+	s.transport.SetHeartbeatHandler(nil)
 	// IMPORTANT: do not call .Error() on the shutdown future here.
 	// hashicorp/raft's shutdownFuture.Error() additionally invokes Close()
 	// on the transport (raft@v1.7.3 future.go), which the InmemTransport
@@ -1037,10 +1043,6 @@ func (s *Cache) recoverQuorum() error {
 	// it sets the shutdown flag and closes the channel that all internal
 	// goroutines select on. reinitRaftAdoptingInstance uses the same pattern.
 	rft.Shutdown()
-	// See reinitRaftAdoptingInstance: unbind the heartbeat fast-path from the
-	// raft we just shut down so a beat is never silently dropped by a
-	// torn-down instance. newRaft below rebinds it to the live raft (RT-13010).
-	s.transport.SetHeartbeatHandler(nil)
 
 	// Mint a fresh instance ID — recoverQuorum forks the consensus
 	// history line on purpose (RT-12862). Surviving peers compare the
