@@ -273,6 +273,15 @@ func (q *natsPersistedQueue) stopConsumer() error {
 	return nil
 }
 
+// settleWait is how long a stopping consumer waits for the in-flight item
+// to be settled by the apply loop before falling back to a Nack.
+func (q *natsPersistedQueue) settleWait() time.Duration {
+	if q.ackWait > 0 {
+		return q.ackWait
+	}
+	return defaultPersistedAckWait
+}
+
 // clearConsumer drops the active-consumer reference if it still points at c.
 // Called from the puller goroutine's exit path: when the consumer dies
 // spontaneously (e.g. the JetStream consumer was deleted server-side or hit
@@ -361,7 +370,17 @@ func (c *natsPersistedConsumer) consume(ctx context.Context, msg jetstream.Msg) 
 	select {
 	case <-item.settled:
 	case <-ctx.Done():
-		_ = item.Nack(context.Background())
+		// The item is with the apply loop and may already be committed to
+		// raft. An immediate Nack here could void that successful apply:
+		// ReplySuccess loses the settle race, the publisher's reply never
+		// goes out, and the next leader applies the same command a second
+		// time. Prefer letting the in-flight apply settle, bounded by
+		// AckWait — past that JetStream redelivers anyway (RT-13042 M5).
+		select {
+		case <-item.settled:
+		case <-time.After(c.queue.settleWait()):
+			_ = item.Nack(context.Background())
+		}
 		return false
 	}
 	return true
@@ -387,7 +406,15 @@ func (c *natsPersistedConsumer) stop() {
 	c.inflightM.Lock()
 	in := c.inflight
 	c.inflightM.Unlock()
-	if in != nil {
+	if in == nil {
+		return
+	}
+	// Same reasoning as the ctx.Done branch in consume: the in-flight item
+	// may be mid-apply on the loop side, so give it a bounded chance to
+	// settle before nacking it for redelivery (RT-13042 M5).
+	select {
+	case <-in.settled:
+	case <-time.After(c.queue.settleWait()):
 		_ = in.Nack(context.Background())
 	}
 }
@@ -420,12 +447,29 @@ type natsPersistedItem struct {
 	msg     jetstream.Msg
 	command *pb.Store
 
-	settledOnce sync.Once
+	settledM    sync.Mutex
+	settledDone bool
 	settled     chan struct{}
 }
 
 func (i *natsPersistedItem) Command() *pb.Store {
 	return i.command
+}
+
+// beginSettle claims the right to settle this item. It returns false when
+// the item was already settled — the caller lost the race and must not
+// touch the underlying message again. A lost race is reported to the loser
+// as ErrAlreadySettled (RT-13042 M5): silently no-oping made a Nack that
+// voided a successful apply undetectable on the apply side.
+func (i *natsPersistedItem) beginSettle() bool {
+	i.settledM.Lock()
+	defer i.settledM.Unlock()
+
+	if i.settledDone {
+		return false
+	}
+	i.settledDone = true
+	return true
 }
 
 func (i *natsPersistedItem) ReplySuccess(_ context.Context, resp *pb.StoreResponse) error {
@@ -437,39 +481,40 @@ func (i *natsPersistedItem) ReplyError(_ context.Context, err error) error {
 }
 
 func (i *natsPersistedItem) Nack(_ context.Context) error {
-	var ackErr error
-	i.settledOnce.Do(func() {
-		ackErr = i.msg.Nak()
-		close(i.settled)
-	})
-	return ackErr
+	if !i.beginSettle() {
+		return ErrAlreadySettled
+	}
+	err := i.msg.Nak()
+	close(i.settled)
+	return err
 }
 
 func (i *natsPersistedItem) terminate(protoResp *pb.CommandResponse, ack bool) error {
+	if !i.beginSettle() {
+		return ErrAlreadySettled
+	}
+	defer close(i.settled)
+
+	bts, mErr := proto.Marshal(protoResp)
+	if mErr != nil {
+		// Even on marshal failure we need to ack to avoid
+		// poison-message redelivery storms; the publisher will
+		// time out and surface its own error.
+		_ = i.msg.Ack()
+		return mErr
+	}
+
 	var err error
-	i.settledOnce.Do(func() {
-		bts, mErr := proto.Marshal(protoResp)
-		if mErr != nil {
-			err = mErr
-			// Even on marshal failure we need to ack to avoid
-			// poison-message redelivery storms; the publisher will
-			// time out and surface its own error.
-			_ = i.msg.Ack()
-			close(i.settled)
-			return
+	if reply := persistedReplyInbox(i.msg); reply != "" {
+		if pErr := i.queue.conn.Publish(reply, bts); pErr != nil {
+			err = pErr
 		}
-		if reply := persistedReplyInbox(i.msg); reply != "" {
-			if pErr := i.queue.conn.Publish(reply, bts); pErr != nil {
-				err = pErr
-			}
+	}
+	if ack {
+		if aErr := i.msg.Ack(); aErr != nil && err == nil {
+			err = aErr
 		}
-		if ack {
-			if aErr := i.msg.Ack(); aErr != nil && err == nil {
-				err = aErr
-			}
-		}
-		close(i.settled)
-	})
+	}
 	return err
 }
 

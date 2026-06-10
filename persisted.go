@@ -213,7 +213,13 @@ func (s *Cache) applyPersistedItem(ctx context.Context, item transports.Persiste
 	if storeResp.Uid == 0 {
 		storeResp.Uid = uid
 	}
-	_ = item.ReplySuccess(ctx, storeResp)
+	if r := item.ReplySuccess(ctx, storeResp); errors.Is(r, transports.ErrAlreadySettled) {
+		// A shutdown-path Nack won the settle race after the apply already
+		// committed: the publisher gets no reply and the item is redelivered
+		// to the next leader, which applies it a second time (RT-13042 M5).
+		s.logger.Warn("persisted item nacked despite successful apply; command will be redelivered — FSM applies must be idempotent",
+			"uid", storeResp.Uid)
+	}
 }
 
 // isLeadershipTransitionError reports whether err signals that the

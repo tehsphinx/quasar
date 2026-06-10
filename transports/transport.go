@@ -28,6 +28,14 @@ const (
 // invoked on them. Callers should check SupportsPersisted() first.
 var ErrPersistedNotSupported = errors.New("transport does not support persisted FIFO")
 
+// ErrAlreadySettled is returned by PersistedItem.ReplySuccess / ReplyError /
+// Nack when the item was already settled by a concurrent call. The caller's
+// intended outcome did NOT take effect: most notably, a ReplySuccess that
+// loses against a shutdown-path Nack means the command was applied locally
+// but the queue item goes back for redelivery — the next leader will apply
+// it again (RT-13042 M5).
+var ErrAlreadySettled = errors.New("persisted item already settled")
+
 // Transport defines an extended raft.Transport with additional commands for the cache.
 type Transport interface {
 	raft.Transport
@@ -96,6 +104,12 @@ type Transport interface {
 // calling exactly one of ReplySuccess / ReplyError / Nack — the
 // persisted stream's MaxAckPending = 1 invariant pauses delivery until
 // the in-flight item is settled.
+//
+// Delivery on the persisted path is AT-LEAST-ONCE: redelivery is inherent
+// to the backing queue (AckWait expiry, leadership flips, a Nack racing a
+// successful apply — see ErrAlreadySettled). FSM implementations whose
+// commands are not naturally idempotent must deduplicate replayed
+// commands themselves.
 type PersistedItem interface {
 	// Command returns the underlying Store command.
 	Command() *pb.Store
