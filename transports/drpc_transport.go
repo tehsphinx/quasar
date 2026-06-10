@@ -120,9 +120,16 @@ func (s *DRPCTransport) DecodePeer(bytes []byte) raft.ServerAddress {
 // as a fast-pass. This is to avoid head-of-line blocking from
 // disk IO. If a Transport does not support this, it can simply
 // ignore the call, and push the heartbeat onto the Consumer channel.
+//
+// DRPCTransport is experimental and not yet wired into raft; this is a
+// deliberate no-op rather than a panic so that raft.NewRaft — which
+// calls SetHeartbeatHandler unconditionally during construction — does
+// not bring the process down on the very first step. The rest of the
+// transport is still stubbed and will panic when actually exercised
+// (RT-13042 m20).
 func (s *DRPCTransport) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
-	// TODO implement me
-	panic("implement me")
+	// No-op: heartbeats fall through to the Consumer channel, as the
+	// raft.Transport contract permits for transports without a fast-pass.
 }
 
 // TimeoutNow is used to start a leadership transfer to the target node.
