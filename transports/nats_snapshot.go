@@ -161,17 +161,28 @@ func (s *NATSTransport) openNatsStream(subj string) (*io.PipeReader, *nats.Subsc
 	})
 
 	chanSub, err := s.conn.Subscribe(subj+".send.*", func(msg *nats.Msg) {
-		timer.Reset(snapshotPkgTimout)
-		if _, r := pipeWriter.Write(msg.Data); r != nil {
-			_ = pipeWriter.CloseWithError(r)
-			return
-		}
-		if strings.HasSuffix(msg.Subject, ".EOF") {
-			timer.Stop()
-			_ = pipeWriter.Close()
-		}
+		writeSnapshotPkg(timer, pipeWriter, msg.Subject, msg.Data)
 	})
 	return pipeReader, chanSub, err
+}
+
+// writeSnapshotPkg hands one received snapshot package to the FSM-side reader
+// through pipeWriter. The timer is stopped for the duration of the write:
+// pipeWriter.Write blocks until that reader consumes the data, and a slow/busy
+// local reader (or a reinit window) must not be mistaken for a stalled network.
+// The timer only measures the gap between network packages, so it is re-armed
+// after a successful (non-EOF) write.
+func writeSnapshotPkg(timer *time.Timer, pipeWriter *io.PipeWriter, subject string, data []byte) {
+	timer.Stop()
+	if _, r := pipeWriter.Write(data); r != nil {
+		_ = pipeWriter.CloseWithError(r)
+		return
+	}
+	if strings.HasSuffix(subject, ".EOF") {
+		_ = pipeWriter.Close()
+		return
+	}
+	timer.Reset(snapshotPkgTimout)
 }
 
 func (s *NATSTransport) buildConsumeMsg(msg *nats.Msg, pipeReader *io.PipeReader) (chan raft.RPCResponse, raft.RPC, error) {

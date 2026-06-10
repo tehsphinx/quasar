@@ -4,6 +4,7 @@ package transports
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 )
@@ -40,4 +41,41 @@ func TestInstallSnapshotRespChanDoesNotBlockLateResponse(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("late response send blocked: chResp must be buffered to avoid leaking the subscription callback goroutine")
 	}
+}
+
+// TestWriteSnapshotPkgSlowReaderDoesNotTimeout reproduces RT-13042 m14: the
+// inter-package timer must not punish a slow local reader. While
+// pipeWriter.Write blocks waiting for the FSM-side reader, the timer has to be
+// paused; otherwise a reader slower than snapshotPkgTimout aborts an otherwise
+// healthy snapshot install. The timer is exercised with a short period so a
+// slow reader is simulated quickly.
+func TestWriteSnapshotPkgSlowReaderDoesNotTimeout(t *testing.T) {
+	const pkgTimeout = 50 * time.Millisecond
+
+	pipeReader, pipeWriter := io.Pipe()
+	timer := time.AfterFunc(pkgTimeout, func() {
+		_ = pipeWriter.CloseWithError(context.DeadlineExceeded)
+	})
+	defer timer.Stop()
+
+	// Reader consumes the package, but only after a delay far longer than the
+	// inter-package timeout, mimicking a busy FSM-side reader / reinit window.
+	readErr := make(chan error, 1)
+	go func() {
+		time.Sleep(4 * pkgTimeout)
+		buf := make([]byte, 16)
+		_, err := io.ReadFull(pipeReader, buf)
+		readErr <- err
+	}()
+
+	// Blocks until the slow reader above consumes the data.
+	writeSnapshotPkg(timer, pipeWriter, "subj.send.1", []byte("snapshot-package"))
+
+	if err := <-readErr; err != nil {
+		t.Fatalf("slow reader saw error, timer punished local reader instead of measuring network gap: %v", err)
+	}
+
+	// A clean EOF must still close the pipe without error after the slow write.
+	go func() { _, _ = io.ReadAll(pipeReader) }()
+	writeSnapshotPkg(timer, pipeWriter, "subj.send.EOF", nil)
 }
