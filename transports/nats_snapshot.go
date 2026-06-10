@@ -29,7 +29,9 @@ func (s *NATSTransport) InstallSnapshot(_ raft.ServerID, address raft.ServerAddr
 		return err
 	}
 
-	chResp := make(chan []byte)
+	// Buffered (capacity 1) so a response arriving after the select below has
+	// exited on ctx.Done() never blocks the subscription callback goroutine.
+	chResp := make(chan []byte, 1)
 	recvSubj := protoRespCh.GetSubject() + ".resp"
 	respSub, err := s.conn.Subscribe(recvSubj, func(msg *nats.Msg) {
 		chResp <- msg.Data
