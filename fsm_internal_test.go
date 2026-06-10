@@ -117,6 +117,55 @@ func TestFSMRestoreToleratesShortReads(t *testing.T) {
 	}
 }
 
+// TestSystemUIDCommitTimeRegistration is the RT-13042 M10 regression test.
+// Non-command log indexes used to be registered at STORE time — but logs are
+// stored before they are committed, so a follower storing an uncommitted
+// configuration entry advanced lastApplied immediately. If a new leader later
+// truncated and replaced that entry, WaitFor had already released its waiters
+// without the real entry being applied — a hole in the read-your-writes
+// guarantee. Configuration entries must only register at commit time (via
+// raft.ConfigurationStore); noop entries — which raft never hands to the FSM
+// on any path — keep the store-time registration.
+func TestSystemUIDCommitTimeRegistration(t *testing.T) {
+	fsm := wrapFSM(newSnapFSM())
+	st := wrapStore(raft.NewInmemStore(), fsm)
+
+	// A stored-but-uncommitted configuration entry must not move lastApplied.
+	if err := st.StoreLog(&raft.Log{Index: 1, Type: raft.LogConfiguration}); err != nil {
+		t.Fatalf("StoreLog: %v", err)
+	}
+	if got := fsm.getLastApplied(); got != 0 {
+		t.Fatalf("lastApplied = %d after storing an uncommitted configuration entry, want 0", got)
+	}
+
+	// Noop entries never reach the FSM, so they still register at store
+	// time. This mirrors the real ordering on a fresh leader: the noop at
+	// index 2 is stored BEFORE the configuration entry at index 1 commits,
+	// so it queues behind the not-yet-registered config index.
+	if err := st.StoreLogs([]*raft.Log{{Index: 2, Type: raft.LogNoop}}); err != nil {
+		t.Fatalf("StoreLogs: %v", err)
+	}
+	if got := fsm.getLastApplied(); got != 0 {
+		t.Fatalf("lastApplied = %d with the noop queued behind the uncommitted config entry, want 0", got)
+	}
+
+	// On commit raft hands the configuration entry to StoreConfiguration;
+	// registering it must also drain the queued noop, or every WaitReady on
+	// a fresh cluster hangs until the first command applies.
+	fsm.StoreConfiguration(1, raft.Configuration{})
+	if got := fsm.getLastApplied(); got != 2 {
+		t.Fatalf("lastApplied = %d after committed configuration entry, want 2 (config + queued noop)", got)
+	}
+
+	// Command entries register through Apply, never through the store wrapper.
+	if err := st.StoreLog(&raft.Log{Index: 3, Type: raft.LogCommand}); err != nil {
+		t.Fatalf("StoreLog: %v", err)
+	}
+	if got := fsm.getLastApplied(); got != 2 {
+		t.Fatalf("lastApplied = %d after stored command entry, want 2 (commands apply via FSM.Apply)", got)
+	}
+}
+
 // TestUserRestoreAlignsLastAppliedWithRaftIndex is the RT-13042 M7 regression
 // test for the restore index. Restoring a snapshot through raft.Restore burns
 // a fresh index (max(lastIndex, snapshotIndex)+1) — the old code instead set

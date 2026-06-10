@@ -324,8 +324,15 @@ func (s *Cache) masterLastIndex(ctx context.Context) (uint64, error) {
 	return uid, nil
 }
 
+// localLastIndex is the local anchor for WaitFor-style consistency waits
+// (masterLastIndex on the leader, the LatestUid RPC handler). It reports
+// raft's APPLIED index, not LastIndex: LastIndex includes stored-but-
+// uncommitted entries, so a Load/WaitReady anchored on it could wait out its
+// full deadline for an entry that never commits after a leadership loss
+// (RT-13042 M10). The applied index is the committed state a consistency
+// wait actually needs to observe.
 func (s *Cache) localLastIndex() uint64 {
-	return s.raft().LastIndex()
+	return s.raft().AppliedIndex()
 }
 
 // apply is the central dispatcher for cache commands. When the configured

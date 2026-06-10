@@ -168,6 +168,19 @@ func (s *fsmWrapper) takeRestoreIndex() uint64 {
 	return atomic.SwapUint64(&s.restoreIndex, 0)
 }
 
+var _ raft.ConfigurationStore = (*fsmWrapper)(nil)
+
+// StoreConfiguration is invoked by raft once a configuration-change log
+// entry is committed and handed to the FSM goroutine. It registers the
+// entry's index at COMMIT time — the store wrapper skips configuration
+// entries at store time precisely so an uncommitted (and possibly later
+// truncated) config change cannot advance lastApplied early (RT-13042 M10).
+//
+// Implements raft.ConfigurationStore.
+func (s *fsmWrapper) StoreConfiguration(index uint64, _ raft.Configuration) {
+	s.regSystemUID(index)
+}
+
 func (s *fsmWrapper) applyRaftReset() {
 	s.setLastApplied(0)
 	s.resetSysUIDs()
@@ -210,6 +223,13 @@ func (s *fsmWrapper) uidApplied(uid uint64) {
 
 func (s *fsmWrapper) regSystemUID(uid uint64) {
 	if applied := s.applySysUID(uid); applied {
+		// Drain queued successors: with configuration entries registering at
+		// commit time (RT-13042 M10), a freshly elected leader's noop is
+		// stored — and queued here — BEFORE the configuration entry below it
+		// commits, so the commit-time registration must pop the queue or
+		// lastApplied stalls until the first command applies.
+		s.applySysUIDs()
+
 		s.condM.Lock()
 		defer s.condM.Unlock()
 

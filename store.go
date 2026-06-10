@@ -18,11 +18,30 @@ type store struct {
 	fsm *fsmWrapper
 }
 
+// regSystemUID registers the index of a non-command log entry so
+// fsmWrapper.lastApplied keeps moving across entries that never reach
+// FSM.Apply — without it, WaitFor would hang on e.g. the noop every newly
+// elected leader appends.
+//
+// Configuration entries are deliberately NOT registered here: logs are
+// stored BEFORE they are committed, and an index registered at store time
+// can advance lastApplied past an entry a new leader later truncates and
+// replaces — releasing WaitFor callers before the real entry at that index
+// is applied (RT-13042 M10). Committed configuration entries reach the FSM
+// via StoreConfiguration (raft.ConfigurationStore) instead, which registers
+// them at commit time. Noop entries never reach the FSM on any path, so
+// store time remains the only hook for them; that residual window
+// self-corrects on the next applied entry and is accepted.
+func (s *store) regSystemUID(log *raft.Log) {
+	if log.Type == raft.LogCommand || log.Type == raft.LogConfiguration {
+		return
+	}
+	s.fsm.regSystemUID(log.Index)
+}
+
 // StoreLog stores a log entry.
 func (s *store) StoreLog(log *raft.Log) error {
-	if log.Type != raft.LogCommand {
-		s.fsm.regSystemUID(log.Index)
-	}
+	s.regSystemUID(log)
 	return s.LogStore.StoreLog(log)
 }
 
@@ -33,9 +52,7 @@ func (s *store) StoreLog(log *raft.Log) error {
 // discontinuity between logs before the snapshot and logs after.
 func (s *store) StoreLogs(logs []*raft.Log) error {
 	for _, log := range logs {
-		if log.Type != raft.LogCommand {
-			s.fsm.regSystemUID(log.Index)
-		}
+		s.regSystemUID(log)
 	}
 	return s.LogStore.StoreLogs(logs)
 }
