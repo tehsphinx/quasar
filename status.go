@@ -157,8 +157,12 @@ func (s *Cache) determineClusterHealth(status RaftStatus) bool {
 	}
 
 	// Check if this node is significantly behind
-	// If commit index is far behind last index, there might be issues
-	if status.CommitIndex > 0 && status.LastApplied > 0 {
+	// If commit index is far behind last index, there might be issues.
+	// Guard the subtraction on CommitIndex > LastApplied: these are uint64,
+	// so if LastApplied ever exceeds CommitIndex (shouldn't happen per raft
+	// invariants, but this is a health report — be defensive) the subtraction
+	// wraps to a huge number and falsely reports unhealthy (L7).
+	if status.CommitIndex > status.LastApplied {
 		lag := status.CommitIndex - status.LastApplied
 		// Allow some lag, but if it's more than 1000 entries, something might be wrong
 		if lag > 1000 {
