@@ -41,7 +41,12 @@ func (s *FSMInjector) WaitForKnownLatest(ctx context.Context) error {
 	ctx, cancel := getWaitCtx(ctx)
 	defer cancel()
 
-	uid := s.cache.raft().LastIndex()
+	// Anchor on the committed index, not LastIndex(): LastIndex includes
+	// stored-but-uncommitted entries, so after a leadership loss the awaited
+	// entry may never commit and the caller burns its whole deadline — the
+	// same trap localLastIndex documents (RT-13042 M10). CommitIndex gives
+	// the "known but not yet applied" entries this call is meant to wait out.
+	uid := s.cache.raft().CommitIndex()
 	return s.cache.fsm.WaitFor(ctx, uid)
 }
 
