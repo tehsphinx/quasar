@@ -599,7 +599,10 @@ func (s *TCPTransport) handleConn(connCtx context.Context, conn net.Conn) {
 		}
 
 		if err := s.handleCommand(r, dec, enc); err != nil {
-			if errors.Is(err, io.EOF) {
+			// io.EOF / io.ErrUnexpectedEOF are the normal connection-close path
+			// and stay quiet; everything else is a real decode/dispatch error
+			// worth surfacing during triage.
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				s.logger.Error("failed to decode incoming command", "error", err)
 			}
 			return
