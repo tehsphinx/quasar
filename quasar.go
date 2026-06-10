@@ -272,6 +272,13 @@ type Cache struct {
 
 	recoveryMutex sync.Mutex
 
+	// hardReset* remember the resetID of the most recent HardReset fan-out so
+	// a retry after a partial failure reuses it instead of minting a fresh
+	// UUID that would re-wipe peers already reset by the prior attempt (m9).
+	hardResetMu     sync.Mutex
+	lastHardResetID string
+	lastHardResetOK bool
+
 	transport transports.Transport
 	discovery *DiscoveryInjector
 	suffrage  raft.ServerSuffrage
@@ -739,6 +746,16 @@ func (s *Cache) reset(ctx context.Context) error {
 // again, to re-anchor the reset in the new log history / snapshots — the hard
 // reset clears each FSM out-of-band, which on its own does not carry the
 // snapshot-regression guarantee the log-based reset provides (RT-12994).
+//
+// HardReset must be issued from the node intended to survive as leader: the
+// initiator keeps its raft (localInitiatorReset) while every peer is wiped to
+// fresh stores, so a hard reset issued from a node that is NOT the one "ahead"
+// cannot fix a cluster wedged by that ahead node — issue it from the survivor.
+//
+// A retry after a partial fan-out failure reuses the previous attempt's
+// resetID rather than minting a fresh one, so peers already wiped by the
+// failed attempt dedup it (markResetID) and are not wiped a second time (m9).
+// A fresh resetID is minted only after a fully successful HardReset.
 func (s *Cache) HardReset(ctx context.Context) error {
 	servers, err := s.GetServerList()
 	if err != nil {
@@ -747,7 +764,7 @@ func (s *Cache) HardReset(ctx context.Context) error {
 
 	s.logger.Info("hard cache reset triggered")
 
-	resetID := uuid.NewString()
+	resetID := s.hardResetID()
 
 	var retErrs []error
 	for _, server := range servers {
@@ -762,7 +779,33 @@ func (s *Cache) HardReset(ctx context.Context) error {
 		retErrs = append(retErrs, r)
 	}
 
-	return errors.Join(retErrs...)
+	err = errors.Join(retErrs...)
+	s.recordHardResetResult(resetID, err == nil)
+	return err
+}
+
+// hardResetID returns the resetID to use for a HardReset fan-out: the previous
+// attempt's ID when that attempt did not fully succeed (so a retry reuses it),
+// otherwise a fresh UUID (m9).
+func (s *Cache) hardResetID() string {
+	s.hardResetMu.Lock()
+	defer s.hardResetMu.Unlock()
+
+	if s.lastHardResetID != "" && !s.lastHardResetOK {
+		return s.lastHardResetID
+	}
+	return uuid.NewString()
+}
+
+// recordHardResetResult remembers the outcome of a HardReset fan-out so the
+// next call can decide whether to reuse the resetID (partial failure) or mint
+// a fresh one (success).
+func (s *Cache) recordHardResetResult(resetID string, ok bool) {
+	s.hardResetMu.Lock()
+	defer s.hardResetMu.Unlock()
+
+	s.lastHardResetID = resetID
+	s.lastHardResetOK = ok
 }
 
 // localInitiatorReset clears the FSM on the node that initiates a HardReset but

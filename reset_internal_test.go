@@ -150,6 +150,32 @@ func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
 	}
 }
 
+// TestHardResetReusesResetIDOnRetry is the RT-13042 m9 regression test.
+// HardReset used to mint a fresh UUID on every call, so retrying after a
+// partial fan-out failure re-wiped peers already reset by the prior attempt.
+// The resetID must be reused while the last attempt has not fully succeeded,
+// and a fresh one minted only after success.
+func TestHardResetReusesResetIDOnRetry(t *testing.T) {
+	c := &Cache{}
+
+	first := c.hardResetID()
+	if first == "" {
+		t.Fatal("expected a resetID")
+	}
+
+	// Partial failure: the next attempt must reuse the same ID.
+	c.recordHardResetResult(first, false)
+	if got := c.hardResetID(); got != first {
+		t.Fatalf("expected the failed attempt's resetID %q reused on retry, got %q", first, got)
+	}
+
+	// Success: the next attempt must mint a fresh ID.
+	c.recordHardResetResult(first, true)
+	if got := c.hardResetID(); got == first {
+		t.Fatalf("expected a fresh resetID after a successful reset, got the old %q", got)
+	}
+}
+
 // TestLocalHardResetClearsInstanceID is the RT-13042 m4 regression test.
 // A follower hard reset used to call reinitRaftAdoptingInstance("") while
 // leaving its stale instance ID in place, so the next leader ping mismatched
