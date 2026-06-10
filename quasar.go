@@ -301,6 +301,13 @@ type Cache struct {
 
 	ctx   context.Context
 	close context.CancelFunc
+
+	// shutdownOnce makes shutdown idempotent: Shutdown() cancels the cache
+	// ctx (which makes consume call shutdown) and then calls shutdown itself,
+	// so without this the transport Close() and raft.Shutdown() would run
+	// twice, concurrently (L6).
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 // newStores (re)creates the in-memory raft stores and stashes them on the
@@ -699,11 +706,13 @@ func (s *Cache) RemoveAndShutdown(ctx context.Context) error {
 }
 
 func (s *Cache) shutdown() error {
-	if trans, ok := s.transport.(io.Closer); ok {
-		_ = trans.Close()
-	}
-
-	return s.raft().Shutdown().Error()
+	s.shutdownOnce.Do(func() {
+		if trans, ok := s.transport.(io.Closer); ok {
+			_ = trans.Close()
+		}
+		s.shutdownErr = s.raft().Shutdown().Error()
+	})
+	return s.shutdownErr
 }
 
 func (s *Cache) removeSelf(ctx context.Context) error {
