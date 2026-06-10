@@ -48,7 +48,12 @@ func wrapFSM(fsm FSM) *fsmWrapper {
 		condM: mutex,
 		cond:  cond.New(mutex),
 	}
-	if _, ok := fsm.(logApplier); ok {
+	// The logApplier fast path returns the unexported applyResponse, which
+	// applyLocal type-asserts. Only the internal kvFSM can satisfy that
+	// contract, so detect it concretely: a user FSM that happens to
+	// implement Apply(*raft.Log) would otherwise take the fast path and
+	// panic the leader on the first apply (L1).
+	if _, ok := fsm.(*kvFSM); ok {
 		s.isLogApplier = true
 	}
 	return s
