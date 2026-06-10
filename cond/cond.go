@@ -68,16 +68,17 @@ func (c *Cond) WaitContext(ctx context.Context) error {
 }
 
 func (c *Cond) getWaitChan() chan struct{} {
-	ch := c.ch.Load()
-	if ch == nil {
+	for {
+		ch := c.ch.Load()
+		if ch != nil {
+			return *ch
+		}
+
 		chNew := make(chan struct{})
 		if c.ch.CompareAndSwap(nil, &chNew) {
-			ch = &chNew
-		} else {
-			// another channel was set meanwhile, load and use.
-			ch = c.ch.Load()
+			return chNew
 		}
+		// another channel was set meanwhile (or a Broadcast cleared it again);
+		// retry the load/CAS so we never dereference a nil pointer.
 	}
-
-	return *ch
 }
