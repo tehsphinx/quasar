@@ -24,8 +24,12 @@ func getNATSOptions(opts []NATSOption) natsOptions {
 
 	if cfg.logger == nil {
 		cfg.logger = hclog.New(&hclog.LoggerOptions{
-			Name:   "quasar",
-			Output: hclog.DefaultOutput,
+			Name: "quasar",
+			// Honor WithNATSLogOutput: cfg.output was previously collected but
+			// never wired into the default logger, so the option was silently
+			// ignored (RT-13042 S7). Defaults to os.Stderr (set in the cfg
+			// above), matching hclog.DefaultOutput.
+			Output: cfg.output,
 			Level:  hclog.DefaultLevel,
 		})
 	}
