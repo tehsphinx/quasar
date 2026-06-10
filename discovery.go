@@ -491,11 +491,16 @@ func (s *DiscoveryInjector) setServer(srv raft.Server) bool {
 
 	s.lastSeen[srv.ID] = time.Now()
 
-	_, ok := s.servers[srv.ID]
-	if ok {
+	known, ok := s.servers[srv.ID]
+	if ok && known.Address == srv.Address {
 		return false
 	}
 
+	// New ID, or a known ID that came back on a different address (a peer
+	// restarted with a dynamic port/IP). Treat an address change as new so
+	// ProcessServerWithStatus re-runs addServer: AddVoter with a changed
+	// address updates the raft configuration entry, otherwise the leader
+	// keeps the dead address forever and the peer is unreachable (M3).
 	s.servers[srv.ID] = srv
 	return true
 }

@@ -319,6 +319,47 @@ func TestDiscoveryRunDoesNotLeakPruningTickers(t *testing.T) {
 	}
 }
 
+// TestSetServerDetectsAddressChange is the M3 regression test. setServer keyed
+// on ServerID only, so a peer that restarted with the same ID but a new address
+// (dynamic port/IP) refreshed lastSeen and returned isNew == false, keeping the
+// old (dead) address forever — never re-added to raft, never pruned. setServer
+// must treat an address change as new so ProcessServerWithStatus re-runs
+// addServer and updates the raft configuration entry.
+func TestSetServerDetectsAddressChange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewKVCache(ctx,
+		WithLocalID("follower"),
+		WithTransport(tr),
+		WithSuffrage(raft.Nonvoter),
+	)
+	if err != nil {
+		t.Fatalf("NewKVCache: %v", err)
+	}
+	defer func() { _ = c.Shutdown() }()
+
+	peer := raft.Server{ID: "peer", Address: "old-addr", Suffrage: raft.Voter}
+	if !c.discovery.setServer(peer) {
+		t.Fatal("first observation of a peer must report isNew == true")
+	}
+	if c.discovery.setServer(peer) {
+		t.Fatal("same ID and address must report isNew == false")
+	}
+
+	moved := raft.Server{ID: "peer", Address: "new-addr", Suffrage: raft.Voter}
+	if !c.discovery.setServer(moved) {
+		t.Fatal("same ID with a changed address must report isNew == true")
+	}
+
+	for _, srv := range c.discovery.getServers() {
+		if srv.ID == "peer" && srv.Address != "new-addr" {
+			t.Fatalf("stored address not updated: got %q, want %q", srv.Address, "new-addr")
+		}
+	}
+}
+
 func containsServer(servers []raft.Server, id raft.ServerID) bool {
 	for _, s := range servers {
 		if s.ID == id {
