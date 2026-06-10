@@ -22,19 +22,23 @@ func (s *memKVStore) Store(key string, data []byte) error {
 	s.m.Lock()
 	defer s.m.Unlock()
 
-	s.store[key] = data
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	s.store[key] = cp
 	return nil
 }
 
 func (s *memKVStore) Load(key string) ([]byte, error) {
-	s.m.Lock()
-	defer s.m.Unlock()
+	s.m.RLock()
+	defer s.m.RUnlock()
 
 	data, ok := s.store[key]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return data, nil
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	return cp, nil
 }
 
 // Items returns a copy of all key/value pairs. Implements SnapshotKVStore.
