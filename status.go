@@ -3,6 +3,8 @@
 package quasar
 
 import (
+	"time"
+
 	"github.com/hashicorp/raft"
 )
 
@@ -73,11 +75,20 @@ func (s *Cache) GetRaftStatus() RaftStatus {
 	status.LeaderAddress = string(leaderAddr)
 	status.HasLeader = leaderID != ""
 
-	// Check if leader is healthy by verifying leadership
+	// Check if leader is healthy. VerifyLeader round-trips a quorum check
+	// that only the leader itself can answer — followers and candidates fail
+	// the verify future with ErrNotLeader (raft v1.7.3), which used to mark
+	// every healthy follower's cluster unhealthy (RT-13042 H3). On non-leader
+	// nodes, derive leader health from the recency of leader contact instead:
+	// contact staler than HeartbeatTimeout is the same signal that makes a
+	// follower start an election.
 	if status.HasLeader {
-		// VerifyLeader returns nil if this node believes the leader is still valid
-		verifyFuture := cacheRaft.VerifyLeader()
-		status.LeaderHealthy = verifyFuture.Error() == nil
+		if status.IsLeader {
+			verifyFuture := cacheRaft.VerifyLeader()
+			status.LeaderHealthy = verifyFuture.Error() == nil
+		} else {
+			status.LeaderHealthy = time.Since(cacheRaft.LastContact()) <= s.heartbeatTimeout()
+		}
 	}
 
 	// Get last contact time (only meaningful for followers)
@@ -116,6 +127,16 @@ func (s *Cache) GetRaftStatus() RaftStatus {
 	status.Healthy = s.determineClusterHealth(status)
 
 	return status
+}
+
+// heartbeatTimeout returns the HeartbeatTimeout the raft instance runs with —
+// the user-supplied raft config when set, raft's default otherwise. Read-only:
+// deliberately does not go through raftConfig, which mutates the config.
+func (s *Cache) heartbeatTimeout() time.Duration {
+	if s.cfg.raftConfig != nil {
+		return s.cfg.raftConfig.HeartbeatTimeout
+	}
+	return raft.DefaultConfig().HeartbeatTimeout
 }
 
 // determineClusterHealth evaluates the overall health of the Raft cluster.
