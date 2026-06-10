@@ -2,6 +2,7 @@ package quasar
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
@@ -271,6 +272,50 @@ func TestLocalPeerStatusReportsVotersOnEveryNode(t *testing.T) {
 			t.Fatalf("expected NumVotersInConfig == 2 on both nodes, got cache1=%d cache2=%d", n1, n2)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestDiscoveryRunDoesNotLeakPruningTickers is the RT-13042 M9 regression
+// test. DiscoveryInjector.run is called on every raft (re)creation
+// (newCache, reinitRaftAdoptingInstance, recoverQuorum) and used to start its
+// pruning ticker on the cache-lifetime context: unlike the observer goroutine
+// (cancelled via cancelPrevious), every rebuild leaked one more ticker
+// goroutine running pruneExpiredServers concurrently for the life of the
+// cache. Re-running discovery many times must not accumulate goroutines.
+func TestDiscoveryRunDoesNotLeakPruningTickers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewKVCache(ctx,
+		WithLocalID("node"),
+		WithTransport(tr),
+		WithSuffrage(raft.Nonvoter),
+		WithAutoPrune(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("NewKVCache: %v", err)
+	}
+	defer func() { _ = c.Shutdown() }()
+
+	runtime.GC()
+	time.Sleep(100 * time.Millisecond)
+	base := runtime.NumGoroutine()
+
+	// Simulate 20 raft rebuilds re-registering discovery.
+	const rebuilds = 20
+	for i := 0; i < rebuilds; i++ {
+		c.discovery.run(ctx, c.raft())
+	}
+
+	// Give superseded goroutines time to observe their cancelled contexts.
+	time.Sleep(300 * time.Millisecond)
+	got := runtime.NumGoroutine()
+
+	// Only the latest observer + pruning ticker may remain; pre-fix this
+	// leaks one pruning goroutine per rebuild.
+	if diff := got - base; diff >= rebuilds/2 {
+		t.Fatalf("discovery.run leaked %d goroutines across %d rebuilds", diff, rebuilds)
 	}
 }
 

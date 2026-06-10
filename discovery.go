@@ -214,9 +214,6 @@ func (s *DiscoveryInjector) getAddServerFunc(voter bool) (addServerFunc, error) 
 }
 
 func (s *DiscoveryInjector) run(ctx context.Context, rft *raft.Raft) {
-	if s.cache.cfg.pruneAfter != 0 {
-		s.registerPruning(ctx, s.cache.cfg.pruneAfter)
-	}
 	s.regObservation(ctx, rft)
 }
 
@@ -224,6 +221,16 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 	s.cancelPrevious()
 	ctx, cancel := context.WithCancel(ctx)
 	s.setCancel(cancel)
+
+	// Pruning shares the per-raft cancel with the observer goroutine: run is
+	// invoked on every raft (re)creation (newCache, reinitRaftAdoptingInstance,
+	// recoverQuorum), and a ticker started on the cache-lifetime context would
+	// leak one goroutine per rebuild — duplicated sweeps and duplicated
+	// RemoveServer calls on flapping clusters (RT-13042 M9). cancelPrevious
+	// above stops the predecessor's ticker along with its observer.
+	if s.cache.cfg.pruneAfter != 0 {
+		s.registerPruning(ctx, s.cache.cfg.pruneAfter)
+	}
 
 	// Non-blocking observer: raft's `observe` holds observersLock.RLock
 	// while delivering, and a blocking send into a full channel would pin
