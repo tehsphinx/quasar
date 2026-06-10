@@ -70,12 +70,14 @@ func (s *Cache) runPersistedConsumer(ctx context.Context) {
 	for {
 		rft, ctxRaft := s.getRaftWithCtx()
 		if rft == nil {
+			// Cache is still wiring up; wait briefly before retrying so this
+			// loop doesn't busy-spin the CPU (m7), mirroring
+			// runQuorumRecoveryWatch.
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-time.After(100 * time.Millisecond):
 			}
-			// Cache is still wiring up; retry on the next ctxRaft cycle.
 			continue
 		}
 		s.watchLeadershipOnRaft(ctx, ctxRaft, rft)
