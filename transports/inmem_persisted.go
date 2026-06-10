@@ -39,6 +39,13 @@ type InmemQueueHub struct {
 	activeConsumer *InmemTransport
 	inflightCh     chan PersistedItem
 	inflightItem   *inmemPersistedItem
+
+	// releaseCh is closed by releaseLocked whenever the current claim
+	// ends, signalling the per-claim watchdog goroutine to exit. Without
+	// it a watchdog that started for a claim ended via stopConsumer would
+	// stay blocked on its ctx until that ctx happened to be cancelled,
+	// leaking one goroutine per leadership flip (RT-13042 m21).
+	releaseCh chan struct{}
 }
 
 // NewInmemQueueHub constructs an empty hub. Attach it to every Inmem
@@ -126,14 +133,21 @@ func (h *InmemQueueHub) startConsumer(ctx context.Context, t *InmemTransport) (<
 
 	h.activeConsumer = t
 	h.inflightCh = make(chan PersistedItem, 1)
+	h.releaseCh = make(chan struct{})
 
-	go func(ch chan PersistedItem) {
-		<-ctx.Done()
-		// Best-effort: if the consumer's ctx is cancelled before
-		// stopConsumer fires, drop the claim so the next leader can
-		// take over without waiting.
-		h.releaseConsumerIfOwner(t, ch)
-	}(h.inflightCh)
+	go func(ch chan PersistedItem, released <-chan struct{}) {
+		select {
+		case <-ctx.Done():
+			// Best-effort: if the consumer's ctx is cancelled before
+			// stopConsumer fires, drop the claim so the next leader can
+			// take over without waiting.
+			h.releaseConsumerIfOwner(t, ch)
+		case <-released:
+			// The claim ended through stopConsumer (or a ctx-cancel for a
+			// different claim that re-claimed in between); nothing to do
+			// but exit so this goroutine does not outlive its claim.
+		}
+	}(h.inflightCh, h.releaseCh)
 
 	h.deliverLocked()
 	return h.inflightCh, nil
@@ -173,6 +187,12 @@ func (h *InmemQueueHub) releaseLocked(t *InmemTransport) error {
 		close(h.inflightCh)
 		h.inflightCh = nil
 	}
+	if h.releaseCh != nil {
+		// Wake the per-claim watchdog so it exits with the claim instead
+		// of leaking until its ctx is cancelled (RT-13042 m21).
+		close(h.releaseCh)
+		h.releaseCh = nil
+	}
 	h.activeConsumer = nil
 	return nil
 }
@@ -190,12 +210,19 @@ func (h *InmemQueueHub) deliverLocked() {
 	// Non-blocking send: inflightCh is buffered with cap 1, so this
 	// always succeeds when inflightItem was nil (deliver is only
 	// reached when the previous item was settled).
+	//
+	// The default branch cannot be reached by a concurrent close: a
+	// select's default does NOT make a send on a closed channel safe —
+	// that would panic. It is safe only because inflightCh is closed and
+	// nil'd together under h.m (releaseLocked), and deliverLocked also
+	// runs under h.m; so whenever we get here inflightCh is non-nil, open,
+	// and (since inflightItem was just nil) empty. The default is kept as
+	// a defensive no-op for the otherwise-impossible empty-buffer miss.
 	select {
 	case h.inflightCh <- item:
 	default:
-		// inflightCh was closed (consumer stopped between the
-		// activeConsumer check and the send). Put the item back at
-		// the head for the next claimant.
+		// Item could not be handed off; put it back at the head for the
+		// next claimant.
 		h.queue = append([]*inmemPersistedItem{item}, h.queue...)
 		h.inflightItem = nil
 	}
