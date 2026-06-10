@@ -74,17 +74,15 @@ var (
 // by the cache.
 // An example implementation can be seen in ./examples/generic/exampleFSM/example.go.
 func NewCache(ctx context.Context, fsm FSM, opts ...Option) (*Cache, error) {
-	cache, err := newCache(ctx, wrapFSM(fsm), opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	fsm.Inject(&FSMInjector{cache: cache})
-
-	return cache, err
+	return newCache(ctx, wrapFSM(fsm), fsm.Inject, opts...)
 }
 
-func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, error) {
+// newCache builds and starts the cache. inject is the user FSM's Inject method;
+// it is invoked before any raft instance or consume/persisted goroutine starts,
+// so the FSM always has its FSMInjector before the first Apply can reach it
+// (m11 — previously Inject ran only after newCache had already wired up raft
+// and the consumer goroutines, racing an early Store/apply).
+func newCache(ctx context.Context, fsm *fsmWrapper, inject func(*FSMInjector), opts ...Option) (*Cache, error) {
 	ctx, closeCache := context.WithCancel(ctx)
 	cfg := getOptions(opts)
 
@@ -101,6 +99,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 		newRaftFn: newRaft,
 	}
 	fsm.hasLeader = c.hasLeader
+	inject(&FSMInjector{cache: c})
 
 	transport, err := getTransport(ctx, cfg)
 	if err != nil {
