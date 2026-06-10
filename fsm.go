@@ -201,6 +201,14 @@ func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
 
 	for s.getLastApplied() < uid {
 		if err := s.cond.WaitContext(ctx); err != nil {
+			// The wait channel may have been closed by a Broadcast at the same
+			// instant the context expired; select then picks ctx.Done() at
+			// random even though the condition was actually met. Re-check once
+			// (the lock is held again here) so a wait that succeeded exactly at
+			// the deadline is not reported as a timeout (m25).
+			if s.getLastApplied() >= uid {
+				return nil
+			}
 			if s.hasLeader != nil && !s.hasLeader() {
 				return errors.Join(err, ErrWaitFor, ErrNoLeader)
 			}
