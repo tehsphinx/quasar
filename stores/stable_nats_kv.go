@@ -2,6 +2,7 @@ package stores
 
 import (
 	"encoding/binary"
+	"errors"
 
 	"github.com/nats-io/nats.go"
 )
@@ -27,6 +28,10 @@ func (s *StableNatsKV) Set(key, val []byte) error {
 // Get returns the value for key, or an empty byte slice if key was not found.
 func (s *StableNatsKV) Get(key []byte) ([]byte, error) {
 	entry, err := s.kv.Get(string(key))
+	if errors.Is(err, nats.ErrKeyNotFound) {
+		// raft.StableStore expects a miss as a zero value with nil error (RT-13042 C4).
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -47,6 +52,10 @@ func (s *StableNatsKV) SetUint64(key []byte, val uint64) error {
 // GetUint64 returns the uint64 value for key, or 0 if key was not found.
 func (s *StableNatsKV) GetUint64(key []byte) (uint64, error) {
 	entry, err := s.kv.Get(string(key))
+	if errors.Is(err, nats.ErrKeyNotFound) {
+		// raft.StableStore expects a miss as a zero value with nil error (RT-13042 C4).
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}

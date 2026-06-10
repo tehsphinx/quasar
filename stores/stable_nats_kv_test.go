@@ -42,6 +42,26 @@ func TestStableNatsKV(t *testing.T) {
 
 	stable := NewStableNatsKV(kv)
 
+	// raft.StableStore contract: a missing key is a zero value with nil error,
+	// not an error. raft.NewRaft fails on a fresh bucket otherwise (RT-13042 C4).
+	t.Run("missing key", func(t *testing.T) {
+		got, r := stable.Get([]byte("missing"))
+		if r != nil {
+			t.Errorf("Get on missing key returned error: %v", r)
+		}
+		if len(got) != 0 {
+			t.Errorf("Get on missing key returned %q, expected empty", got)
+		}
+
+		gotUint, r := stable.GetUint64([]byte("missing"))
+		if r != nil {
+			t.Errorf("GetUint64 on missing key returned error: %v", r)
+		}
+		if gotUint != 0 {
+			t.Errorf("GetUint64 on missing key returned %d, expected 0", gotUint)
+		}
+	})
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if r := stable.Set([]byte(tt.key), []byte(tt.val)); r != nil {
