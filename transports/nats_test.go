@@ -5,12 +5,15 @@ package transports
 import (
 	"context"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
+	"github.com/tehsphinx/quasar/pb/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // NATS connection settings - adjust these for your test environment
@@ -363,6 +366,56 @@ func TestNATSTransport_TimeoutNow(t *testing.T) {
 	// Verify the response
 	if !reflect.DeepEqual(resp, out) {
 		t.Fatalf("command mismatch: %#v %#v", resp, out)
+	}
+}
+
+// TestNATSTransport_RaftRPCErrorEnvelope is the RT-13042 M6 regression test.
+// Handlers reply with CommandResponse{Error: …} when they cannot produce a
+// payload (decode failure, multipart error, consume timeout). The raft RPC
+// senders used to ignore that envelope: the nil response oneof converted into
+// a zero-valued raft response, so AppendEntries reported {Term: 0, Success:
+// false} (an endless nextIndex-decrement retry loop) and RequestVote
+// fabricated "not granted at term 0". A payload-level failure must surface
+// as an explicit error instead.
+func TestNATSTransport_RaftRPCErrorEnvelope(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	trans, err := makeNATSTransport(ctx, t, "test-cache", "env-sender")
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	defer trans.conn.Close()
+
+	// A raw peer that answers every RPC with an error envelope, as the real
+	// handlers do on payload-level failures.
+	const peer = "env-peer"
+	errResp, err := proto.Marshal(&pb.CommandResponse{Error: "decode exploded"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	sub, err := trans.conn.Subscribe("quasar.test-cache."+peer+".>", func(msg *nats.Msg) {
+		_ = msg.Respond(errResp)
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	voteArgs := raft.RequestVoteRequest{Term: 20, RPCHeader: raft.RPCHeader{Addr: []byte("butters")}}
+	var voteResp raft.RequestVoteResponse
+	if err := trans.RequestVote("id1", peer, &voteArgs, &voteResp); err == nil {
+		t.Fatalf("RequestVote returned a fabricated response %+v instead of the envelope error", voteResp)
+	} else if !strings.Contains(err.Error(), "decode exploded") {
+		t.Fatalf("RequestVote error = %v, want the envelope error", err)
+	}
+
+	appendArgs := makeAppendRPC()
+	var appendResp raft.AppendEntriesResponse
+	if err := trans.AppendEntries("id1", peer, &appendArgs, &appendResp); err == nil {
+		t.Fatalf("AppendEntries returned a fabricated response %+v instead of the envelope error", appendResp)
+	} else if !strings.Contains(err.Error(), "decode exploded") {
+		t.Fatalf("AppendEntries error = %v, want the envelope error", err)
 	}
 }
 

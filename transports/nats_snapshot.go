@@ -52,7 +52,11 @@ func (s *NATSTransport) InstallSnapshot(_ raft.ServerID, address raft.ServerAddr
 		if r := proto.Unmarshal(respBts, &protoResp); r != nil {
 			return r
 		}
-		*resp = *protoResp.GetInstallSnapshot().Convert()
+		payload, err := checkRaftResponse(&protoResp, (*pb.CommandResponse).GetInstallSnapshot)
+		if err != nil {
+			return err
+		}
+		*resp = *payload.Convert()
 	}
 	return nil
 }

@@ -435,8 +435,14 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 		err := s.requestSmall(hbCtx, hbSubj, pb.ToAppendEntriesRequest(request), &protoResp)
 		hbCancel()
 		if err == nil {
-			*resp = *protoResp.GetAppendEntries().Convert()
-			return nil
+			payload, rErr := checkRaftResponse(&protoResp, (*pb.CommandResponse).GetAppendEntries)
+			if rErr == nil {
+				*resp = *payload.Convert()
+				return nil
+			}
+			// Payload-level failure on the heartbeat subject: fall back to
+			// entries.append like any other heartbeat failure.
+			err = rErr
 		}
 		if !errors.Is(err, nats.ErrNoResponders) {
 			// Subscribed but unanswered: don't surface this at error level
@@ -454,7 +460,11 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 		s.logger.Error("failed to send append entries request", "error", err, "size", size, "entries", len(request.Entries))
 		return err
 	}
-	*resp = *protoResp.GetAppendEntries().Convert()
+	payload, err := checkRaftResponse(&protoResp, (*pb.CommandResponse).GetAppendEntries)
+	if err != nil {
+		return err
+	}
+	*resp = *payload.Convert()
 	return nil
 }
 
@@ -599,7 +609,11 @@ func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress,
 		return err
 	}
 
-	*resp = *protoResp.GetRequestVote().Convert()
+	payload, err := checkRaftResponse(&protoResp, (*pb.CommandResponse).GetRequestVote)
+	if err != nil {
+		return err
+	}
+	*resp = *payload.Convert()
 	return nil
 }
 
@@ -619,7 +633,11 @@ func (s *NATSTransport) RequestPreVote(_ raft.ServerID, address raft.ServerAddre
 		return err
 	}
 
-	*resp = *protoResp.GetRequestPreVote().Convert()
+	payload, err := checkRaftResponse(&protoResp, (*pb.CommandResponse).GetRequestPreVote)
+	if err != nil {
+		return err
+	}
+	*resp = *payload.Convert()
 	return nil
 }
 
@@ -723,7 +741,11 @@ func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, 
 		return err
 	}
 
-	*resp = *protoResp.GetTimeoutNow().Convert()
+	payload, err := checkRaftResponse(&protoResp, (*pb.CommandResponse).GetTimeoutNow)
+	if err != nil {
+		return err
+	}
+	*resp = *payload.Convert()
 	return nil
 }
 
@@ -837,6 +859,25 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 	err = proto.Unmarshal(response.Data, protoResp)
 	// fmt.Println("response data:", fmt.Sprintf("%+v", protoResp))
 	return len(bts), err
+}
+
+// checkRaftResponse validates the CommandResponse envelope of a raft RPC and
+// returns its concrete payload. Handlers reply with CommandResponse{Error: …}
+// on decode / multipart / consume failures; the raft RPC callers used to
+// ignore that envelope and convert the nil oneof into a zero-valued response
+// (e.g. AppendEntriesResponse{Term: 0, Success: false}) — surfacing a
+// payload-level failure as an endless nextIndex-decrement retry loop, or as
+// a fabricated "vote not granted at term 0", instead of an explicit
+// transport error (RT-13042 M6).
+func checkRaftResponse[T any](protoResp *pb.CommandResponse, get func(*pb.CommandResponse) *T) (*T, error) {
+	if errStr := protoResp.GetError(); errStr != "" {
+		return nil, errors.New(errStr)
+	}
+	payload := get(protoResp)
+	if payload == nil {
+		return nil, errors.New("raft rpc response missing expected payload")
+	}
+	return payload, nil
 }
 
 // requestSmall sends msg on subj as a single NATS message. Use this for RPCs
