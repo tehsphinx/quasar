@@ -840,9 +840,11 @@ func decodeResponse(conn *netConn, resp interface{}) (bool, error) {
 		return false, err
 	}
 
-	// Format an error if any
+	// Format an error if any. Use errors.New so a remote message containing '%'
+	// is preserved verbatim -- reattachNoLeader does substring matching on the
+	// reconstructed error, which a format-string interpretation would garble.
 	if rpcError != "" {
-		return true, fmt.Errorf(rpcError)
+		return true, errors.New(rpcError)
 	}
 	return true, nil
 }

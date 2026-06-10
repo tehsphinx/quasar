@@ -3,6 +3,7 @@
 package transports
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/raft"
 )
 
@@ -100,3 +102,44 @@ func TestHandleConnQuietOnCleanClose(t *testing.T) {
 		t.Fatalf("clean close should not log a decode error, got: %q", out)
 	}
 }
+
+// TestDecodeResponsePreservesPercentInError reproduces RT-13042 m16: a remote
+// error string containing '%' must be reconstructed verbatim. Using
+// fmt.Errorf(rpcError) would interpret it as a format string and garble it
+// (e.g. appending "%!s(MISSING)"), breaking reattachNoLeader's substring
+// matching. errors.New keeps it intact.
+func TestDecodeResponsePreservesPercentInError(t *testing.T) {
+	const remoteErr = "no leader: 50% of nodes unavailable %s %d"
+
+	// Encode an error string followed by a response, exactly as the wire
+	// protocol decodeResponse expects.
+	var buf bytes.Buffer
+	enc := codec.NewEncoder(&buf, &codec.MsgpackHandle{})
+	if err := enc.Encode(remoteErr); err != nil {
+		t.Fatalf("encoding error string: %v", err)
+	}
+	var resp raft.AppendEntriesResponse
+	if err := enc.Encode(&resp); err != nil {
+		t.Fatalf("encoding response: %v", err)
+	}
+
+	conn := &netConn{
+		conn: &nopConn{},
+		dec:  codec.NewDecoder(bufio.NewReader(&buf), &codec.MsgpackHandle{}),
+	}
+
+	var got raft.AppendEntriesResponse
+	_, err := decodeResponse(conn, &got)
+	if err == nil {
+		t.Fatal("expected an error from decodeResponse")
+	}
+	if err.Error() != remoteErr {
+		t.Fatalf("remote error garbled: got %q, want %q", err.Error(), remoteErr)
+	}
+}
+
+// nopConn is a net.Conn whose Close is a no-op, used so decodeResponse's
+// conn.Release() path does not panic in the tests above.
+type nopConn struct{ net.Conn }
+
+func (nopConn) Close() error { return nil }
