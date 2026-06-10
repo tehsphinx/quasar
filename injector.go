@@ -73,9 +73,19 @@ func (s *FSMInjector) CacheID() string {
 	return s.cache.localID
 }
 
+// getWaitCtx derives the context used for a consistency wait. A caller
+// deadline at or under maxWait is honored as-is; a longer caller budget is
+// capped at maxWait rather than being collapsed to defaultWait (RT-13042 m3 —
+// previously a 60s caller budget silently became a 5s wait and maxWait was
+// never used as an actual bound). When the caller has no deadline, defaultWait
+// applies.
 func getWaitCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < maxWait {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithTimeout(ctx, defaultWait)
+	}
+	if time.Until(deadline) <= maxWait {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, defaultWait)
+	return context.WithTimeout(ctx, maxWait)
 }
