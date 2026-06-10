@@ -170,17 +170,22 @@ func (s *NATSTransport) Store(ctx context.Context, _ raft.ServerID, address raft
 }
 
 func (s *NATSTransport) handleStore(ctx context.Context) func(*nats.Msg) {
-	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
-	var message Message
+	// Reassembly is keyed by the sender-qualified request_id: unlike
+	// AppendEntries (one leader, sequential), ANY node — and multiple
+	// goroutines per node — may forward large Stores to this subject
+	// concurrently, so interleaved parts must not share one buffer
+	// (RT-13042 M3).
+	assembler := newMultipartAssembler()
 
 	return func(msg *nats.Msg) {
-		if complete, err := handleMultiPart(msg, &message); err != nil {
+		data, complete, err := assembler.handle(msg)
+		if err != nil {
 			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
 			return
-		} else if !complete {
+		}
+		if !complete {
 			return
 		}
-		data := message.GetDataAndReset()
 
 		var protoMsg pb.Store
 		if r := proto.Unmarshal(data, &protoMsg); r != nil {
@@ -454,17 +459,17 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 }
 
 func (s *NATSTransport) handleEntries(ctx context.Context) func(*nats.Msg) {
-	// currently we rely on the fact that there can be only one leader, and it will send entries sequentially in order.
-	var message Message
+	assembler := newMultipartAssembler()
 
 	return func(msg *nats.Msg) {
-		if complete, err := handleMultiPart(msg, &message); err != nil {
+		data, complete, err := assembler.handle(msg)
+		if err != nil {
 			s.handleError(msg, fmt.Errorf("failed to handle multi-part message: %w", err))
 			return
-		} else if !complete {
+		}
+		if !complete {
 			return
 		}
-		data := message.GetDataAndReset()
 
 		var protoMsg pb.AppendEntriesRequest
 		if r := proto.Unmarshal(data, &protoMsg); r != nil {
