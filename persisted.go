@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/pb/v1"
 	"github.com/tehsphinx/quasar/transports"
 )
+
+// persistedConsumerRestartDelay throttles restarting a persisted consumer
+// whose item channel closed while this node is still leader (RT-13042 M4).
+const persistedConsumerRestartDelay = 500 * time.Millisecond
 
 // routePersisted is the write path used when the configured transport
 // supports persisted-FIFO. Every Store call from any node (leader or
@@ -144,8 +149,8 @@ func (s *Cache) startPersistedConsumerOnce(ctx context.Context) {
 
 // runPersistedApplyLoop applies items received from the persisted-FIFO
 // consumer. Exits when the channel is closed (StopPersistedConsumer
-// fired) or when ctx is done. Each item is settled exactly once via
-// ReplySuccess, ReplyError, or Nack.
+// fired, or the consumer died on its own) or when ctx is done. Each item
+// is settled exactly once via ReplySuccess, ReplyError, or Nack.
 func (s *Cache) runPersistedApplyLoop(ctx context.Context, ch <-chan transports.PersistedItem) {
 	for {
 		select {
@@ -153,11 +158,35 @@ func (s *Cache) runPersistedApplyLoop(ctx context.Context, ch <-chan transports.
 			return
 		case item, ok := <-ch:
 			if !ok {
+				s.restartPersistedConsumerIfLeader(ctx)
 				return
 			}
 			s.applyPersistedItem(ctx, item)
 		}
 	}
+}
+
+// restartPersistedConsumerIfLeader restarts the persisted consumer after its
+// item channel closed underneath a node that is still leader. A closed
+// channel normally means StopPersistedConsumer ran on leadership loss — but
+// the consumer can also die spontaneously (JetStream consumer deleted
+// server-side, unrecoverable JS error). In that case this node stays leader,
+// so no leadership observation will ever restart the consumer, and every
+// persisted write cluster-wide stalls until a leadership flip (RT-13042 M4).
+// The brief delay keeps a consumer that dies instantly on start from
+// hot-looping.
+func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(persistedConsumerRestartDelay):
+	}
+
+	if !s.IsLeader() {
+		return
+	}
+	s.logger.Warn("persisted consumer stopped while still leader; restarting it")
+	s.startPersistedConsumerOnce(ctx)
 }
 
 // applyPersistedItem runs the standard leader-local apply path for

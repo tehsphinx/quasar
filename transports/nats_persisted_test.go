@@ -181,6 +181,61 @@ func TestNATSPersistedQueue_StreamManaged(t *testing.T) {
 	asrt.NoErr(voter.StopPersistedConsumer())
 }
 
+// TestNATSPersistedQueue_RestartAfterConsumerDeleted is the RT-13042 M4
+// regression test. When the JetStream consumer dies server-side (deleted, or
+// an unrecoverable JS error), the puller goroutine exits and closes the items
+// channel — but the queue used to keep its q.consumer reference, so every
+// subsequent StartPersistedConsumer returned the dead consumer's CLOSED
+// channel: the death was permanent until a leadership flip plus an explicit
+// StopPersistedConsumer, stalling all persisted writes cluster-wide. With the
+// fix the dead consumer clears itself, so a restart creates a fresh consumer
+// that delivers again.
+func TestNATSPersistedQueue_RestartAfterConsumerDeleted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	asrt := is.New(t)
+	streamName := fmt.Sprintf("quasar_test_queue_%d", time.Now().UnixNano())
+	producer := makeNATSPersistedTransport(ctx, t, "test-cache", "producer", streamName)
+	leader := makeNATSPersistedTransport(ctx, t, "test-cache", "leader", streamName)
+
+	ch, err := leader.StartPersistedConsumer(ctx)
+	asrt.NoErr(err)
+
+	// Kill the consumer server-side, as an operator or stream rebuild would.
+	js, err := jetstream.New(leader.conn)
+	asrt.NoErr(err)
+	asrt.NoErr(js.DeleteConsumer(ctx, streamName, persistedConsumerNamePrefix))
+
+	// The puller loop notices — at the latest via missed idle heartbeats —
+	// and closes the items channel.
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("unexpected item delivered after consumer deletion")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("items channel did not close after the JetStream consumer was deleted")
+	}
+
+	// Restarting must yield a LIVE consumer — not the dead one's closed
+	// channel — and deliver a fresh publish end to end.
+	ch2, err := leader.StartPersistedConsumer(ctx)
+	asrt.NoErr(err)
+
+	go func() {
+		for item := range ch2 {
+			_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 11})
+		}
+	}()
+
+	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")})
+	asrt.NoErr(err)
+	asrt.Equal(resp.Uid, uint64(11))
+
+	asrt.NoErr(leader.StopPersistedConsumer())
+}
+
 // TestNATSPersistedQueue_NotConfigured confirms transports built
 // without WithNATSPersistedQueue report SupportsPersisted() == false
 // and return ErrPersistedNotSupported from the persisted methods.

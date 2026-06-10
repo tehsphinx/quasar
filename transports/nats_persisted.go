@@ -26,6 +26,14 @@ const (
 
 	persistedConsumerNamePrefix = "quasar-cache-consumer"
 
+	// persistedPullHeartbeat is the idle-heartbeat interval requested on
+	// the persisted consumer's pull subscription. Without it, a consumer
+	// that dies server-side (deleted, stream rebuilt) is only noticed when
+	// the long-lived pull request expires; with it the client errors out
+	// of Next after ~2 missed heartbeats, so the death is detected within
+	// seconds and the consumer can be restarted (RT-13042 M4).
+	persistedPullHeartbeat = 5 * time.Second
+
 	// persistedReplyHeader carries the publisher's reply-inbox subject
 	// across the JetStream hop. We can't use the wire-level Reply field
 	// because JetStream rewrites it to the ack-inbox subject when the
@@ -232,7 +240,7 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan Persiste
 	}
 
 	pullCtx, cancel := context.WithCancel(context.Background())
-	mctx, err := jsConsumer.Messages()
+	mctx, err := jsConsumer.Messages(jetstream.PullHeartbeat(persistedPullHeartbeat))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("start persisted messages context: %w", err)
@@ -265,6 +273,22 @@ func (q *natsPersistedQueue) stopConsumer() error {
 	return nil
 }
 
+// clearConsumer drops the active-consumer reference if it still points at c.
+// Called from the puller goroutine's exit path: when the consumer dies
+// spontaneously (e.g. the JetStream consumer was deleted server-side or hit
+// an unrecoverable JS error) the queue must not keep handing the dead
+// consumer's closed items channel out of startConsumer — that would make
+// the death permanent until a leadership flip AND an explicit
+// StopPersistedConsumer (RT-13042 M4). On the regular stop path
+// stopConsumer has already cleared the reference, so this is a no-op.
+func (q *natsPersistedQueue) clearConsumer(c *natsPersistedConsumer) {
+	q.consumerM.Lock()
+	if q.consumer == c {
+		q.consumer = nil
+	}
+	q.consumerM.Unlock()
+}
+
 // natsPersistedConsumer wraps the JS Messages pull context and the
 // outgoing PersistedItem channel.
 type natsPersistedConsumer struct {
@@ -284,6 +308,7 @@ type natsPersistedConsumer struct {
 func (c *natsPersistedConsumer) run(ctx context.Context) {
 	defer close(c.items)
 	defer c.mctx.Stop()
+	defer c.queue.clearConsumer(c)
 	for {
 		msg, err := c.mctx.Next()
 		if err != nil {
