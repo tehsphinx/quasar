@@ -272,7 +272,7 @@ type Cache struct {
 func (s *Cache) newStores() {
 	s.logStore = wrapStore(raft.NewInmemStore(), s.fsm)
 	s.stableStore = stores.NewStableInMemory()
-	s.snapshotStore = raft.NewInmemSnapshotStore()
+	s.snapshotStore = wrapSnapshotStore(raft.NewInmemSnapshotStore(), s.fsm)
 }
 
 func (s *Cache) serverInfo() raft.Server {

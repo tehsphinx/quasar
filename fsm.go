@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -47,10 +48,18 @@ type fsmWrapper struct {
 	fsm FSM
 
 	lastApplied uint64
-	sysUIDsM    sync.Mutex
-	sysUIDs     []uint64
-	condM       *sync.Mutex
-	cond        *cond.Cond
+	// restoreIndex is the meta index of the snapshot raft most recently
+	// opened from the wrapped snapshot store (see wrapSnapshotStore). raft's
+	// runFSM opens a snapshot and immediately calls Restore on the same
+	// goroutine, so the value read inside Restore is the index the restore
+	// lands at — for both the follower InstallSnapshot path and the
+	// burned-index user-restore path (RT-13042 M7). Accessed atomically;
+	// consumed (reset to 0) by takeRestoreIndex.
+	restoreIndex uint64
+	sysUIDsM     sync.Mutex
+	sysUIDs      []uint64
+	condM        *sync.Mutex
+	cond         *cond.Cond
 
 	// hasLeader reports whether the cache currently sees a raft leader.
 	// Wired up by newCache after the Cache is constructed; used by WaitFor
@@ -115,16 +124,29 @@ func (s *fsmWrapper) Snapshot() (raft.FSMSnapshot, error) {
 func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
 	s.setLastApplied(0)
 
+	// io.ReadFull: a plain Read may legally return fewer than 8 bytes with a
+	// nil error, and an error returned from Restore on the user-restore path
+	// makes raft v1.7.x panic the whole process (RT-13042 M7).
 	bts := make([]byte, uint64Bytes)
-	n, err := snapshot.Read(bts)
-	if err != nil {
-		return err
+	if _, err := io.ReadFull(snapshot, bts); err != nil {
+		return fmt.Errorf("failed to parse lastApplied: %w", err)
 	}
-	if n != len(bts) {
-		return errors.New("failed to parse lastApplied: not enough bytes found")
+
+	// The embedded value is the writer's lastApplied at Snapshot() time. It
+	// travels with the data but does NOT identify the raft index this restore
+	// lands at: a user restore (raft.Restore) re-snapshots the data at a
+	// burned index max(lastIndex, snapshotIndex)+1, and a follower
+	// InstallSnapshot applies the leader's snapshot at the leader's meta
+	// index. The old `embedded + 1` heuristic matched only the
+	// nothing-written-since user-restore case and left followers one index
+	// AHEAD after InstallSnapshot — WaitFor returned before the entry was
+	// applied, briefly serving stale reads (RT-13042 M7). Use the meta index
+	// of the snapshot raft just opened; the embedded value remains the
+	// fallback for direct Restore calls that bypass the snapshot store.
+	uid := uint64FromBytes(bts)
+	if metaIndex := s.takeRestoreIndex(); metaIndex != 0 {
+		uid = metaIndex
 	}
-	// uuid from snapshot + 1 for restore operation
-	uid := uint64FromBytes(bts) + 1
 
 	if r := s.fsm.Restore(snapshot); r != nil {
 		return r
@@ -132,6 +154,18 @@ func (s *fsmWrapper) Restore(snapshot io.ReadCloser) error {
 
 	s.uidApplied(uid)
 	return nil
+}
+
+// noteRestoreIndex records the meta index of the snapshot raft just opened
+// from the wrapped snapshot store. See the restoreIndex field doc.
+func (s *fsmWrapper) noteRestoreIndex(index uint64) {
+	atomic.StoreUint64(&s.restoreIndex, index)
+}
+
+// takeRestoreIndex consumes the recorded snapshot meta index, returning 0
+// when no snapshot was opened since the last consumption.
+func (s *fsmWrapper) takeRestoreIndex() uint64 {
+	return atomic.SwapUint64(&s.restoreIndex, 0)
 }
 
 func (s *fsmWrapper) applyRaftReset() {
