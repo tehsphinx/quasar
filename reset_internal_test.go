@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/transports"
 )
@@ -97,6 +99,54 @@ func TestLocalHardResetSerializesWithRecovery(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("localHardReset did not complete after recovery released recoveryMutex")
+	}
+}
+
+// TestReinitRaftRebuildFailureRetriesAndLogs is the RT-13042 m5 regression
+// test. After reinitRaftAdoptingInstance wipes the FSM and shuts the old raft
+// down, a failing rebuild used to return immediately, leaving the node inert
+// with no retry and no prominent log. rebuildRaft must retry a bounded number
+// of times and log loudly before giving up.
+func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := &syncBuffer{}
+	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Error})
+
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, &stubFSM{},
+		WithLocalID("follower"),
+		WithTransport(tr),
+		WithSuffrage(raft.Nonvoter),
+		WithHclogLogger(logger),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+
+	if c.IsLeader() {
+		t.Fatal("lone nonvoter unexpectedly reports IsLeader() == true")
+	}
+
+	var calls atomic.Int32
+	wantErr := errors.New("rebuild boom")
+	c.newRaftFn = func(options, raft.FSM, raft.LogStore, raft.StableStore,
+		raft.SnapshotStore, transports.Transport,
+	) (*raft.Raft, error) {
+		calls.Add(1)
+		return nil, wantErr
+	}
+
+	if err := c.localHardReset("reset-1"); !errors.Is(err, wantErr) {
+		t.Fatalf("expected the rebuild error to propagate, got %v", err)
+	}
+	if got := calls.Load(); got != rebuildRaftAttempts {
+		t.Fatalf("expected %d rebuild attempts, got %d", rebuildRaftAttempts, got)
+	}
+	if !strings.Contains(out.String(), "node is inert") {
+		t.Fatalf("expected a loud rebuild-failure log, got:\n%s", out.String())
 	}
 }
 

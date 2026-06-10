@@ -82,15 +82,16 @@ func newCache(ctx context.Context, fsm *fsmWrapper, opts ...Option) (*Cache, err
 	cfg := getOptions(opts)
 
 	c := &Cache{
-		cfg:      cfg,
-		ctx:      ctx,
-		name:     cfg.cacheName,
-		localID:  cfg.localID,
-		fsm:      fsm,
-		pStore:   cfg.pStore,
-		suffrage: cfg.suffrage,
-		close:    closeCache,
-		logger:   cfg.getLogger(),
+		cfg:       cfg,
+		ctx:       ctx,
+		name:      cfg.cacheName,
+		localID:   cfg.localID,
+		fsm:       fsm,
+		pStore:    cfg.pStore,
+		suffrage:  cfg.suffrage,
+		close:     closeCache,
+		logger:    cfg.getLogger(),
+		newRaftFn: newRaft,
 	}
 	fsm.hasLeader = c.hasLeader
 
@@ -255,6 +256,12 @@ type Cache struct {
 	logStore      raft.LogStore
 	stableStore   raft.StableStore
 	snapshotStore raft.SnapshotStore
+
+	// newRaftFn constructs the raft instance. It is the package newRaft
+	// function in production; tests override it to exercise rebuild-failure
+	// paths (m5).
+	newRaftFn func(cfg options, fsm raft.FSM, logStore raft.LogStore, stableStore raft.StableStore,
+		snapshotStore raft.SnapshotStore, transport transports.Transport) (*raft.Raft, error)
 
 	recoveryMutex sync.Mutex
 
@@ -843,13 +850,46 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string) error {
 		s.setInstanceID(adoptInstanceID)
 	}
 
-	rft, err := newRaft(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport)
+	rft, err := s.rebuildRaft()
 	if err != nil {
 		return err
 	}
 	s.setRaft(rft)
 	s.discovery.run(s.ctx, rft)
 	return nil
+}
+
+const (
+	rebuildRaftAttempts = 3
+	rebuildRaftBackoff  = 200 * time.Millisecond
+)
+
+// rebuildRaft constructs the post-reset raft instance, retrying a bounded
+// number of times. By the time it runs, reinitRaftAdoptingInstance has already
+// wiped the FSM and shut the old raft down, so a failure here leaves the node
+// inert — every raft call returns ErrRaftShutdown and nothing retries (m5).
+// The bounded retry rides out a transient store/transport failure; if every
+// attempt fails the node is logged about as loudly as a library can manage
+// before the error propagates to the caller.
+func (s *Cache) rebuildRaft() (*raft.Raft, error) {
+	var err error
+	for attempt := 1; attempt <= rebuildRaftAttempts; attempt++ {
+		var rft *raft.Raft
+		rft, err = s.newRaftFn(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport)
+		if err == nil {
+			return rft, nil
+		}
+		s.logger.Error("raft rebuild after reset failed; node is inert until it succeeds",
+			"local-id", s.localID,
+			"attempt", attempt,
+			"max-attempts", rebuildRaftAttempts,
+			"error", err,
+		)
+		if attempt < rebuildRaftAttempts {
+			time.Sleep(rebuildRaftBackoff)
+		}
+	}
+	return nil, err
 }
 
 // runQuorumRecoveryWatch is the long-running goroutine that decides when to
