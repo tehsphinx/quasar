@@ -1,12 +1,14 @@
 package stores
 
-import "sync"
+import (
+	"encoding/binary"
+	"sync"
+)
 
 // NewStableInMemory creates a new in-memory stable store for the cache.
 func NewStableInMemory() *StableInMemory {
 	return &StableInMemory{
-		store:       map[string][]byte{},
-		storeUint64: map[string]uint64{},
+		store: map[string][]byte{},
 	}
 }
 
@@ -14,9 +16,8 @@ func NewStableInMemory() *StableInMemory {
 // It is safe for concurrent use: during quorum recovery the old and new raft
 // instance briefly share the same store instance (RT-13042 C2).
 type StableInMemory struct {
-	mu          sync.RWMutex
-	store       map[string][]byte
-	storeUint64 map[string]uint64
+	mu    sync.RWMutex
+	store map[string][]byte
 }
 
 // Set sets a value.
@@ -42,7 +43,9 @@ func (s *StableInMemory) SetUint64(key []byte, val uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.storeUint64[string(key)] = val
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, val)
+	s.store[string(key)] = b
 	return nil
 }
 
@@ -51,6 +54,9 @@ func (s *StableInMemory) GetUint64(key []byte) (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	val := s.storeUint64[string(key)]
-	return val, nil
+	val, ok := s.store[string(key)]
+	if !ok || len(val) < 8 {
+		return 0, nil
+	}
+	return binary.BigEndian.Uint64(val), nil
 }
