@@ -204,10 +204,11 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 	// (run per discovery ping since m17) for the full lease timeout. The
 	// future resolves on its own afterward, so the buffered receiver does not
 	// leak (L8).
-	errc := make(chan error, 1)
-	go func() { errc <- fut.Error() }()
+	chErr := make(chan error, 1)
+	go func() { chErr <- fut.Error() }()
+
 	select {
-	case r := <-errc:
+	case r := <-chErr:
 		if r != nil {
 			return r
 		}
