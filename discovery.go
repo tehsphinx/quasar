@@ -41,6 +41,7 @@ func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 		applied:         map[raft.ServerID]struct{}{},
 		servers:         map[raft.ServerID]raft.Server{},
 		lastSeen:        map[raft.ServerID]time.Time{},
+		instanceIDs:     map[raft.ServerID]string{},
 		peerInClusterCh: make(chan struct{}),
 	}
 }
@@ -80,8 +81,16 @@ type DiscoveryInjector struct {
 	serversM sync.RWMutex
 	servers  map[raft.ServerID]raft.Server
 	lastSeen map[raft.ServerID]time.Time
-	appliedM sync.RWMutex
-	applied  map[raft.ServerID]struct{}
+	// instanceIDs holds each peer's last-pinged raft instance ID (RT-13067).
+	// addServer's admission gate compares it against the local instance ID: a
+	// peer that does not provably follow this node's consensus history is
+	// hard-reset before being added to the configuration. Empty means the peer
+	// never reported one (fresh node, freshly wiped node, or a discovery
+	// implementation that does not propagate status) and is treated as a
+	// mismatch — the wipe is a no-op on a genuinely fresh peer.
+	instanceIDs map[raft.ServerID]string
+	appliedM    sync.RWMutex
+	applied     map[raft.ServerID]struct{}
 
 	cancelM sync.Mutex
 	cancel  context.CancelFunc
@@ -154,7 +163,7 @@ func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status Peer
 
 	s.cache.noteLeaderInstanceID(srv.ID, status.InstanceID)
 
-	isNew := s.setServer(srv)
+	isNew := s.setServerWithInstanceID(srv, status.InstanceID)
 	if !isNew {
 		return
 	}
@@ -192,47 +201,39 @@ func (s *DiscoveryInjector) LocalPeerStatus() PeerStatus {
 	}
 }
 
-// errAddDeferredPendingReset is returned by addServer when admission is held
-// back until this node's startup hard reset has run (WithResetOnStartup,
-// RT-13067). It is not a failure: the peer stays known-but-unapplied and
-// addMissingServers re-adds it once the reset records its id (kicked from the
-// reset path) — at which point wipe-before-add is armed.
-var errAddDeferredPendingReset = errors.New("add deferred until startup reset")
-
 func (s *DiscoveryInjector) addServer(srv raft.Server) error {
-	// A freshly single-voter-bootstrapped leader must not admit a (re)joining
-	// peer until its startup hard reset arms wipe-before-add. The peer may have
-	// survived this node's restart on a higher raft term; adding it first starts
-	// replication immediately and its higher term demotes this fresh leader
-	// within a heartbeat, before the wipe-before-add below can run — trapping the
-	// cluster in an election loop (RT-13067). The hold (set only with
-	// WithResetOnStartup) is released by the startup reset or the grace timer,
-	// which then kicks addMissingServers to admit the deferred peers.
-	if s.cache.deferPeerAdmit.Load() {
-		return errAddDeferredPendingReset
-	}
-
 	addServerFn, err := s.getAddServerFunc(srv.Suffrage == raft.Voter)
 	if err != nil {
 		return err
 	}
 
-	// If a hard reset has happened, wipe a (re)joining peer BEFORE adding it to
-	// the configuration. A peer that was unreachable during the HardReset
-	// fan-out — or that this leader never had in its config because it
-	// bootstrapped fresh after a restart and only rediscovers peers afterwards
-	// — is still ahead (higher term). Adding it first starts replication
-	// immediately; the peer's higher term then demotes this leader within a
-	// heartbeat, the AddVoter/AddNonvoter future resolves with "leadership
-	// lost", and addServer returns before any post-add wipe could run, so the
-	// cluster flaps election-to-election and never recovers (RT-13067). Wiping
-	// first resets the peer to fresh stores, so once it is added replication
-	// catches it up instead of demoting the leader. resetID dedup (markResetID)
-	// means a peer already wiped for this reset no-ops, so this is safe to run
-	// on every (re)join. Gated on IsLeader: only the surviving reset initiator
-	// (which holds leadership) may wipe peers, and a non-leader's
-	// AddVoter/AddNonvoter would fail anyway.
-	if resetID := s.cache.getLastResetID(); resetID != "" && s.cache.IsLeader() {
+	// Admission gate (RT-13067): a (re)joining peer is added directly only when
+	// its last-pinged raft instance ID proves it already follows this node's
+	// consensus history. Any other peer — a different instance ID, or none
+	// reported — may have survived this node's restart on a higher raft term:
+	// adding it first starts replication immediately and its higher term
+	// demotes a freshly bootstrapped leader within a heartbeat, before any
+	// post-add wipe could run, trapping the cluster in an election loop. So the
+	// mismatched peer is hard-reset to fresh stores FIRST (the RPC is confirmed:
+	// the receiver applies the wipe before responding), then added, and catch-up
+	// replication brings it back. The gate is armed from the instant of
+	// bootstrap (the instance ID is minted there), so the pre-startup-reset
+	// window is covered without any admission hold. Empty peer instance IDs are
+	// treated as mismatch: a genuinely fresh peer wipes as a no-op, while a peer
+	// that joined the previous incarnation moments before the restart (never
+	// adopted an ID, still ahead) is defused. resetID dedup (markResetID) makes
+	// re-wipes within one incarnation no-ops. Gated on IsLeader (a non-leader's
+	// AddVoter/AddNonvoter would fail anyway) and on having a local instance ID:
+	// a leader without one (joined, elected before adopting) cannot claim a
+	// history and must not wipe healthy followers.
+	localInst := s.cache.getInstanceID()
+	if s.cache.IsLeader() && localInst != "" && s.peerInstanceID(srv.ID) != localInst {
+		resetID := s.cache.getLastResetID()
+		if resetID == "" {
+			// No reset ran yet this incarnation; key the admission wipe on the
+			// instance ID so retries dedup per incarnation.
+			resetID = localInst
+		}
 		ctx, cancel := context.WithTimeout(s.cache.ctx, addServerHardResetTimeout)
 		r := s.cache.sendHardReset(ctx, srv, resetID)
 		cancel()
@@ -542,10 +543,19 @@ func (s *DiscoveryInjector) removeApplied(srvID raft.ServerID) {
 }
 
 func (s *DiscoveryInjector) setServer(srv raft.Server) bool {
+	return s.setServerWithInstanceID(srv, "")
+}
+
+// setServerWithInstanceID is setServer plus bookkeeping of the peer's
+// last-pinged raft instance ID, which addServer's admission gate consults
+// (RT-13067). Last ping wins: a peer that wipes (instance ID cleared) or
+// adopts a new instance ID is re-evaluated on its next ping.
+func (s *DiscoveryInjector) setServerWithInstanceID(srv raft.Server, instanceID string) bool {
 	s.serversM.Lock()
 	defer s.serversM.Unlock()
 
 	s.lastSeen[srv.ID] = time.Now()
+	s.instanceIDs[srv.ID] = instanceID
 
 	known, ok := s.servers[srv.ID]
 	if ok && known.Address == srv.Address {
@@ -567,6 +577,16 @@ func (s *DiscoveryInjector) deleteServer(id raft.ServerID) {
 
 	delete(s.servers, id)
 	delete(s.lastSeen, id)
+	delete(s.instanceIDs, id)
+}
+
+// peerInstanceID returns the raft instance ID the given peer reported on its
+// last discovery ping, or "" if it never reported one.
+func (s *DiscoveryInjector) peerInstanceID(id raft.ServerID) string {
+	s.serversM.RLock()
+	defer s.serversM.RUnlock()
+
+	return s.instanceIDs[id]
 }
 
 // isAliveSince reports whether the given peer has pinged discovery on or
@@ -591,6 +611,7 @@ func (s *DiscoveryInjector) forgetServer(id raft.ServerID) {
 	s.serversM.Lock()
 	delete(s.servers, id)
 	delete(s.lastSeen, id)
+	delete(s.instanceIDs, id)
 	s.serversM.Unlock()
 
 	s.appliedM.Lock()

@@ -727,20 +727,25 @@ func TestHardResetWipesAheadPeerBeforeAddingOnRejoin(t *testing.T) {
 	}))
 }
 
-// TestStartupResetDefersAheadPeerAdmission_RT13067 reproduces the production
+// TestFreshLeaderWipesAheadPeersOnAdmission_RT13067 reproduces the production
 // ordering that TestHardResetWipesAheadPeerBeforeAddingOnRejoin did not: there
-// the restarting voter is muted, hard-reset, and only THEN unmuted, so the
-// reset records its id before peers rejoin. In production the ahead nonvoters
-// are discoverable while the gate bootstraps, so the leader-observation
-// addMissingServers (and the discovery ping path) re-admit them BEFORE
-// ResetAndPopulate runs — the reset only fires after WaitReady. The first ahead
-// nonvoter admitted demotes the fresh leader within a heartbeat and the cluster
-// flaps election-to-election (RT-13067, observed on rt73qa with quasar v0.8.18).
+// the restarting voter is muted, hard-reset, and only THEN unmuted, so a reset
+// id is recorded before peers rejoin. In production the ahead nonvoters are
+// discoverable while the gate bootstraps, so the leader-observation
+// addMissingServers (and the discovery ping path) re-admit them BEFORE any
+// reset has run. With the old reset-id-armed wipe the first ahead nonvoter was
+// admitted unwiped, demoted the fresh leader within a heartbeat, and the
+// cluster flapped election-to-election (RT-13067, observed on rt73qa with
+// quasar v0.8.18).
 //
-// WithResetOnStartup fixes it: a freshly single-voter-bootstrapped leader holds
-// peer admission until its startup reset records a reset id, then reconciliation
-// admits each peer through wipe-before-add so it rejoins on fresh stores.
-func TestStartupResetDefersAheadPeerAdmission_RT13067(t *testing.T) {
+// The instance-ID admission gate fixes it: the ahead nonvoters ping the
+// previous incarnation's instance ID, which mismatches the fresh leader's, so
+// each is hard-reset to fresh stores before being added — armed from the
+// instant of bootstrap, no startup reset or admission hold required. The
+// cluster must converge on its own: config grows to self + both nonvoters,
+// the leader's term never moves (a demotion would bump it), and the
+// nonvoters' pre-restart data is gone.
+func TestFreshLeaderWipesAheadPeersOnAdmission_RT13067(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping RT-13067 startup-ordering reproduction in -short mode")
 	}
@@ -791,9 +796,7 @@ func TestStartupResetDefersAheadPeerAdmission_RT13067(t *testing.T) {
 	}
 
 	nodes := map[string]*resetNode{}
-	// resetOnStartup is enabled only for the node under test (the restarting
-	// voter), mirroring gatex where every gate sets WithResetOnStartup.
-	startNode := func(id string, suffrage raft.ServerSuffrage, resetOnStartup bool) *resetNode {
+	startNode := func(id string, suffrage raft.ServerSuffrage) *resetNode {
 		fsm := exampleFSM.NewInMemoryFSM()
 		opts := []quasar.Option{
 			quasar.WithLocalID(id),
@@ -803,16 +806,13 @@ func TestStartupResetDefersAheadPeerAdmission_RT13067(t *testing.T) {
 			quasar.WithQuorumRecovery(recoverAfter),
 			quasar.WithSuffrage(suffrage),
 		}
-		if resetOnStartup {
-			opts = append(opts, quasar.WithResetOnStartup())
-		}
 		c, err := quasar.NewCache(ctxMain, fsm, opts...)
 		asrt.NoErr(err)
 		return &resetNode{id: id, cache: c, fsm: fsm}
 	}
 
 	for _, s := range specs {
-		nodes[s.id] = startNode(s.id, s.suffrage, false)
+		nodes[s.id] = startNode(s.id, s.suffrage)
 	}
 	defer func() {
 		for _, n := range nodes {
@@ -900,10 +900,10 @@ func TestStartupResetDefersAheadPeerAdmission_RT13067(t *testing.T) {
 	}))
 	cancelNoLeader()
 
-	// Restart v1 fresh — UNMUTED from the start (unlike the rejoin test) and with
-	// WithResetOnStartup. The ahead nonvoters are discoverable while v1
-	// bootstraps, so the leader-observation addMissingServers and the ping path
-	// try to re-admit them before any reset — the production ordering.
+	// Restart v1 fresh — UNMUTED from the start (unlike the rejoin test). The
+	// ahead nonvoters are discoverable while v1 bootstraps, so the
+	// leader-observation addMissingServers and the ping path re-admit them
+	// right away, before any reset has run — the production ordering.
 	addr, tr := transports.NewInmemTransport("")
 	addrs["v1"] = addr
 	trs["v1"] = tr
@@ -911,7 +911,7 @@ func TestStartupResetDefersAheadPeerAdmission_RT13067(t *testing.T) {
 		tr.Connect(addrs[id], trs[id])
 		trs[id].Connect(addr, tr)
 	}
-	nodes["v1"] = startNode("v1", raft.Voter, true)
+	nodes["v1"] = startNode("v1", raft.Voter)
 
 	bootCtx, cancelBoot := context.WithTimeout(ctxMain, recoverBudget)
 	asrt.NoErr(waitForCondition(bootCtx, func() error {
@@ -924,31 +924,14 @@ func TestStartupResetDefersAheadPeerAdmission_RT13067(t *testing.T) {
 	termBefore := termOf(nodes["v1"])
 	t.Logf("fresh v1 is sole-voter leader at term %s", termBefore)
 
-	// Give discovery several ticks. The ahead nonvoters are pinging and addServer
-	// is invoked for each. The discriminator: with the fix admission is DEFERRED
-	// (v1's config stays just itself) and v1 is never demoted; without it the
-	// first ahead nonvoter admitted demotes v1 and the cluster flaps.
-	time.Sleep(8 * discoveryTick)
-	if !nodes["v1"].cache.IsLeader() {
-		t.Fatalf("v1 was demoted before its startup reset: an ahead nonvoter was admitted (RT-13067 flap)")
-	}
-	srvs, err := nodes["v1"].cache.GetServerList()
-	asrt.NoErr(err)
-	if len(srvs) != 1 {
-		t.Fatalf("v1 admitted %d servers before its startup reset; ahead-peer admission was not deferred (RT-13067): %v",
-			len(srvs), srvs)
-	}
-	asrt.Equal(termOf(nodes["v1"]), termBefore) // no election while deferring
-
-	// The startup reset (what gatex's ResetAndPopulate runs after WaitReady).
-	// It records the reset id and kicks reconciliation, so the deferred
-	// nonvoters are now admitted through wipe-before-add.
-	asrt.NoErr(nodes["v1"].cache.HardReset(ctxMain))
-
+	// No reset, no hold: the instance-ID admission gate alone must converge the
+	// cluster. Each ahead nonvoter pings the previous incarnation's instance ID,
+	// mismatches fresh v1's, and is hard-reset to fresh stores before being
+	// added — so it catches up instead of demoting v1.
 	convCtx, cancelConv := context.WithTimeout(ctxMain, recoverBudget)
 	asrt.NoErr(waitForCondition(convCtx, func() error {
 		if !nodes["v1"].cache.IsLeader() {
-			return fmt.Errorf("v1 lost leadership while admitting nonvoters after reset (flap)")
+			return fmt.Errorf("v1 lost leadership while admitting the ahead nonvoters (RT-13067 flap)")
 		}
 		srvs, e := nodes["v1"].cache.GetServerList()
 		if e != nil {
@@ -961,12 +944,20 @@ func TestStartupResetDefersAheadPeerAdmission_RT13067(t *testing.T) {
 	}))
 	cancelConv()
 
-	// Re-admitting the ahead nonvoters caused NO election on v1: a demotion
-	// would have bumped the term.
+	// Admitting the ahead nonvoters caused NO election on v1: a demotion would
+	// have bumped the term.
 	termAfter := termOf(nodes["v1"])
 	if termAfter != termBefore {
-		t.Fatalf("v1 term changed from %s to %s across the reset+rejoin: leader was demoted by an ahead nonvoter (RT-13067)",
+		t.Fatalf("v1 term changed from %s to %s across the rejoin: leader was demoted by an ahead nonvoter (RT-13067)",
 			termBefore, termAfter)
+	}
+
+	// The nonvoters were wiped on admission: their pre-restart data is gone
+	// (fresh v1 never had it, so catch-up replication cannot bring it back).
+	for _, id := range nonvoters {
+		if hasAll(nodes[id].fsm, "alice") == nil {
+			t.Fatalf("%s still has pre-restart data after rejoin; it was admitted without being wiped (RT-13067)", id)
+		}
 	}
 
 	// A post-recovery write must replicate to both wiped nonvoters.
