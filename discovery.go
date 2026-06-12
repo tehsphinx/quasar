@@ -198,6 +198,30 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 		return err
 	}
 
+	// If a hard reset has happened, wipe a (re)joining peer BEFORE adding it to
+	// the configuration. A peer that was unreachable during the HardReset
+	// fan-out — or that this leader never had in its config because it
+	// bootstrapped fresh after a restart and only rediscovers peers afterwards
+	// — is still ahead (higher term). Adding it first starts replication
+	// immediately; the peer's higher term then demotes this leader within a
+	// heartbeat, the AddVoter/AddNonvoter future resolves with "leadership
+	// lost", and addServer returns before any post-add wipe could run, so the
+	// cluster flaps election-to-election and never recovers (RT-13067). Wiping
+	// first resets the peer to fresh stores, so once it is added replication
+	// catches it up instead of demoting the leader. resetID dedup (markResetID)
+	// means a peer already wiped for this reset no-ops, so this is safe to run
+	// on every (re)join. Gated on IsLeader: only the surviving reset initiator
+	// (which holds leadership) may wipe peers, and a non-leader's
+	// AddVoter/AddNonvoter would fail anyway.
+	if resetID := s.cache.getLastResetID(); resetID != "" && s.cache.IsLeader() {
+		ctx, cancel := context.WithTimeout(s.cache.ctx, addServerHardResetTimeout)
+		r := s.cache.sendHardReset(ctx, srv, resetID)
+		cancel()
+		if r != nil {
+			return r
+		}
+	}
+
 	fut := addServerFn(srv.ID, srv.Address, 0, addServerCommitTimeout)
 	// fut.Error() blocks until the config change commits or leadership is
 	// lost; bound that wait so a quorum-less leader does not park this caller
@@ -216,17 +240,6 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 		return fmt.Errorf("add server %q: timed out waiting for configuration change to commit", srv.ID)
 	case <-s.cache.ctx.Done():
 		return s.cache.ctx.Err()
-	}
-
-	// If a hard reset has happened, wipe any peer that (re)joins afterwards so a
-	// node that was unreachable during the HardReset fan-out — and is therefore
-	// still ahead — cannot re-wedge the cluster on rejoin (RT-13034).
-	if resetID := s.cache.getLastResetID(); resetID != "" {
-		ctx, cancel := context.WithTimeout(s.cache.ctx, addServerHardResetTimeout)
-		defer cancel()
-		if r := s.cache.sendHardReset(ctx, srv, resetID); r != nil {
-			return r
-		}
 	}
 
 	return nil
