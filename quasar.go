@@ -668,7 +668,7 @@ func (s *Cache) handleRPC(ctx context.Context, rpc raft.RPC) {
 		resp = &pb.StoreResponse{Uid: uid}
 	case *pb.ResetCache:
 		if cmd.Hard {
-			err = s.localHardReset(cmd.Uuid)
+			err = s.localHardReset(cmd.Uuid, cmd.GetInitiatorInstanceId())
 		} else {
 			err = s.reset(ctx)
 		}
@@ -853,11 +853,15 @@ func (s *Cache) localInitiatorReset(resetID string) error {
 }
 
 // sendHardReset sends an out-of-band hard ResetCache RPC to a single remote
-// server. The receiver runs localHardReset on its side (see consume).
+// server. The receiver runs localHardReset on its side (see consume). The RPC
+// carries this node's instance ID so the receiver adopts the initiator's
+// consensus-history line right at the wipe instead of waiting to re-adopt it
+// from a later discovery ping (RT-13067).
 func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID string) error {
 	resp, err := s.transport.ResetCache(ctx, server.ID, server.Address, &pb.ResetCache{
-		Uuid: resetID,
-		Hard: true,
+		Uuid:                resetID,
+		Hard:                true,
+		InitiatorInstanceId: s.getInstanceID(),
 	})
 	if err != nil {
 		return err
@@ -875,6 +879,17 @@ func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID s
 // follower it reinitializes raft on fresh stores via reinitRaftAdoptingInstance,
 // discarding the log/term/vote/snapshot that made it ahead.
 //
+// initiatorInstanceID is the instance ID of the node that initiated the reset;
+// the follower adopts it while rebuilding (RT-13067). It is by construction the
+// consensus-history line this node joins after the wipe, and adopting it here —
+// instead of clearing the local ID and waiting to silently re-adopt from a
+// later leader ping (the former m4 behavior) — removes the window in which the
+// node has no instance ID at all: discovery delivery is best-effort, and an
+// initiator crash inside that window left followers ID-less, where a recovered
+// survivor's freshly minted ID was then silently adopted without the fork wipe.
+// An empty initiatorInstanceID (initiator had none) falls back to clearing the
+// local ID so the next leader ping re-seeds it via noteLeaderInstanceID.
+//
 // Serialized on recoveryMutex with recoverQuorum and adoptLeaderInstance
 // (RT-13042): a hard reset racing a concurrent quorum recovery or fork
 // adoption — plausible exactly in the wedged states hard reset exists for —
@@ -882,7 +897,7 @@ func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID s
 // the losing raft instance left running on the shared transport. The resetID
 // dedup check sits inside the lock so a duplicate RPC that waited out an
 // in-flight reset no-ops instead of wiping the node a second time.
-func (s *Cache) localHardReset(resetID string) error {
+func (s *Cache) localHardReset(resetID, initiatorInstanceID string) error {
 	s.recoveryMutex.Lock()
 	defer s.recoveryMutex.Unlock()
 
@@ -897,15 +912,11 @@ func (s *Cache) localHardReset(resetID string) error {
 	}
 
 	s.logger.Info("hard reset: reinitializing raft because this node is a follower",
-		"local-id", s.localID, "reset-id", resetID)
-	// Drop our stale instance ID. reinitRaftAdoptingInstance("") rebuilds raft
-	// but, with an empty adopt ID, leaves the old instance ID in place — so the
-	// next leader ping would mismatch and trigger adoptLeaderInstance, a second
-	// redundant full wipe that discards whatever catch-up replication already
-	// happened. With the ID cleared the follower instead silently adopts the
-	// leader's ID via the empty-ID branch in noteLeaderInstanceID (m4).
-	s.setInstanceID("")
-	return s.reinitRaftAdoptingInstance("")
+		"local-id", s.localID, "reset-id", resetID, "adopt-instance-id", initiatorInstanceID)
+	if initiatorInstanceID == "" {
+		s.setInstanceID("")
+	}
+	return s.reinitRaftAdoptingInstance(initiatorInstanceID)
 }
 
 // reinitRaftAdoptingInstance tears down the local raft and rebuilds it on

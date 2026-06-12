@@ -81,7 +81,7 @@ func TestLocalHardResetSerializesWithRecovery(t *testing.T) {
 	c.recoveryMutex.Lock()
 
 	done := make(chan error, 1)
-	go func() { done <- c.localHardReset("reset-1") }()
+	go func() { done <- c.localHardReset("reset-1", "") }()
 
 	select {
 	case <-done:
@@ -139,7 +139,7 @@ func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
 		return nil, wantErr
 	}
 
-	if err := c.localHardReset("reset-1"); !errors.Is(err, wantErr) {
+	if err := c.localHardReset("reset-1", ""); !errors.Is(err, wantErr) {
 		t.Fatalf("expected the rebuild error to propagate, got %v", err)
 	}
 	if got := calls.Load(); got != rebuildRaftAttempts {
@@ -176,12 +176,37 @@ func TestHardResetReusesResetIDOnRetry(t *testing.T) {
 	}
 }
 
-// TestLocalHardResetClearsInstanceID is the RT-13042 m4 regression test.
-// A follower hard reset used to call reinitRaftAdoptingInstance("") while
-// leaving its stale instance ID in place, so the next leader ping mismatched
-// and triggered a second, redundant full wipe via adoptLeaderInstance.
-// localHardReset must clear the instance ID so the follower silently adopts
-// the leader's ID instead.
+// TestLocalHardResetAdoptsInitiatorInstanceID is the RT-13067 follow-up
+// regression test. A follower hard reset used to clear its instance ID and
+// rely on a later discovery ping of the leader to re-seed it (RT-13042 m4).
+// Discovery delivery is best-effort, so an initiator crash inside that window
+// left the follower without an instance ID — a recovered survivor's freshly
+// minted ID was then silently adopted without the fork wipe, and the stale
+// configuration never reconciled. The follower must adopt the initiator's
+// instance ID directly at the wipe.
+func TestLocalHardResetAdoptsInitiatorInstanceID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c, _ := newFollowerCache(ctx, t)
+
+	c.setInstanceID("stale-instance-id")
+
+	if err := c.localHardReset("reset-1", "initiator-instance-id"); err != nil {
+		t.Fatalf("localHardReset: %v", err)
+	}
+
+	if got := c.getInstanceID(); got != "initiator-instance-id" {
+		t.Fatalf("expected the initiator's instance ID adopted after follower hard reset, got %q", got)
+	}
+}
+
+// TestLocalHardResetClearsInstanceID is the RT-13042 m4 regression test,
+// scoped since RT-13067 to the fallback case of an initiator without an
+// instance ID: the follower must not keep its stale ID (the next leader ping
+// would mismatch and trigger a second, redundant full wipe via
+// adoptLeaderInstance) but clear it, so it silently adopts the leader's ID
+// from a later ping instead.
 func TestLocalHardResetClearsInstanceID(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -190,7 +215,7 @@ func TestLocalHardResetClearsInstanceID(t *testing.T) {
 
 	c.setInstanceID("stale-instance-id")
 
-	if err := c.localHardReset("reset-1"); err != nil {
+	if err := c.localHardReset("reset-1", ""); err != nil {
 		t.Fatalf("localHardReset: %v", err)
 	}
 
@@ -218,7 +243,7 @@ func TestLocalHardResetDeduplicatesConcurrentResets(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := c.localHardReset("reset-1"); err != nil {
+			if err := c.localHardReset("reset-1", ""); err != nil {
 				t.Errorf("localHardReset: %v", err)
 			}
 		}()

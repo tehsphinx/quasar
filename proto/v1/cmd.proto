@@ -67,6 +67,15 @@ message ResetCache {
   // reset to the leader. Used to recover a cluster where a node is ahead of a freshly (re)started
   // leader and no leader can be elected (RT-13034).
   bool hard = 2;
+
+  // initiator_instance_id is the raft instance ID of the node initiating a hard reset. The receiving
+  // follower adopts it while rebuilding its raft instead of clearing its own ID and waiting to
+  // re-adopt one from a discovery ping of the leader: the wiped node is by construction joining the
+  // initiator's consensus history, and discovery delivery is best-effort — a leader crash inside the
+  // re-adoption window used to leave followers without an instance ID, disarming fork detection
+  // (RT-13067). Empty when the initiator has no instance ID yet; the receiver then falls back to
+  // clearing its own.
+  string initiator_instance_id = 3;
 }
 
 message ResetCacheResponse {
