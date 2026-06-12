@@ -1037,3 +1037,197 @@ func TestInstanceIDForkAdoptionAfterRecoverQuorum(t *testing.T) {
 		Name: "postFork", Age: 99, Instruments: []string{"tuba"},
 	}))
 }
+
+// TestRecoveredConfigReplicatesWithoutDiscovery_RT13067 is the regression
+// guard for the post-quorum-recovery configuration stall (RT-13067 follow-up).
+//
+// raft.RecoverCluster persists the forced single-voter configuration only in
+// a snapshot — it deletes the whole log. A nonvoter that is log-matched with
+// the recovered captain therefore never receives an InstallSnapshot, and the
+// captain's post-election noop carries no configuration, so without a fresh
+// configuration entry the nonvoter keeps the stale pre-recovery configuration
+// indefinitely. Its discovery pings then advertise the stale voter count,
+// which a later restarting voter reads as "established cluster", skipping
+// bootstrap into a configless wedge (RT-12775 gating).
+//
+// In production the instance-ID mismatch wipe usually masks this: the wiped
+// nonvoter is caught up via InstallSnapshot, which carries the config. But
+// that path depends on a discovery ping of the recovered leader arriving —
+// and discovery delivery is best-effort. This test makes the dependency
+// explicit by muting ALL discovery before the crash: the recovered
+// configuration must reach the log-matched nonvoter through raft log
+// replication alone (the recoverQuorum config re-assert), with no wipe — the
+// nonvoter keeps its instance ID and its data.
+func TestRecoveredConfigReplicatesWithoutDiscovery_RT13067(t *testing.T) {
+	const (
+		recoverAfter  = 6 * time.Second
+		recoverBudget = 45 * time.Second
+		discoveryTick = 200 * time.Millisecond
+		bootstrapWait = 2 * time.Second
+	)
+
+	ctxMain, cancelMain := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancelMain()
+
+	asrt := is.New(t)
+	bus := newInmemBus()
+
+	type spec struct {
+		id       string
+		suffrage raft.ServerSuffrage
+	}
+	specs := []spec{
+		{"v1", raft.Voter},
+		{"v2", raft.Voter},
+		{"n1", raft.Nonvoter},
+	}
+
+	addrs := map[string]raft.ServerAddress{}
+	trs := map[string]*transports.InmemTransport{}
+	for _, s := range specs {
+		addr, tr := transports.NewInmemTransport("")
+		addrs[s.id] = addr
+		trs[s.id] = tr
+	}
+	for id, tr := range trs {
+		for otherID, otherTr := range trs {
+			if id == otherID {
+				continue
+			}
+			tr.Connect(addrs[otherID], otherTr)
+		}
+	}
+
+	type node struct {
+		id    string
+		cache *quasar.Cache
+		fsm   *exampleFSM.InMemoryFSM
+	}
+	startNode := func(id string, suffrage raft.ServerSuffrage) *node {
+		fsm := exampleFSM.NewInMemoryFSM()
+		// No WithAutoPrune: pruning is discovery-fed, and this test mutes
+		// discovery — the muted (but alive and replicating) nonvoter must not
+		// be pruned as dead. aliveCutoff falls back to recoverAfter.
+		c, err := quasar.NewCache(ctxMain, fsm,
+			quasar.WithLocalID(id),
+			quasar.WithTransport(trs[id]),
+			quasar.WithDiscovery(newInmemDiscovery(bus, discoveryTick)),
+			quasar.WithQuorumRecovery(recoverAfter),
+			quasar.WithSuffrage(suffrage),
+			quasar.WithBootstrapWait(bootstrapWait),
+		)
+		asrt.NoErr(err)
+		return &node{id: id, cache: c, fsm: fsm}
+	}
+
+	// Stagger startup so only v1 bootstraps and everyone adopts its
+	// instance ID via leader pings.
+	nodes := map[string]*node{}
+	nodes["v1"] = startNode("v1", raft.Voter)
+	asrt.NoErr(nodes["v1"].cache.WaitReady(ctxMain))
+	defer func() {
+		for _, n := range nodes {
+			if n != nil {
+				_ = n.cache.Shutdown()
+			}
+		}
+	}()
+	nodes["v2"] = startNode("v2", raft.Voter)
+	asrt.NoErr(nodes["v2"].cache.WaitReady(ctxMain))
+	nodes["n1"] = startNode("n1", raft.Nonvoter)
+
+	settleCtx, cancelSettle := context.WithTimeout(ctxMain, 20*time.Second)
+	defer cancelSettle()
+	asrt.NoErr(waitForCondition(settleCtx, func() error {
+		srvs, e := nodes["v1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		if len(srvs) != len(specs) {
+			return fmt.Errorf("v1 sees %d servers, want %d", len(srvs), len(specs))
+		}
+		idA := nodes["v1"].cache.InstanceID()
+		if idA == "" {
+			return fmt.Errorf("v1 instance ID not minted yet")
+		}
+		if got := nodes["n1"].cache.InstanceID(); got != idA {
+			return fmt.Errorf("n1 instance ID %q != v1 %q", got, idA)
+		}
+		return nil
+	}))
+	idA := nodes["v1"].cache.InstanceID()
+
+	// Write through the cluster and wait until n1 is fully caught up
+	// (log-matched with the voters).
+	{
+		writeCtx, cancel := context.WithTimeout(ctxMain, 5*time.Second)
+		defer cancel()
+		asrt.NoErr(nodes["v1"].fsm.SetMusician(writeCtx, exampleFSM.Musician{
+			Name: "preCrash", Age: 1, Instruments: []string{"theremin"},
+		}))
+	}
+	catchupCtx, cancelCatchup := context.WithTimeout(ctxMain, 10*time.Second)
+	defer cancelCatchup()
+	asrt.NoErr(waitForCondition(catchupCtx, func() error {
+		if _, e := nodes["n1"].fsm.GetMusicianLocal("preCrash"); e != nil {
+			return fmt.Errorf("n1 not caught up: %w", e)
+		}
+		return nil
+	}))
+
+	// Mute ALL discovery. From here on no instance-ID adoption (and thus no
+	// mismatch wipe + InstallSnapshot) can deliver the recovered config to
+	// n1 — it must arrive through raft log replication.
+	for _, s := range specs {
+		bus.mute(s.id)
+	}
+
+	// Hard-stop v2 — the recovery captain precondition.
+	asrt.NoErr(nodes["v2"].cache.Shutdown())
+	nodes["v2"] = nil
+
+	recoverCtx, cancelRecover := context.WithTimeout(ctxMain, recoverBudget)
+	defer cancelRecover()
+	asrt.NoErr(waitForCondition(recoverCtx, func() error {
+		if !nodes["v1"].cache.IsLeader() {
+			return fmt.Errorf("v1 not yet leader of recovered cluster")
+		}
+		if nodes["v1"].cache.InstanceID() == idA {
+			return fmt.Errorf("v1 still on pre-recovery instance ID")
+		}
+		return nil
+	}))
+
+	// The regression assertion: the log-matched, discovery-deaf nonvoter
+	// receives the recovered single-voter configuration.
+	configCtx, cancelConfig := context.WithTimeout(ctxMain, recoverBudget)
+	defer cancelConfig()
+	asrt.NoErr(waitForCondition(configCtx, func() error {
+		srvs, e := nodes["n1"].cache.GetServerList()
+		if e != nil {
+			return e
+		}
+		voters := 0
+		for _, s := range srvs {
+			if s.ID == "v2" {
+				return fmt.Errorf("n1 config still contains the dropped voter v2")
+			}
+			if s.Suffrage == raft.Voter {
+				voters++
+			}
+		}
+		if voters != 1 {
+			return fmt.Errorf("n1 config has %d voters, want 1", voters)
+		}
+		return nil
+	}))
+
+	// Prove the config came via log replication, not via a wipe: n1 kept its
+	// pre-recovery instance ID and its data.
+	if got := nodes["n1"].cache.InstanceID(); got != idA {
+		t.Fatalf("n1 instance ID changed to %q (was %q) — config arrived via a wipe, not log replication", got, idA)
+	}
+	if _, err := nodes["n1"].fsm.GetMusicianLocal("preCrash"); err != nil {
+		t.Fatalf("n1 lost its data across the recovery: %v", err)
+	}
+}

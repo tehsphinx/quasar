@@ -1273,7 +1273,60 @@ func (s *Cache) recoverQuorum() error {
 
 	s.setRaft(rftNew)
 	s.discovery.run(s.ctx, rftNew)
+	go s.reassertRecoveredConfig(rftNew)
 	return nil
+}
+
+// reassertRecoveredConfigPoll is how often reassertRecoveredConfig re-checks
+// for leadership (and retries a failed configuration append) on the recovered
+// raft instance.
+const reassertRecoveredConfigPoll = 100 * time.Millisecond
+
+// reassertRecoveredConfig re-commits the post-recovery configuration into the
+// raft log once the recovered raft instance wins its election.
+// raft.RecoverCluster persists the forced configuration only in a snapshot —
+// it deletes the whole log — and the post-election noop entry carries no
+// configuration. A follower that is log-matched with the recovered captain
+// therefore never receives an InstallSnapshot and would keep the stale
+// pre-recovery configuration indefinitely (RT-13067): its discovery pings
+// advertise the stale voter count, which a later restarting voter reads as
+// "established cluster", skipping bootstrap into a configless wedge (RT-12775
+// gating). A self-AddVoter is a membership no-op, but hashicorp/raft appends
+// and replicates the resulting configuration entry unconditionally — exactly
+// the vehicle log-matched followers need.
+//
+// Runs on its own goroutine: winning the election can take several rounds.
+// Exits when the entry committed, the cache shuts down, or rft was replaced
+// by a newer raft instance (a later recovery or reset owns the config then).
+func (s *Cache) reassertRecoveredConfig(rft *raft.Raft) {
+	tick := time.NewTicker(reassertRecoveredConfigPoll)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-tick.C:
+		}
+		if s.raft() != rft {
+			return
+		}
+		if rft.State() != raft.Leader {
+			continue
+		}
+
+		err := rft.AddVoter(raft.ServerID(s.localID), s.transport.LocalAddr(), 0, addServerCommitTimeout).Error()
+		if err == nil {
+			s.logger.Info("quorum recovery: recovered configuration re-committed to the raft log",
+				"local-id", s.localID)
+			return
+		}
+		if errors.Is(err, raft.ErrRaftShutdown) {
+			return
+		}
+		s.logger.Warn("quorum recovery: re-committing the recovered configuration failed; retrying",
+			"local-id", s.localID, "error", err)
+	}
 }
 
 // voterScan summarizes the current raft voter configuration measured
