@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"golang.org/x/exp/maps"
 )
@@ -129,6 +130,14 @@ type DiscoveryInjector struct {
 // Name returns the caches name. This name identifies a cache and separates it from other caches on the network.
 func (s *DiscoveryInjector) Name() string {
 	return s.cache.name
+}
+
+// Logger exposes the cache's logger to Discovery implementations so delivery
+// failures can be surfaced instead of silently swallowed (RT-13067): a
+// discovery plane that stops delivering pings disarms instance-ID re-seeding
+// and peer liveness, and used to be invisible in the logs.
+func (s *DiscoveryInjector) Logger() hclog.Logger {
+	return s.cache.logger
 }
 
 // ServerInfo returns the raft.Server info of this cache instance.

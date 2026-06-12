@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar"
@@ -81,14 +82,22 @@ func (s *NATSDiscovery) runPinging(ctx context.Context) {
 	for {
 		select {
 		case <-tick.C:
-			//nolint:staticcheck // empty branch to be filled later
 			if r := s.ping(); r != nil {
-				// TODO: log?
+				s.logger().Warn("discovery ping failed", "error", r)
 			}
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// logger returns the cache's logger once Inject ran, and a null logger
+// before that so early calls cannot panic.
+func (s *NATSDiscovery) logger() hclog.Logger {
+	if s.cache == nil {
+		return hclog.NewNullLogger()
+	}
+	return s.cache.Logger()
 }
 
 func (s *NATSDiscovery) ping() error {
@@ -127,6 +136,7 @@ func (s *NATSDiscovery) discoveryHandler(msg *nats.Msg) {
 
 	bts, err := s.marshalPing(true)
 	if err != nil {
+		s.logger().Warn("discovery ping response: marshal failed", "error", err)
 		return
 	}
 
@@ -134,6 +144,7 @@ func (s *NATSDiscovery) discoveryHandler(msg *nats.Msg) {
 	// so msg.Reply is always empty here — the former msg.Respond branch was
 	// dead (RT-13042 S8). Responses go back out on the shared subject.
 	if r := s.nc.Publish(s.subj, bts); r != nil {
+		s.logger().Warn("discovery ping response failed", "error", r)
 		return
 	}
 }
