@@ -221,21 +221,23 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 	// window is covered without any admission hold. Empty peer instance IDs are
 	// treated as mismatch: a genuinely fresh peer wipes as a no-op, while a peer
 	// that joined the previous incarnation moments before the restart (never
-	// adopted an ID, still ahead) is defused. resetID dedup (markResetID) makes
-	// re-wipes within one incarnation no-ops. Gated on IsLeader (a non-leader's
+	// adopted an ID, still ahead) is defused. Gated on IsLeader (a non-leader's
 	// AddVoter/AddNonvoter would fail anyway) and on having a local instance ID:
 	// a leader without one (joined, elected before adopting) cannot claim a
 	// history and must not wipe healthy followers.
+	//
+	// The wipe is keyed on the local instance ID — the leader's current
+	// consensus incarnation — NEVER on getLastResetID(): retries for the same
+	// incarnation dedup on the peer (markResetID), while a peer wiped under an
+	// older key is wiped again for the new incarnation. The last reset ID can
+	// be inherited from a previous incarnation's sweep (e.g. across a quorum
+	// recovery on a node that was itself wiped earlier), a key the peers have
+	// already recorded — keying on it made their dedup silently skip the
+	// admission wipe, readmitting a potentially forked peer unwiped.
 	localInst := s.cache.getInstanceID()
 	if s.cache.IsLeader() && localInst != "" && s.peerInstanceID(srv.ID) != localInst {
-		resetID := s.cache.getLastResetID()
-		if resetID == "" {
-			// No reset ran yet this incarnation; key the admission wipe on the
-			// instance ID so retries dedup per incarnation.
-			resetID = localInst
-		}
 		ctx, cancel := context.WithTimeout(s.cache.ctx, addServerHardResetTimeout)
-		r := s.cache.sendHardReset(ctx, srv, resetID)
+		r := s.cache.sendHardReset(ctx, srv, localInst)
 		cancel()
 		if r != nil {
 			return r

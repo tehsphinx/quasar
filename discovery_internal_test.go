@@ -368,3 +368,80 @@ func containsServer(servers []raft.Server, id raft.ServerID) bool {
 	}
 	return false
 }
+
+// TestAdmissionWipeKeyedToCurrentIncarnation is the RT-13067 follow-up
+// regression test for the admission gate's wipe key. The gate used to prefer
+// getLastResetID() as the hard-reset key and fall back to the local instance
+// ID only when no reset had run yet. The last reset ID can be inherited from a
+// previous incarnation's sweep (e.g. this node was itself wiped under that key
+// before recovering into a new incarnation) — a key the peers have already
+// recorded, so their markResetID dedup silently skipped the admission wipe and
+// a forked peer was (re)admitted unwiped. The wipe must be keyed on the
+// leader's current instance ID: same-incarnation retries still dedup on the
+// peer, while a peer wiped under any older key is wiped for the new
+// incarnation.
+func TestAdmissionWipeKeyedToCurrentIncarnation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	leaderAddr, leaderTr := transports.NewInmemTransport("")
+	peerAddr, peerTr := transports.NewInmemTransport("")
+	leaderTr.Connect(peerAddr, peerTr)
+	peerTr.Connect(leaderAddr, leaderTr)
+
+	leader, err := NewCache(ctx, &stubFSM{},
+		WithLocalID("leader"),
+		WithTransport(leaderTr),
+		WithBootstrap(true),
+	)
+	if err != nil {
+		t.Fatalf("NewCache(leader): %v", err)
+	}
+	t.Cleanup(func() { _ = leader.Shutdown() })
+	if err := leader.WaitReady(ctx); err != nil {
+		t.Fatalf("leader WaitReady: %v", err)
+	}
+	if !leader.IsLeader() {
+		t.Fatal("bootstrapped lone voter did not become leader")
+	}
+	leaderInst := leader.getInstanceID()
+	if leaderInst == "" {
+		t.Fatal("bootstrapped leader has no instance ID")
+	}
+
+	peerFSM := &stubFSM{}
+	peer, err := NewCache(ctx, peerFSM,
+		WithLocalID("peer"),
+		WithTransport(peerTr),
+		WithSuffrage(raft.Nonvoter),
+	)
+	if err != nil {
+		t.Fatalf("NewCache(peer): %v", err)
+	}
+	t.Cleanup(func() { _ = peer.Shutdown() })
+
+	// Both sides already saw the same reset key in a previous incarnation:
+	// the peer was wiped under it, and this leader inherited it as its
+	// lastResetID before recovering into its current incarnation.
+	leader.markResetID("previous-incarnation-reset")
+	peer.markResetID("previous-incarnation-reset")
+
+	// The peer is on a forked history relative to the leader.
+	peer.setInstanceID("forked-instance")
+
+	// Admission: the peer pings with its forked instance ID and addServer runs
+	// the gate. The wipe key must be the leader's instance ID — keying on the
+	// stale lastResetID gets deduped by the peer and skips the wipe.
+	peerSrv := raft.Server{ID: "peer", Address: peerAddr, Suffrage: raft.Nonvoter}
+	leader.discovery.setServerWithInstanceID(peerSrv, "forked-instance")
+	if err := leader.discovery.addServer(peerSrv); err != nil {
+		t.Fatalf("addServer(peer): %v", err)
+	}
+
+	if got := peerFSM.resets.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 wipe on the forked peer at admission, got %d", got)
+	}
+	if got := peer.getInstanceID(); got != leaderInst {
+		t.Fatalf("expected the peer to adopt the leader's instance ID %q at the admission wipe, got %q", leaderInst, got)
+	}
+}
