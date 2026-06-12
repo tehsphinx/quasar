@@ -192,7 +192,13 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 			"local-address", transport.LocalAddr(),
 			"bootstrap-wait", cfg.bootstrapWait,
 		)
-		s.bootstrappedSingleVoter.Store(true)
+		if cfg.resetOnStartup {
+			// Hold peer admission until the startup hard reset wipes the
+			// surviving (possibly ahead) peers; the grace timer is the fallback
+			// release for a node that never resets (RT-13067).
+			s.deferPeerAdmit.Store(true)
+			go s.admitPeersAfterResetGrace(ctx)
+		}
 		s.setInstanceID(uuid.NewString())
 		s.bootstrapCluster(rft, raft.Configuration{
 			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
@@ -296,14 +302,17 @@ type Cache struct {
 	suffrage  raft.ServerSuffrage
 	logger    hclog.Logger
 
-	// bootstrappedSingleVoter is set when this node came up by bootstrapping
-	// its own single-voter cluster (no established cluster was discovered at
-	// startup) rather than by joining an existing one. With WithResetOnStartup
-	// it gates the pre-reset peer-admission deferral in addServer: only a node
-	// in this state has surviving peers that may be ahead of its fresh raft and
-	// must be wiped before being admitted (RT-13067). A node elected via normal
-	// failover never took the single-voter-bootstrap path, so it is unaffected.
-	bootstrappedSingleVoter atomic.Bool
+	// deferPeerAdmit holds back discovery peer admission in addServer. It is set
+	// only with WithResetOnStartup and only on a node that came up by
+	// bootstrapping its own single-voter cluster (RT-13067): such a node has a
+	// fresh, low-term raft while surviving peers may still be ahead, so admitting
+	// them before the startup hard reset wipes them lets the first one demote
+	// this leader into an election loop. The hold is released — and reconciliation
+	// kicked so the deferred peers are admitted through wipe-before-add — by the
+	// startup reset (localInitiatorReset) or, as a fallback for a node that never
+	// resets, by a grace timer (admitPeersAfterResetGrace). A node that joined an
+	// existing cluster or was elected via normal failover never sets it.
+	deferPeerAdmit atomic.Bool
 
 	// quorumProbe* cache the last quorumProbeReachable result so a burst
 	// of leaderless requests doesn't re-fan-out one LatestUID RPC per
@@ -864,16 +873,43 @@ func (s *Cache) localInitiatorReset(resetID string) error {
 		return err
 	}
 
-	// The reset id is now recorded, so addServer's wipe-before-add is armed.
-	// Kick membership reconciliation to admit any peer that was deferred during
-	// the pre-reset startup window (WithResetOnStartup, RT-13067): addServer now
-	// hard-resets each peer before adding it, so it rejoins on fresh stores
-	// instead of demoting this freshly-bootstrapped leader. A no-op when there
-	// is nothing deferred or this node is not the leader (the adds simply fail).
-	if s.discovery != nil {
+	// The reset id is now recorded, so addServer's wipe-before-add is armed:
+	// release any startup peer-admission hold and reconcile so the deferred
+	// peers are admitted now, each hard-reset before being added (RT-13067).
+	s.liftPeerAdmitDefer()
+	return nil
+}
+
+// resetOnStartupAdmitGrace bounds how long a freshly single-voter-bootstrapped
+// leader holds peer admission waiting for its startup hard reset to arm
+// wipe-before-add (WithResetOnStartup, RT-13067). The reset normally releases
+// the hold within a second or two; this is the fallback so a node that never
+// resets (an embedder — or test — that forms a cluster without ResetAndPopulate)
+// still admits peers and converges rather than wedging forever.
+const resetOnStartupAdmitGrace = 5 * time.Second
+
+// admitPeersAfterResetGrace releases the startup peer-admission hold once the
+// grace window elapses, in case the startup reset never runs. A no-op if the
+// reset already released it.
+func (s *Cache) admitPeersAfterResetGrace(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(resetOnStartupAdmitGrace):
+	}
+	s.liftPeerAdmitDefer()
+}
+
+// liftPeerAdmitDefer releases the startup peer-admission hold and, only if it
+// was actually held, kicks membership reconciliation so peers deferred during
+// the hold are admitted now via addServer (wipe-before-add). Idempotent: the
+// reset path and the grace timer both call it; the CAS makes the second a
+// no-op, so the reconcile kick fires at most once and never for a node that
+// never deferred.
+func (s *Cache) liftPeerAdmitDefer() {
+	if s.deferPeerAdmit.CompareAndSwap(true, false) && s.discovery != nil {
 		go s.discovery.addMissingServers()
 	}
-	return nil
 }
 
 // sendHardReset sends an out-of-band hard ResetCache RPC to a single remote
