@@ -37,6 +37,7 @@ type options struct {
 	recoverQuorumAfter time.Duration
 	bootstrapWait      time.Duration
 	noLeaderTimeout    time.Duration
+	resetOnStartup     bool
 	hclogLogger        hclog.Logger
 	slogLogger         *slog.Logger
 
@@ -252,6 +253,28 @@ func WithNoLeaderTimeout(timeout time.Duration) Option {
 			return
 		}
 		o.noLeaderTimeout = timeout
+	}
+}
+
+// WithResetOnStartup tells quasar that the embedder performs a hard reset at
+// startup (via HardReset, after WaitReady) on the node that comes up as the
+// sole voter. With this set, a freshly single-voter-bootstrapped leader does
+// not admit discovered peers until that startup reset has recorded its reset
+// id: the reset is what arms the wipe-before-add in DiscoveryInjector.addServer,
+// and a peer admitted before it runs is replicated to while still on its
+// pre-restart (higher) term, demoting the fresh leader within a heartbeat and
+// trapping the cluster in an election loop (RT-13067). Once the startup reset
+// records its id, membership reconciliation is kicked so the deferred peers are
+// admitted through wipe-before-add and rejoin cleanly.
+//
+// Only the single-voter-bootstrap path is gated, so a node that joins an
+// existing cluster (and a leader elected via normal failover) is unaffected.
+// Leave this off for embedders that do not hard-reset at startup, otherwise a
+// cold-starting voter would defer peer admission until a reset that never
+// comes.
+func WithResetOnStartup() Option {
+	return func(o *options) {
+		o.resetOnStartup = true
 	}
 }
 

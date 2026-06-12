@@ -192,7 +192,27 @@ func (s *DiscoveryInjector) LocalPeerStatus() PeerStatus {
 	}
 }
 
+// errAddDeferredPendingReset is returned by addServer when admission is held
+// back until this node's startup hard reset has run (WithResetOnStartup,
+// RT-13067). It is not a failure: the peer stays known-but-unapplied and
+// addMissingServers re-adds it once the reset records its id (kicked from the
+// reset path) — at which point wipe-before-add is armed.
+var errAddDeferredPendingReset = errors.New("add deferred until startup reset")
+
 func (s *DiscoveryInjector) addServer(srv raft.Server) error {
+	// A freshly single-voter-bootstrapped leader must not admit a (re)joining
+	// peer until its startup hard reset has recorded a reset id. The peer may
+	// have survived this node's restart on a higher raft term; adding it first
+	// starts replication immediately and its higher term demotes this fresh
+	// leader within a heartbeat, before the wipe-before-add below can run —
+	// trapping the cluster in an election loop (RT-13067). getLastResetID()==""
+	// means the startup reset has not recorded yet, so defer; the reset path
+	// kicks addMissingServers once the id is set.
+	if s.cache.cfg.resetOnStartup && s.cache.bootstrappedSingleVoter.Load() &&
+		s.cache.IsLeader() && s.cache.getLastResetID() == "" {
+		return errAddDeferredPendingReset
+	}
+
 	addServerFn, err := s.getAddServerFunc(srv.Suffrage == raft.Voter)
 	if err != nil {
 		return err

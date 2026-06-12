@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -191,6 +192,7 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 			"local-address", transport.LocalAddr(),
 			"bootstrap-wait", cfg.bootstrapWait,
 		)
+		s.bootstrappedSingleVoter.Store(true)
 		s.setInstanceID(uuid.NewString())
 		s.bootstrapCluster(rft, raft.Configuration{
 			Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
@@ -293,6 +295,15 @@ type Cache struct {
 	discovery *DiscoveryInjector
 	suffrage  raft.ServerSuffrage
 	logger    hclog.Logger
+
+	// bootstrappedSingleVoter is set when this node came up by bootstrapping
+	// its own single-voter cluster (no established cluster was discovered at
+	// startup) rather than by joining an existing one. With WithResetOnStartup
+	// it gates the pre-reset peer-admission deferral in addServer: only a node
+	// in this state has surviving peers that may be ahead of its fresh raft and
+	// must be wiped before being admitted (RT-13067). A node elected via normal
+	// failover never took the single-voter-bootstrap path, so it is unaffected.
+	bootstrappedSingleVoter atomic.Bool
 
 	// quorumProbe* cache the last quorumProbeReachable result so a burst
 	// of leaderless requests doesn't re-fan-out one LatestUID RPC per
@@ -849,7 +860,20 @@ func (s *Cache) localInitiatorReset(resetID string) error {
 
 	s.logger.Info("hard reset: FSM cleared; keeping raft state on the reset initiator",
 		"local-id", s.localID, "reset-id", resetID)
-	return s.fsm.applyReset()
+	if err := s.fsm.applyReset(); err != nil {
+		return err
+	}
+
+	// The reset id is now recorded, so addServer's wipe-before-add is armed.
+	// Kick membership reconciliation to admit any peer that was deferred during
+	// the pre-reset startup window (WithResetOnStartup, RT-13067): addServer now
+	// hard-resets each peer before adding it, so it rejoins on fresh stores
+	// instead of demoting this freshly-bootstrapped leader. A no-op when there
+	// is nothing deferred or this node is not the leader (the adds simply fail).
+	if s.discovery != nil {
+		go s.discovery.addMissingServers()
+	}
+	return nil
 }
 
 // sendHardReset sends an out-of-band hard ResetCache RPC to a single remote
