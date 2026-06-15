@@ -30,7 +30,17 @@ const (
 	// universe. The wait aborts as soon as a peer is seen, so only a genuine
 	// cold start (no cluster out there yet) pays the full duration.
 	defaultBootstrapWait = 5 * time.Second
-	observationChanSize  = 5
+	// defaultBootstrapFallback bounds the RT-12775 bootstrap-gating liveness
+	// fallback (see WithBootstrapFallbackWait). A voter that skipped its own
+	// bootstrap because a peer announced an established cluster waits this long
+	// for a leader to actually form before concluding the cluster is
+	// stale/leaderless and bootstrapping a single-voter cluster to break the
+	// wedge. Sized to sit between worst-case healthy re-add latency (one
+	// discovery ping, ≤ bootstrapWait) and the embedder's startup-retry budget
+	// (gatex retries WaitReady 3×~10s ≈ 30s), so the wedge clears within a
+	// single process lifetime without pre-empting a healthy rejoin.
+	defaultBootstrapFallback = 10 * time.Second
+	observationChanSize      = 5
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the
 	// discovery alive-window to expire. Sized for a healthy LAN: long
@@ -183,6 +193,16 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 		select {
 		case <-s.discovery.PeerInCluster():
 			s.logger.Info("bootstrap: peer in established cluster discovered, skipping single-node bootstrap")
+			// RT-13067: the announced "established cluster" may be stale and
+			// leaderless (all voters down, or a surviving nonvoter still
+			// advertising a stale multi-voter config). Skipping bootstrap is
+			// otherwise terminal — nothing re-arms it — so a leaderless cluster
+			// pins this voter in a configless crash-loop. Arm a bounded liveness
+			// fallback that bootstraps a single-voter cluster if no real leader
+			// forms. Runs only when a fallback window is configured.
+			if cfg.bootstrapFallback > 0 {
+				go s.runBootstrapFallback(ctx, cfg.bootstrapFallback, transport)
+			}
 			return nil
 		default:
 		}
@@ -222,6 +242,72 @@ func (s *Cache) bootstrapCluster(rft *raft.Raft, configuration raft.Configuratio
 	if err := rft.BootstrapCluster(configuration).Error(); err != nil {
 		s.logger.Warn("bootstrap cluster failed", "error", err)
 	}
+}
+
+// runBootstrapFallback is the liveness backstop for the RT-12775
+// bootstrap-gating (see WithBootstrapFallbackWait). It is started only after a
+// voter skipped its single-node bootstrap because discovery reported an
+// established cluster. After the grace window it bootstraps a single-voter
+// cluster — but only if the announced cluster turned out to be stale and
+// leaderless. The fire-time guards make this safe in a healthy cluster:
+//   - hasLeader(): a leader formed (this node was pulled in and is receiving
+//     heartbeats) → a normal rejoin happened, nothing to do.
+//   - hasEmptyConfig(): the local raft is still configless → if a real leader
+//     had added this node (AddVoter/AddNonvoter), the replicated config would
+//     be non-empty; a non-empty config means the rejoin is underway.
+//   - discovery.observedLeaderPing(): any peer ever reported HasLeader, i.e. a
+//     reachable leader exists out there and will (re)admit this node → keep
+//     waiting rather than fork a competing cluster.
+//
+// Only when all three say "no leader anywhere and we never joined" does the
+// fallback bootstrap, matching the RT-13034 wedge (stale-config peers
+// advertising NumVotersInConfig>=2 while every voter is down). The fresh
+// single-voter leader then converges the stale peers via the Option I
+// instance-ID admission gate on their next ping.
+func (s *Cache) runBootstrapFallback(ctx context.Context, after time.Duration, transport transports.Transport) {
+	timer := time.NewTimer(after)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+
+	if s.hasLeader() || !s.hasEmptyConfig() || s.discovery.observedLeaderPing() {
+		return
+	}
+
+	rft := s.raft()
+	if rft == nil {
+		return
+	}
+
+	s.logger.Warn("bootstrap fallback: skipped bootstrap on an established-cluster ping but no leader formed within the grace window; bootstrapping single-voter cluster to break the wedge",
+		"local-id", s.localID,
+		"local-address", transport.LocalAddr(),
+		"fallback-wait", after,
+	)
+	s.setInstanceID(uuid.NewString())
+	s.bootstrapCluster(rft, raft.Configuration{
+		Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
+	})
+}
+
+// hasEmptyConfig reports whether the local raft has no servers in its
+// configuration — i.e. this node has neither bootstrapped nor been added to a
+// cluster by a leader. On a transient read error it returns false (conservative:
+// the bootstrap fallback must not fire when membership is unknown).
+func (s *Cache) hasEmptyConfig() bool {
+	rft := s.raft()
+	if rft == nil {
+		return true
+	}
+	cfgFut := rft.GetConfiguration()
+	if err := cfgFut.Error(); err != nil {
+		return false
+	}
+	return len(cfgFut.Configuration().Servers) == 0
 }
 
 // waitForBootstrapDecision blocks until discovery has observed a peer that

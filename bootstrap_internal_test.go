@@ -39,6 +39,124 @@ type noopDiscovery struct{}
 func (noopDiscovery) Inject(*DiscoveryInjector) {}
 func (noopDiscovery) Run(context.Context) error { return nil }
 
+// announcingDiscovery enables the discovery-voter bootstrap branch and, when
+// Run is called (inside NewCache, before bootstrap), synchronously announces a
+// single peer with the given status. With NumVotersInConfig>=2 or HasLeader it
+// closes peerInClusterCh, so the local voter skips its single-node bootstrap —
+// the precondition for the RT-13067 liveness fallback.
+type announcingDiscovery struct {
+	inj    *DiscoveryInjector
+	peerID raft.ServerID
+	status PeerStatus
+}
+
+func (d *announcingDiscovery) Inject(inj *DiscoveryInjector) { d.inj = inj }
+
+func (d *announcingDiscovery) Run(context.Context) error {
+	// The peer is not in our (empty) config and we are not leader, so the
+	// addServer attempt inside ProcessServerWithStatus fails fast and harmlessly
+	// — but peerInClusterCh / sawLeaderPing are updated first, which is all this
+	// test needs.
+	d.inj.ProcessServerWithStatus(
+		raft.Server{ID: d.peerID, Address: raft.ServerAddress(d.peerID), Suffrage: raft.Voter},
+		d.status,
+	)
+	return nil
+}
+
+// TestBootstrapFallbackRecoversFromLeaderlessEstablishedCluster is the RT-13067
+// regression test for the bootstrap-gating liveness fallback. A restarting
+// voter is told (via a stale-config peer reporting NumVotersInConfig=2, no
+// leader) that an established cluster exists, so it skips its own bootstrap.
+// Pre-fix this is terminal: configless, leaderless, crash-looping. The fallback
+// must detect that no real leader ever formed and bootstrap a single-voter
+// cluster to break the wedge.
+func TestBootstrapFallbackRecoversFromLeaderlessEstablishedCluster(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	out := &syncBuffer{}
+	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Warn})
+
+	disc := &announcingDiscovery{
+		peerID: "stale-peer",
+		status: PeerStatus{HasLeader: false, NumVotersInConfig: 2},
+	}
+
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, newSnapFSM(),
+		WithLocalID("voter"),
+		WithTransport(tr),
+		WithDiscovery(disc),
+		WithBootstrapFallbackWait(300*time.Millisecond),
+		WithHclogLogger(logger),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+
+	// Bootstrap was skipped: the node starts configless and leaderless.
+	if !c.hasEmptyConfig() {
+		t.Fatalf("expected an empty config right after a skipped bootstrap")
+	}
+
+	// The fallback must bootstrap a single-voter cluster and win the election.
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady after fallback: %v\nlog:\n%s", err, out.String())
+	}
+	if !c.IsLeader() {
+		t.Fatalf("expected the node to be leader of its fallback single-voter cluster")
+	}
+	if !strings.Contains(out.String(), "bootstrap fallback") {
+		t.Fatalf("expected a bootstrap-fallback log, got:\n%s", out.String())
+	}
+}
+
+// TestBootstrapFallbackSkippedWhenLeaderObserved is the RT-13067 safety check:
+// the fallback must NOT fire — and must not fork a competing cluster — when a
+// peer reports a live leader (HasLeader=true). The real leader is expected to
+// re-admit this node; the local voter stays configless, waiting, until that
+// happens.
+func TestBootstrapFallbackSkippedWhenLeaderObserved(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	out := &syncBuffer{}
+	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Warn})
+
+	disc := &announcingDiscovery{
+		peerID: "live-peer",
+		status: PeerStatus{HasLeader: true, NumVotersInConfig: 2},
+	}
+
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, newSnapFSM(),
+		WithLocalID("voter"),
+		WithTransport(tr),
+		WithDiscovery(disc),
+		WithBootstrapFallbackWait(300*time.Millisecond),
+		WithHclogLogger(logger),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+
+	// Wait well past the fallback window, then confirm it did NOT fire.
+	time.Sleep(1 * time.Second)
+
+	if c.IsLeader() {
+		t.Fatalf("fallback forked a competing cluster despite an observed leader")
+	}
+	if !c.hasEmptyConfig() {
+		t.Fatalf("node left its empty config without being admitted by a real leader")
+	}
+	if strings.Contains(out.String(), "bootstrap fallback") {
+		t.Fatalf("fallback fired despite an observed live leader:\n%s", out.String())
+	}
+}
+
 // TestBootstrapWarnsWhenServersIgnoredForDiscoveryVoter is the L5 regression
 // test. A discovery-enabled voter decides bootstrapping on its own, silently
 // ignoring an explicit WithServers/WithBootstrap. The misconfiguration must

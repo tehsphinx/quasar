@@ -36,6 +36,7 @@ type options struct {
 	pruneAfter         time.Duration
 	recoverQuorumAfter time.Duration
 	bootstrapWait      time.Duration
+	bootstrapFallback  time.Duration
 	noLeaderTimeout    time.Duration
 	hclogLogger        hclog.Logger
 	slogLogger         *slog.Logger
@@ -46,11 +47,12 @@ type options struct {
 
 func getOptions(opts []Option) options {
 	cfg := options{
-		cacheName:       "quasar",
-		localID:         uuid.NewString(),
-		suffrage:        raft.Voter,
-		noLeaderTimeout: defaultNoLeaderTimeout,
-		bootstrapWait:   defaultBootstrapWait,
+		cacheName:         "quasar",
+		localID:           uuid.NewString(),
+		suffrage:          raft.Voter,
+		noLeaderTimeout:   defaultNoLeaderTimeout,
+		bootstrapWait:     defaultBootstrapWait,
+		bootstrapFallback: defaultBootstrapFallback,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -238,6 +240,27 @@ func WithQuorumRecovery(after time.Duration) Option {
 func WithBootstrapWait(after time.Duration) Option {
 	return func(o *options) {
 		o.bootstrapWait = after
+	}
+}
+
+// WithBootstrapFallbackWait bounds the liveness fallback for the RT-12775
+// bootstrap-gating. When a voter skips its own single-node bootstrap because a
+// peer announced an established cluster (see WithBootstrapWait), it then waits
+// up to `after` for a leader to actually form. If the window elapses while this
+// node is still configless, still without a leader, and no peer has ever
+// reported a live leader, it bootstraps a single-voter cluster anyway — the
+// detected "established cluster" was stale/leaderless (every voter down, or a
+// surviving nonvoter advertising a stale multi-voter config), so waiting longer
+// only crash-loops. In a healthy cluster a peer always reports HasLeader, so
+// the fallback never fires and never forks; the real leader re-adds this node
+// within a ping cycle and the fallback aborts.
+//
+// Only effective when a Discovery is configured and a bootstrap was skipped.
+// Defaults to defaultBootstrapFallback (10s); pass a zero value to disable the
+// fallback and keep the pre-fix behavior (a skipped voter waits indefinitely).
+func WithBootstrapFallbackWait(after time.Duration) Option {
+	return func(o *options) {
+		o.bootstrapFallback = after
 	}
 }
 

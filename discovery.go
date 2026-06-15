@@ -107,6 +107,14 @@ type DiscoveryInjector struct {
 	peerInClusterOnce sync.Once
 	peerInClusterCh   chan struct{}
 
+	// sawLeaderPing is set the first time any non-self peer reports
+	// HasLeader=true. It distinguishes the two ways PeerInCluster can fire: a
+	// genuinely live cluster (some peer sees a leader) versus a stale,
+	// leaderless config still advertising NumVotersInConfig>=2. The RT-13067
+	// bootstrap-gating liveness fallback reads it to avoid forking a competing
+	// cluster when a real leader exists and will (re)admit this node.
+	sawLeaderPing atomic.Bool
+
 	// voterCount caches how many voters are in this node's raft
 	// configuration, self included. Re-derived from rft.GetConfiguration()
 	// (a non-blocking snapshot in raft v1.7.x) at regObservation time and
@@ -166,8 +174,13 @@ func (s *DiscoveryInjector) ProcessServer(srv raft.Server) {
 // must be reset before catch-up replication starts shipping the leader's
 // (older) snapshot on top of stale logs.
 func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status PeerStatus) {
-	if srv.ID != raft.ServerID(s.cache.localID) && status.inEstablishedCluster() {
-		s.peerInClusterOnce.Do(func() { close(s.peerInClusterCh) })
+	if srv.ID != raft.ServerID(s.cache.localID) {
+		if status.inEstablishedCluster() {
+			s.peerInClusterOnce.Do(func() { close(s.peerInClusterCh) })
+		}
+		if status.HasLeader {
+			s.sawLeaderPing.Store(true)
+		}
 	}
 
 	s.cache.noteLeaderInstanceID(srv.ID, status.InstanceID)
@@ -190,6 +203,14 @@ func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status Peer
 // no-ops on this channel.
 func (s *DiscoveryInjector) PeerInCluster() <-chan struct{} {
 	return s.peerInClusterCh
+}
+
+// observedLeaderPing reports whether any non-self peer has reported
+// HasLeader=true since this discovery injector started. Used by the RT-13067
+// bootstrap-gating liveness fallback to tell a live cluster (keep waiting to be
+// re-admitted) from a stale, leaderless one (bootstrap to break the wedge).
+func (s *DiscoveryInjector) observedLeaderPing() bool {
+	return s.sawLeaderPing.Load()
 }
 
 // LocalPeerStatus returns a snapshot of the local node's raft state for
