@@ -157,6 +157,60 @@ func TestBootstrapFallbackSkippedWhenLeaderObserved(t *testing.T) {
 	}
 }
 
+// TestBootstrapFallbackFiresWhenLeaderPingGoesStale is the RT-13067 age-out
+// regression test. A peer announces a live leader (HasLeader=true) exactly once
+// and then goes silent — the production case where the surviving node that
+// advertised the cluster was itself restarting and is now gone. Pre-age-out the
+// leader observation was sticky, so the fallback never fired and this voter
+// crash-looped until an operator restart cleared the flag. With the age-out the
+// stale leader ping is forgotten after a liveness window and the fallback must
+// bootstrap a single-voter cluster in-process.
+func TestBootstrapFallbackFiresWhenLeaderPingGoesStale(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	out := &syncBuffer{}
+	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Warn})
+
+	// HasLeader=true is announced once (in Run, before bootstrap) and never
+	// again, so the leader-ping signal ages out after aliveCutoff.
+	disc := &announcingDiscovery{
+		peerID: "departed-leader",
+		status: PeerStatus{HasLeader: true, NumVotersInConfig: 2},
+	}
+
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, newSnapFSM(),
+		WithLocalID("voter"),
+		WithTransport(tr),
+		WithDiscovery(disc),
+		// Short liveness window so the single leader ping ages out quickly.
+		WithAutoPrune(500*time.Millisecond),
+		WithBootstrapFallbackWait(200*time.Millisecond),
+		WithHclogLogger(logger),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+
+	// Bootstrap was skipped on the live-leader ping: configless to start with.
+	if !c.hasEmptyConfig() {
+		t.Fatalf("expected an empty config right after a skipped bootstrap")
+	}
+
+	// Once the stale leader ping ages out, the fallback must bootstrap and win.
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady after fallback: %v\nlog:\n%s", err, out.String())
+	}
+	if !c.IsLeader() {
+		t.Fatalf("expected the node to be leader of its fallback single-voter cluster")
+	}
+	if !strings.Contains(out.String(), "bootstrap fallback") {
+		t.Fatalf("expected a bootstrap-fallback log, got:\n%s", out.String())
+	}
+}
+
 // TestBootstrapWarnsWhenServersIgnoredForDiscoveryVoter is the L5 regression
 // test. A discovery-enabled voter decides bootstrapping on its own, silently
 // ignoring an explicit WithServers/WithBootstrap. The misconfiguration must

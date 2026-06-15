@@ -107,13 +107,18 @@ type DiscoveryInjector struct {
 	peerInClusterOnce sync.Once
 	peerInClusterCh   chan struct{}
 
-	// sawLeaderPing is set the first time any non-self peer reports
-	// HasLeader=true. It distinguishes the two ways PeerInCluster can fire: a
-	// genuinely live cluster (some peer sees a leader) versus a stale,
-	// leaderless config still advertising NumVotersInConfig>=2. The RT-13067
-	// bootstrap-gating liveness fallback reads it to avoid forking a competing
-	// cluster when a real leader exists and will (re)admit this node.
-	sawLeaderPing atomic.Bool
+	// sawLeaderPingAt is the UnixNano timestamp of the most recent ping from a
+	// non-self peer reporting HasLeader=true (0 until the first such ping). It
+	// distinguishes the two ways PeerInCluster can fire: a genuinely live cluster
+	// (some peer sees a leader) versus a stale, leaderless config still
+	// advertising NumVotersInConfig>=2. The RT-13067 bootstrap-gating liveness
+	// fallback reads it (via observedLeaderPing) to avoid forking a competing
+	// cluster when a real leader exists and will (re)admit this node. It is a
+	// timestamp rather than a sticky bool so the signal ages out: a leader that
+	// stops pinging (e.g. the surviving node was itself restarting and is now
+	// gone) no longer pins this voter for the whole process lifetime, which would
+	// otherwise force a restart to clear it.
+	sawLeaderPingAt atomic.Int64
 
 	// voterCount caches how many voters are in this node's raft
 	// configuration, self included. Re-derived from rft.GetConfiguration()
@@ -179,7 +184,7 @@ func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status Peer
 			s.peerInClusterOnce.Do(func() { close(s.peerInClusterCh) })
 		}
 		if status.HasLeader {
-			s.sawLeaderPing.Store(true)
+			s.sawLeaderPingAt.Store(time.Now().UnixNano())
 		}
 	}
 
@@ -205,12 +210,20 @@ func (s *DiscoveryInjector) PeerInCluster() <-chan struct{} {
 	return s.peerInClusterCh
 }
 
-// observedLeaderPing reports whether any non-self peer has reported
-// HasLeader=true since this discovery injector started. Used by the RT-13067
-// bootstrap-gating liveness fallback to tell a live cluster (keep waiting to be
-// re-admitted) from a stale, leaderless one (bootstrap to break the wedge).
-func (s *DiscoveryInjector) observedLeaderPing() bool {
-	return s.sawLeaderPing.Load()
+// observedLeaderPing reports whether a non-self peer has reported HasLeader=true
+// within the given window. Used by the RT-13067 bootstrap-gating liveness
+// fallback to tell a live cluster (keep waiting to be re-admitted) from a stale,
+// leaderless one (bootstrap to break the wedge). The window ages the signal out:
+// a live leader pings every discovery cadence, so a recent leader ping means a
+// real leader still exists; once leader pings stop for a full window the cluster
+// is treated as leaderless. A zero/negative window only matches a ping at the
+// current instant, i.e. effectively reports "no live leader".
+func (s *DiscoveryInjector) observedLeaderPing(window time.Duration) bool {
+	at := s.sawLeaderPingAt.Load()
+	if at == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, at)) <= window
 }
 
 // LocalPeerStatus returns a snapshot of the local node's raft state for

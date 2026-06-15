@@ -40,7 +40,13 @@ const (
 	// (gatex retries WaitReady 3×~10s ≈ 30s), so the wedge clears within a
 	// single process lifetime without pre-empting a healthy rejoin.
 	defaultBootstrapFallback = 10 * time.Second
-	observationChanSize      = 5
+	// bootstrapFallbackPoll is how often runBootstrapFallback re-checks, after
+	// its initial grace window, whether the established-cluster leader ping has
+	// gone stale. Comfortably below the discovery ping cadence (2-5s) so a leader
+	// that recovers keeps the fallback parked, and small relative to the liveness
+	// window so the wedge clears promptly once leader pings stop.
+	bootstrapFallbackPoll = 1 * time.Second
+	observationChanSize   = 5
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the
 	// discovery alive-window to expire. Sized for a healthy LAN: long
@@ -249,18 +255,25 @@ func (s *Cache) bootstrapCluster(rft *raft.Raft, configuration raft.Configuratio
 // voter skipped its single-node bootstrap because discovery reported an
 // established cluster. After the grace window it bootstraps a single-voter
 // cluster — but only if the announced cluster turned out to be stale and
-// leaderless. The fire-time guards make this safe in a healthy cluster:
+// leaderless. Two conditions end the wait early, both meaning a healthy rejoin
+// is underway so the fallback must not fork a competing cluster:
 //   - hasLeader(): a leader formed (this node was pulled in and is receiving
 //     heartbeats) → a normal rejoin happened, nothing to do.
 //   - hasEmptyConfig(): the local raft is still configless → if a real leader
 //     had added this node (AddVoter/AddNonvoter), the replicated config would
 //     be non-empty; a non-empty config means the rejoin is underway.
-//   - discovery.observedLeaderPing(): any peer ever reported HasLeader, i.e. a
-//     reachable leader exists out there and will (re)admit this node → keep
-//     waiting rather than fork a competing cluster.
 //
-// Only when all three say "no leader anywhere and we never joined" does the
-// fallback bootstrap, matching the RT-13034 wedge (stale-config peers
+// The third signal, discovery.observedLeaderPing(window), is now aged out rather
+// than sticky: a genuinely live leader pings every discovery cadence, so a
+// recent leader ping keeps the fallback waiting to be re-admitted. Only once no
+// leader ping has arrived for a full liveness window (aliveCutoff — the same
+// window used to declare a peer dead) is the cluster judged stale/leaderless and
+// the fallback bootstraps. This matters when the surviving node that advertised
+// the cluster was itself restarting and is now gone (RT-13067): a sticky "ever
+// saw a leader" signal pinned this voter for the whole process lifetime, forcing
+// a restart to clear it; with the age-out the wedge clears in-process.
+//
+// The fallback bootstrap matches the RT-13034 wedge (stale-config peers
 // advertising NumVotersInConfig>=2 while every voter is down). The fresh
 // single-voter leader then converges the stale peers via the Option I
 // instance-ID admission gate on their next ping.
@@ -274,8 +287,25 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, after time.Duration, t
 	case <-timer.C:
 	}
 
-	if s.hasLeader() || !s.hasEmptyConfig() || s.discovery.observedLeaderPing() {
-		return
+	// After the initial grace window, wait until the established-cluster ping
+	// that made us skip bootstrap has gone stale (no leader ping for a full
+	// liveness window) before forking a single-voter cluster. A live leader
+	// keeps pinging, so this loop keeps waiting and never competes with it.
+	window := s.aliveCutoff()
+	ticker := time.NewTicker(bootstrapFallbackPoll)
+	defer ticker.Stop()
+	for {
+		if s.hasLeader() || !s.hasEmptyConfig() {
+			return
+		}
+		if !s.discovery.observedLeaderPing(window) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 
 	rft := s.raft()
@@ -283,10 +313,11 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, after time.Duration, t
 		return
 	}
 
-	s.logger.Warn("bootstrap fallback: skipped bootstrap on an established-cluster ping but no leader formed within the grace window; bootstrapping single-voter cluster to break the wedge",
+	s.logger.Warn("bootstrap fallback: skipped bootstrap on an established-cluster ping but no leader formed and the leader ping went stale; bootstrapping single-voter cluster to break the wedge",
 		"local-id", s.localID,
 		"local-address", transport.LocalAddr(),
 		"fallback-wait", after,
+		"leader-ping-window", window,
 	)
 	s.setInstanceID(uuid.NewString())
 	s.bootstrapCluster(rft, raft.Configuration{
