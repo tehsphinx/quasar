@@ -280,7 +280,10 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 	localInst := s.cache.getInstanceID()
 	if s.cache.IsLeader() && localInst != "" && s.peerInstanceID(srv.ID) != localInst {
 		ctx, cancel := context.WithTimeout(s.cache.ctx, addServerHardResetTimeout)
-		r := s.cache.sendHardReset(ctx, srv, localInst)
+		// Admission wipe recovers raft consensus for a forked/ahead peer; it never
+		// wipes cache-only data (full=false). The peer converges to the leader's
+		// cache-only state via snapshot catch-up.
+		r := s.cache.sendHardReset(ctx, srv, localInst, false)
 		cancel()
 		if r != nil {
 			return r

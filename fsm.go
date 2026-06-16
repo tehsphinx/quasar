@@ -37,6 +37,16 @@ type FSM interface {
 	Reset() error
 }
 
+// FullResetter is an optional extension of FSM. When the FSM implements it,
+// quasar calls ResetFull(full) instead of Reset() when applying a reset,
+// passing whether stores that normally survive a reset must also be cleared (a
+// full reset; see ResetCache.full). Implementing it is optional and
+// non-breaking: an FSM that only implements Reset keeps working — quasar then
+// never performs a full reset.
+type FullResetter interface {
+	ResetFull(full bool) error
+}
+
 type logApplier interface {
 	Apply(log *raft.Log) interface{}
 }
@@ -118,7 +128,7 @@ func (s *fsmWrapper) apply(log *raft.Log, command *pb.Command) (*pb.CommandRespo
 	case *pb.Command_Store:
 		return s.store(log, cmd.Store)
 	case *pb.Command_ResetCache:
-		return nil, s.applyReset()
+		return nil, s.applyReset(cmd.ResetCache.GetFull())
 	default:
 		// fmt.Printf("%+v\n", command)
 		return nil, errors.New("fsmWrapper.apply: command not implemented")
@@ -202,7 +212,14 @@ func (s *fsmWrapper) applyRaftReset() {
 	s.resetSysUIDs()
 }
 
-func (s *fsmWrapper) applyReset() error {
+// applyReset clears the FSM. full selects a full reset: when true and the FSM
+// implements FullResetter, stores that normally survive a reset are also
+// cleared. An FSM that does not implement FullResetter is never reset fully
+// (full is ignored).
+func (s *fsmWrapper) applyReset(full bool) error {
+	if r, ok := s.fsm.(FullResetter); ok {
+		return r.ResetFull(full)
+	}
 	return s.fsm.Reset()
 }
 

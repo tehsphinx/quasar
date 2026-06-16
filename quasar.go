@@ -785,9 +785,9 @@ func (s *Cache) handleRPC(ctx context.Context, rpc raft.RPC) {
 		resp = &pb.StoreResponse{Uid: uid}
 	case *pb.ResetCache:
 		if cmd.Hard {
-			err = s.localHardReset(cmd.Uuid, cmd.GetInitiatorInstanceId())
+			err = s.localHardReset(cmd.Uuid, cmd.GetInitiatorInstanceId(), cmd.GetFull())
 		} else {
-			err = s.reset(ctx)
+			err = s.reset(ctx, cmd.GetFull())
 		}
 		resp = &pb.ResetCacheResponse{Uuid: cmd.Uuid}
 	case *pb.RemoveServer:
@@ -854,6 +854,23 @@ func (s *Cache) removeServer(id string) error {
 	return fut.Error()
 }
 
+// ResetOption configures Reset.
+type ResetOption func(*resetOpts)
+
+type resetOpts struct {
+	full bool
+}
+
+// WithFullReset turns Reset into a full reset: in addition to the normal clear,
+// the FSM also clears stores that would otherwise survive a reset (flare's
+// KeepOnReset, i.e. cache-only data with no source of truth). It is still
+// log-replicated through the normal apply path and triggers no raft reinit — it
+// is independent of HardReset. An FSM that does not implement FullResetter
+// ignores it.
+func WithFullReset() ResetOption {
+	return func(o *resetOpts) { o.full = true }
+}
+
 // Reset clears the cache content on every node by proposing a reset command
 // through the raft log. Like any committed entry it replicates to all current
 // members, is captured by post-reset snapshots, and replays on restart /
@@ -862,17 +879,25 @@ func (s *Cache) removeServer(id string) error {
 // after a snapshot restore). Issued against a healthy cluster: it requires a
 // leader+quorum to commit; with no leader it returns ErrNoLeader and the
 // operator should recover quorum first.
-func (s *Cache) Reset(ctx context.Context) error {
-	s.logger.Info("cache reset triggered")
-	return s.reset(ctx)
+//
+// By default it is a normal reset (KeepOnReset stores survive). Pass
+// WithFullReset to also clear those stores.
+func (s *Cache) Reset(ctx context.Context, opts ...ResetOption) error {
+	var o resetOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+	s.logger.Info("cache reset triggered", "full", o.full)
+	return s.reset(ctx, o.full)
 }
 
 // reset proposes the reset command through the normal apply path: applied
 // locally when this node is the leader, otherwise forwarded to the leader
 // (consume's ResetCache case calls back here on the leader side). The FSM
-// (gatexcache) decides what its Reset() actually clears.
-func (s *Cache) reset(ctx context.Context) error {
-	_, _, err := s.apply(ctx, cmdReset(), storeOpts{})
+// (gatexcache) decides what its Reset() actually clears; full asks it to also
+// clear stores that normally survive a reset.
+func (s *Cache) reset(ctx context.Context, full bool) error {
+	_, _, err := s.apply(ctx, cmdReset(full), storeOpts{})
 	return err
 }
 
@@ -888,7 +913,13 @@ func (s *Cache) reset(ctx context.Context) error {
 // A HardReset must be followed by a normal Reset once the cluster is stable
 // again, to re-anchor the reset in the new log history / snapshots — the hard
 // reset clears each FSM out-of-band, which on its own does not carry the
-// snapshot-regression guarantee the log-based reset provides (RT-12994).
+// snapshot-regression guarantee the log-based reset provides (RT-12994). When
+// WithFullReset is passed, the follow-up Reset should be full too, so the
+// cache-only clear is likewise re-anchored.
+//
+// hard (raft reinit) and full (also clear KeepOnReset stores) are orthogonal:
+// HardReset defaults to a non-full reset and clears only re-derivable data;
+// pass WithFullReset to also wipe the cache-only stores across the fan-out.
 //
 // HardReset must be issued from the node intended to survive as leader: the
 // initiator keeps its raft (localInitiatorReset) while every peer is wiped to
@@ -899,13 +930,18 @@ func (s *Cache) reset(ctx context.Context) error {
 // resetID rather than minting a fresh one, so peers already wiped by the
 // failed attempt dedup it (markResetID) and are not wiped a second time (m9).
 // A fresh resetID is minted only after a fully successful HardReset.
-func (s *Cache) HardReset(ctx context.Context) error {
+func (s *Cache) HardReset(ctx context.Context, opts ...ResetOption) error {
+	var o resetOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	servers, err := s.GetServerList()
 	if err != nil {
 		return err
 	}
 
-	s.logger.Info("hard cache reset triggered")
+	s.logger.Info("hard cache reset triggered", "full", o.full)
 
 	resetID := s.hardResetID()
 
@@ -914,11 +950,11 @@ func (s *Cache) HardReset(ctx context.Context) error {
 		if server.ID == raft.ServerID(s.localID) {
 			continue
 		}
-		if r := s.sendHardReset(ctx, server, resetID); r != nil {
+		if r := s.sendHardReset(ctx, server, resetID, o.full); r != nil {
 			retErrs = append(retErrs, r)
 		}
 	}
-	if r := s.localInitiatorReset(resetID); r != nil {
+	if r := s.localInitiatorReset(resetID, o.full); r != nil {
 		retErrs = append(retErrs, r)
 	}
 
@@ -959,14 +995,17 @@ func (s *Cache) recordHardResetResult(resetID string, ok bool) {
 // — the cluster would deadlock with empty configs (RT-13034). Keeping the
 // initiator's raft lets it (re)win the election against the now-reset peers and
 // catch them up via the standard heartbeat / AppendEntries path.
-func (s *Cache) localInitiatorReset(resetID string) error {
+func (s *Cache) localInitiatorReset(resetID string, full bool) error {
 	if !s.markResetID(resetID) {
 		return nil
 	}
 
 	s.logger.Info("hard reset: FSM cleared; keeping raft state on the reset initiator",
-		"local-id", s.localID, "reset-id", resetID)
-	return s.fsm.applyReset()
+		"local-id", s.localID, "reset-id", resetID, "full", full)
+	// full is orthogonal to the raft reinit: a plain hard reset clears only
+	// re-derivable data (full == false), while a full hard reset also wipes the
+	// cache-only (KeepOnReset) stores (see ResetCache.full).
+	return s.fsm.applyReset(full)
 }
 
 // sendHardReset sends an out-of-band hard ResetCache RPC to a single remote
@@ -974,10 +1013,11 @@ func (s *Cache) localInitiatorReset(resetID string) error {
 // carries this node's instance ID so the receiver adopts the initiator's
 // consensus-history line right at the wipe instead of waiting to re-adopt it
 // from a later discovery ping (RT-13067).
-func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID string) error {
+func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID string, full bool) error {
 	resp, err := s.transport.ResetCache(ctx, server.ID, server.Address, &pb.ResetCache{
 		Uuid:                resetID,
 		Hard:                true,
+		Full:                full,
 		InitiatorInstanceId: s.getInstanceID(),
 	})
 	if err != nil {
@@ -1014,7 +1054,7 @@ func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID s
 // the losing raft instance left running on the shared transport. The resetID
 // dedup check sits inside the lock so a duplicate RPC that waited out an
 // in-flight reset no-ops instead of wiping the node a second time.
-func (s *Cache) localHardReset(resetID, initiatorInstanceID string) error {
+func (s *Cache) localHardReset(resetID, initiatorInstanceID string, full bool) error {
 	s.recoveryMutex.Lock()
 	defer s.recoveryMutex.Unlock()
 
@@ -1024,16 +1064,16 @@ func (s *Cache) localHardReset(resetID, initiatorInstanceID string) error {
 
 	if s.IsLeader() {
 		s.logger.Info("hard reset: FSM cleared; keeping raft state because this node is leader",
-			"local-id", s.localID, "reset-id", resetID)
-		return s.fsm.applyReset()
+			"local-id", s.localID, "reset-id", resetID, "full", full)
+		return s.fsm.applyReset(full)
 	}
 
 	s.logger.Info("hard reset: reinitializing raft because this node is a follower",
-		"local-id", s.localID, "reset-id", resetID, "adopt-instance-id", initiatorInstanceID)
+		"local-id", s.localID, "reset-id", resetID, "adopt-instance-id", initiatorInstanceID, "full", full)
 	if initiatorInstanceID == "" {
 		s.setInstanceID("")
 	}
-	return s.reinitRaftAdoptingInstance(initiatorInstanceID)
+	return s.reinitRaftAdoptingInstance(initiatorInstanceID, full)
 }
 
 // reinitRaftAdoptingInstance tears down the local raft and rebuilds it on
@@ -1046,8 +1086,12 @@ func (s *Cache) localHardReset(resetID, initiatorInstanceID string) error {
 // (possibly older) snapshot. After reinit the leader still has us in its raft
 // configuration, so its heartbeats catch the fresh raft up via the standard
 // AppendEntries / InstallSnapshot probe-back path — no bootstrap here.
-func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string) error {
-	if err := s.fsm.applyReset(); err != nil {
+//
+// full forwards the full-reset flag to the FSM clear: a full hard reset wipes
+// the cache-only (KeepOnReset) stores too. Fork-history adoption passes false
+// (it recovers consensus, it does not wipe cache-only data).
+func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) error {
+	if err := s.fsm.applyReset(full); err != nil {
 		return err
 	}
 
@@ -1365,7 +1409,12 @@ func (s *Cache) recoverQuorum() error {
 	if snaps, err := s.snapshotStore.List(); err != nil {
 		return fmt.Errorf("list snapshots: %w", err)
 	} else if len(snaps) == 0 {
-		if err := s.fsm.applyReset(); err != nil {
+		// Not a full reset (full is reserved for an explicit operator full reset;
+		// recovery never wipes cache-only data on its own). This clear only gives
+		// the full-log replay an idempotent base (M2) — the replay rebuilds all
+		// cache content from the log, KeepOnReset stores included, so there is no
+		// need to clear those here.
+		if err := s.fsm.applyReset(false); err != nil {
 			return fmt.Errorf("reset fsm before log replay: %w", err)
 		}
 	}
@@ -1809,7 +1858,8 @@ func (s *Cache) adoptLeaderInstance(leaderID raft.ServerID, leaderInstanceID str
 		"local-instance-id", s.getInstanceID(),
 	)
 
-	if err := s.reinitRaftAdoptingInstance(leaderInstanceID); err != nil {
+	// Fork-history adoption recovers consensus; it never wipes cache-only data.
+	if err := s.reinitRaftAdoptingInstance(leaderInstanceID, false); err != nil {
 		s.logger.Error("instance-id reset failed", "error", err)
 	}
 }

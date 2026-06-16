@@ -19,9 +19,9 @@ func cmdLatestUID() *pb.Command {
 	}}
 }
 
-func cmdReset() *pb.Command {
+func cmdReset(full bool) *pb.Command {
 	return &pb.Command{Cmd: &pb.Command_ResetCache{
-		ResetCache: &pb.ResetCache{},
+		ResetCache: &pb.ResetCache{Full: full},
 	}}
 }
 

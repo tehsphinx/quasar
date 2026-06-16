@@ -81,7 +81,7 @@ func TestLocalHardResetSerializesWithRecovery(t *testing.T) {
 	c.recoveryMutex.Lock()
 
 	done := make(chan error, 1)
-	go func() { done <- c.localHardReset("reset-1", "") }()
+	go func() { done <- c.localHardReset("reset-1", "", false) }()
 
 	select {
 	case <-done:
@@ -139,7 +139,7 @@ func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
 		return nil, wantErr
 	}
 
-	if err := c.localHardReset("reset-1", ""); !errors.Is(err, wantErr) {
+	if err := c.localHardReset("reset-1", "", false); !errors.Is(err, wantErr) {
 		t.Fatalf("expected the rebuild error to propagate, got %v", err)
 	}
 	if got := calls.Load(); got != rebuildRaftAttempts {
@@ -192,7 +192,7 @@ func TestLocalHardResetAdoptsInitiatorInstanceID(t *testing.T) {
 
 	c.setInstanceID("stale-instance-id")
 
-	if err := c.localHardReset("reset-1", "initiator-instance-id"); err != nil {
+	if err := c.localHardReset("reset-1", "initiator-instance-id", false); err != nil {
 		t.Fatalf("localHardReset: %v", err)
 	}
 
@@ -215,7 +215,7 @@ func TestLocalHardResetClearsInstanceID(t *testing.T) {
 
 	c.setInstanceID("stale-instance-id")
 
-	if err := c.localHardReset("reset-1", ""); err != nil {
+	if err := c.localHardReset("reset-1", "", false); err != nil {
 		t.Fatalf("localHardReset: %v", err)
 	}
 
@@ -243,7 +243,7 @@ func TestLocalHardResetDeduplicatesConcurrentResets(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := c.localHardReset("reset-1", ""); err != nil {
+			if err := c.localHardReset("reset-1", "", false); err != nil {
 				t.Errorf("localHardReset: %v", err)
 			}
 		}()

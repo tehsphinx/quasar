@@ -76,6 +76,13 @@ message ResetCache {
   // (RT-13067). Empty when the initiator has no instance ID yet; the receiver then falls back to
   // clearing its own.
   string initiator_instance_id = 3;
+
+  // full requests a full reset: the FSM also clears stores that normally survive a reset (e.g.
+  // flare's KeepOnReset, cache-only data with no source of truth to re-derive from). It is
+  // independent of `hard`: a full reset is still log-replicated through the normal apply path and
+  // triggers no raft reinit. Used by an explicit operator hard reset to wipe cache-only data, while
+  // a no-leader auto-escalation leaves it false to preserve that data.
+  bool full = 4;
 }
 
 message ResetCacheResponse {
