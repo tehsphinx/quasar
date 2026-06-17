@@ -21,6 +21,13 @@ type storeOpts struct {
 	// leader may have applied the command before the reply / ack
 	// could be sent, and JetStream will redeliver to the next leader.
 	retry bool
+
+	// shardKey selects the persisted-FIFO partition this write is routed to.
+	// All writes sharing a key keep strict in-order delivery; different keys
+	// drain in parallel, so a stalled/retrying write only blocks its own
+	// shard instead of every subsequent write cluster-wide (RT-12964). Empty
+	// routes to the default shard. No-op when the transport is unsharded.
+	shardKey string
 }
 
 func resolveStoreOpts(opts []StoreOption) storeOpts {
@@ -51,5 +58,19 @@ func resolveStoreOpts(opts []StoreOption) storeOpts {
 func WithRetry() StoreOption {
 	return func(o *storeOpts) {
 		o.retry = true
+	}
+}
+
+// WithShardKey routes this Store call to the persisted-FIFO partition
+// selected by key. Writes that must stay mutually ordered (e.g. successive
+// updates to the same entity) must share a key; unrelated writes should use
+// different keys so they drain in parallel and never head-of-line block each
+// other (RT-12964). An empty key (the default) routes to shard 0.
+//
+// Only meaningful when the transport is configured with more than one shard
+// (see WithPersistedShards); ignored otherwise.
+func WithShardKey(key string) StoreOption {
+	return func(o *storeOpts) {
+		o.shardKey = key
 	}
 }

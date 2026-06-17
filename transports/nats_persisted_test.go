@@ -92,7 +92,7 @@ func TestNATSPersistedQueue_PublishConsumeReply(t *testing.T) {
 		drainErr <- nil
 	}()
 
-	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "lastseen", Data: []byte("42")})
+	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "lastseen", Data: []byte("42")}, PersistedStoreOpts{})
 	asrt.NoErr(err)
 	asrt.Equal(resp.Uid, uint64(99))
 
@@ -121,7 +121,7 @@ func TestNATSPersistedQueue_ReplyError(t *testing.T) {
 		}
 	}()
 
-	_, err = producer.StorePersisted(ctx, &pb.Store{Key: "k"})
+	_, err = producer.StorePersisted(ctx, &pb.Store{Key: "k"}, PersistedStoreOpts{})
 	asrt.True(err != nil)
 	asrt.Equal(err.Error(), applyErr.Error())
 
@@ -158,7 +158,7 @@ func TestNATSPersistedQueue_StreamManaged(t *testing.T) {
 
 	// Publishing before the stream exists fails, and crucially does not
 	// create the stream nor permanently cache the failure.
-	_, err = nonvoter.StorePersisted(ctx, &pb.Store{Key: "k"})
+	_, err = nonvoter.StorePersisted(ctx, &pb.Store{Key: "k"}, PersistedStoreOpts{})
 	asrt.True(err != nil)
 	_, err = js.Stream(ctx, streamName)
 	asrt.True(errors.Is(err, jetstream.ErrStreamNotFound))
@@ -174,23 +174,22 @@ func TestNATSPersistedQueue_StreamManaged(t *testing.T) {
 	}()
 
 	// The same nonvoter now binds to the existing stream and succeeds.
-	resp, err := nonvoter.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")})
+	resp, err := nonvoter.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")}, PersistedStoreOpts{})
 	asrt.NoErr(err)
 	asrt.Equal(resp.Uid, uint64(7))
 
 	asrt.NoErr(voter.StopPersistedConsumer())
 }
 
-// TestNATSPersistedQueue_RestartAfterConsumerDeleted is the RT-13042 M4
-// regression test. When the JetStream consumer dies server-side (deleted, or
-// an unrecoverable JS error), the puller goroutine exits and closes the items
-// channel — but the queue used to keep its q.consumer reference, so every
-// subsequent StartPersistedConsumer returned the dead consumer's CLOSED
-// channel: the death was permanent until a leadership flip plus an explicit
-// StopPersistedConsumer, stalling all persisted writes cluster-wide. With the
-// fix the dead consumer clears itself, so a restart creates a fresh consumer
-// that delivers again.
-func TestNATSPersistedQueue_RestartAfterConsumerDeleted(t *testing.T) {
+// TestNATSPersistedQueue_SelfHealAfterConsumerDeleted is the RT-12964
+// self-healing regression test. When a shard's JetStream consumer dies
+// server-side (deleted, or an unrecoverable JS error), that shard's puller
+// must rebuild itself in place — recreating the durable consumer and resuming
+// delivery — WITHOUT closing the shared items channel or requiring an explicit
+// StartPersistedConsumer restart. The items channel stays open the whole time,
+// so the apply loop keeps running and a fresh publish is delivered end to end
+// once the shard reconnects.
+func TestNATSPersistedQueue_SelfHealAfterConsumerDeleted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -202,36 +201,35 @@ func TestNATSPersistedQueue_RestartAfterConsumerDeleted(t *testing.T) {
 	ch, err := leader.StartPersistedConsumer(ctx)
 	asrt.NoErr(err)
 
+	// A single apply loop drains the channel for the whole test. If self-heal
+	// closed the channel this range would exit and the post-deletion publish
+	// below would hang.
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		for item := range ch {
+			_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 11})
+		}
+	}()
+
 	// Kill the consumer server-side, as an operator or stream rebuild would.
 	js, err := jetstream.New(leader.conn)
 	asrt.NoErr(err)
 	asrt.NoErr(js.DeleteConsumer(ctx, streamName, persistedConsumerNamePrefix))
 
-	// The puller loop notices — at the latest via missed idle heartbeats —
-	// and closes the items channel.
-	select {
-	case _, ok := <-ch:
-		if ok {
-			t.Fatal("unexpected item delivered after consumer deletion")
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("items channel did not close after the JetStream consumer was deleted")
-	}
-
-	// Restarting must yield a LIVE consumer — not the dead one's closed
-	// channel — and deliver a fresh publish end to end.
-	ch2, err := leader.StartPersistedConsumer(ctx)
-	asrt.NoErr(err)
-
-	go func() {
-		for item := range ch2 {
-			_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 11})
-		}
-	}()
-
-	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")})
+	// The shard notices — at the latest via missed idle heartbeats — rebuilds
+	// its durable consumer and resumes. A fresh publish is delivered end to end
+	// on the SAME channel with no explicit restart.
+	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")}, PersistedStoreOpts{})
 	asrt.NoErr(err)
 	asrt.Equal(resp.Uid, uint64(11))
+
+	// The channel must not have closed during self-heal.
+	select {
+	case <-closed:
+		t.Fatal("items channel closed during self-heal; the shard should rebuild in place")
+	default:
+	}
 
 	asrt.NoErr(leader.StopPersistedConsumer())
 }
@@ -252,7 +250,7 @@ func TestNATSPersistedQueue_NotConfigured(t *testing.T) {
 
 	asrt.Equal(tr.SupportsPersisted(), false)
 
-	_, err = tr.StorePersisted(ctx, &pb.Store{Key: "k"})
+	_, err = tr.StorePersisted(ctx, &pb.Store{Key: "k"}, PersistedStoreOpts{})
 	asrt.True(errors.Is(err, ErrPersistedNotSupported))
 
 	_, err = tr.StartPersistedConsumer(ctx)

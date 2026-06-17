@@ -29,7 +29,8 @@ const persistedConsumerRestartDelay = 500 * time.Millisecond
 // Without WithRetry() we return the underlying error unwrapped, which
 // stays compatible with today's ErrNoLeader-returning callers.
 func (s *Cache) routePersisted(ctx context.Context, storeCmd *pb.Store, opts storeOpts) (*pb.CommandResponse, uint64, error) {
-	resp, err := s.transport.StorePersisted(ctx, storeCmd)
+	pOpts := transports.PersistedStoreOpts{ShardKey: opts.shardKey}
+	resp, err := s.transport.StorePersisted(ctx, storeCmd, pOpts)
 	if err != nil {
 		err = reattachNoLeader(err)
 		if opts.retry && ctxTimedOut(ctx, err) {

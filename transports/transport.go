@@ -36,6 +36,19 @@ var ErrPersistedNotSupported = errors.New("transport does not support persisted 
 // it again (RT-13042 M5).
 var ErrAlreadySettled = errors.New("persisted item already settled")
 
+// PersistedStoreOpts carries per-call routing metadata from the cache to the
+// persisted-FIFO transport. It travels with the published message (NATS
+// header / in-memory item field) so the consuming leader — which may be a
+// different node than the publisher — can honor it (RT-12964).
+type PersistedStoreOpts struct {
+	// ShardKey selects the FIFO partition this command is routed to. All
+	// commands sharing a key keep strict in-order delivery; different keys
+	// drain in parallel, so a stalled/retrying write only blocks its own
+	// shard rather than every subsequent write cluster-wide. Empty routes to
+	// the default shard.
+	ShardKey string
+}
+
 // Transport defines an extended raft.Transport with additional commands for the cache.
 type Transport interface {
 	raft.Transport
@@ -79,7 +92,10 @@ type Transport interface {
 	//
 	// Returns when the leader replies, when ctx is done, or when the
 	// transport-level publish fails.
-	StorePersisted(ctx context.Context, command *pb.Store) (*pb.StoreResponse, error)
+	//
+	// opts carries routing (ShardKey) metadata that is published alongside the
+	// command so the consuming leader routes it to the right shard.
+	StorePersisted(ctx context.Context, command *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error)
 
 	// StartPersistedConsumer begins draining the persisted-FIFO stream on
 	// this node and returns a channel of PersistedItem. Called by the

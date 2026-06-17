@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"time"
 
@@ -47,6 +48,15 @@ const (
 	// seconds and the consumer can be restarted (RT-13042 M4).
 	persistedPullHeartbeat = 5 * time.Second
 
+	// persistedReconnectBackoff / persistedReconnectMaxBackoff bound the
+	// retry loop a shard runs after its pull subscription dies spontaneously
+	// (JS consumer deleted/rebuilt server-side, missed heartbeats, transient
+	// JS error). A dead shard rebuilds only itself, leaving the sibling shards
+	// draining, so the backoff just keeps a shard that can't reconnect yet
+	// (e.g. JS briefly unavailable) from hot-looping until it recovers.
+	persistedReconnectBackoff    = 250 * time.Millisecond
+	persistedReconnectMaxBackoff = 5 * time.Second
+
 	// persistedReplyHeader carries the publisher's reply-inbox subject
 	// across the JetStream hop. We can't use the wire-level Reply field
 	// because JetStream rewrites it to the ack-inbox subject when the
@@ -63,12 +73,14 @@ type natsPersistedQueue struct {
 	conn          *nats.Conn
 	js            jetstream.JetStream
 	streamName    string
+	subjectBase   string
 	subject       string
 	subjectFilter string
 	ackWait       time.Duration
 	maxAge        time.Duration
 	maxDeliver    int
 	replicas      int
+	shards        int
 	manageStream  bool
 	logger        hclog.Logger
 
@@ -84,7 +96,7 @@ type natsPersistedQueue struct {
 	// consumerM serializes Start/StopPersistedConsumer on this
 	// transport.
 	consumerM sync.Mutex
-	consumer  *natsPersistedConsumer
+	group     *natsPersistedConsumerGroup
 }
 
 // natsPersistedQueueConfig captures the construction-time parameters
@@ -96,6 +108,7 @@ type natsPersistedQueueConfig struct {
 	maxAge       time.Duration
 	maxDeliver   int
 	replicas     int
+	shards       int
 	manageStream bool
 }
 
@@ -114,6 +127,11 @@ func newNatsPersistedQueue(conn *nats.Conn, cacheName string, cfg natsPersistedQ
 	}
 	subject := fmt.Sprintf("quasar.%s.queue", cacheName)
 
+	shards := cfg.shards
+	if shards < 1 {
+		shards = 1
+	}
+
 	js, err := jetstream.New(conn)
 	if err != nil {
 		return nil, fmt.Errorf("init jetstream: %w", err)
@@ -127,12 +145,14 @@ func newNatsPersistedQueue(conn *nats.Conn, cacheName string, cfg natsPersistedQ
 		conn:          conn,
 		js:            js,
 		streamName:    streamName,
+		subjectBase:   subject,
 		subject:       subject + ".msg",
 		subjectFilter: subject + ".>",
 		ackWait:       cfg.ackWait,
 		maxDeliver:    cfg.maxDeliver,
 		maxAge:        cfg.maxAge,
 		replicas:      cfg.replicas,
+		shards:        shards,
 		manageStream:  cfg.manageStream,
 		logger:        hclog.New(&hclog.LoggerOptions{Name: "quasar-persisted"}),
 	}, nil
@@ -182,8 +202,9 @@ func (q *natsPersistedQueue) ensureStream(ctx context.Context) (jetstream.Stream
 }
 
 // publish marshals cmd onto the JS work-queue and blocks on a NATS
-// request-reply inbox for the leader's reply.
-func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store) (*pb.StoreResponse, error) {
+// request-reply inbox for the leader's reply. opts.ShardKey selects the FIFO
+// partition (RT-12964).
+func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error) {
 	if _, err := q.ensureStream(ctx); err != nil {
 		return nil, err
 	}
@@ -202,7 +223,7 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store) (*pb.St
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 
-	msg := nats.NewMsg(q.subject)
+	msg := nats.NewMsg(q.shardSubject(opts.ShardKey))
 	msg.Header.Set(persistedReplyHeader, inbox)
 	msg.Data = bts
 	if _, err = q.js.PublishMsg(ctx, msg); err != nil {
@@ -224,16 +245,24 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store) (*pb.St
 	return protoResp.GetStore(), nil
 }
 
-// startConsumer creates / opens the pull consumer and begins draining
-// the queue. Returns a channel of PersistedItem; close signals consumer
-// shutdown. Only one consumer is active per node at a time; concurrent
-// callers reuse the active consumer.
+// startConsumer creates / opens the per-shard pull consumers and begins
+// draining the queue. Returns a single channel of PersistedItem that fans in
+// every shard; close signals consumer shutdown. Only one consumer group is
+// active per node at a time; concurrent callers reuse the active group.
+//
+// Sharding (RT-12964): each of the q.shards partitions gets its own durable
+// consumer with MaxAckPending = 1, so writes stay strictly in order WITHIN a
+// shard while independent shards drain in parallel — a write that is stalling
+// or being redelivered only blocks its own shard, not every subsequent write
+// cluster-wide. With q.shards == 1 this is byte-for-byte the original
+// single-consumer behaviour (durable name and unfiltered subscription
+// unchanged), so existing deployments are unaffected.
 func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan PersistedItem, error) {
 	q.consumerM.Lock()
 	defer q.consumerM.Unlock()
 
-	if q.consumer != nil {
-		return q.consumer.items, nil
+	if q.group != nil {
+		return q.group.items, nil
 	}
 
 	stream, err := q.ensureStream(ctx)
@@ -241,54 +270,61 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan Persiste
 		return nil, err
 	}
 
-	// Durable consumer name keyed to the stream so a leadership flip
-	// resumes from the same pending state instead of starting from the
-	// beginning. The leader-flip handover happens by cancelling the
-	// previous consumer's puller (which Naks any in-flight item) and
-	// starting a fresh pull on the same durable.
-	consumerCfg := jetstream.ConsumerConfig{
-		Durable:       persistedConsumerNamePrefix,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		MaxAckPending: 1,
-		AckWait:       q.ackWait,
-		MaxDeliver:    q.maxDeliver,
-	}
-	jsConsumer, err := stream.CreateOrUpdateConsumer(ctx, consumerCfg)
-	if err != nil {
-		return nil, fmt.Errorf("create persisted consumer: %w", err)
-	}
-
 	pullCtx, cancel := context.WithCancel(context.Background())
-	mctx, err := jsConsumer.Messages(jetstream.PullHeartbeat(persistedPullHeartbeat))
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("start persisted messages context: %w", err)
-	}
 
 	items := make(chan PersistedItem)
-	c := &natsPersistedConsumer{
-		queue:  q,
+	g := &natsPersistedConsumerGroup{
 		items:  items,
 		cancel: cancel,
-		mctx:   mctx,
 	}
-	q.consumer = c
 
-	go c.run(pullCtx)
+	// Create each shard's consumer and open its pull subscription first; only
+	// launch the puller goroutines once all succeeded, so a mid-loop failure
+	// tears down cleanly without leaking half-started pullers.
+	for i := 0; i < q.shards; i++ {
+		c := &natsPersistedConsumer{
+			queue: q,
+			items: items,
+			shard: i,
+			group: g,
+		}
+		if r := c.connect(ctx, stream); r != nil {
+			g.stopContexts()
+			cancel()
+			return nil, r
+		}
+		g.consumers = append(g.consumers, c)
+	}
+
+	g.launch(pullCtx)
+
+	// Close the shared items channel once every puller has exited. A shard
+	// that dies spontaneously now rebuilds itself in place and keeps running
+	// (see run), so this only fires on a real stop (leadership loss / ctx
+	// cancel). Closing the channel is what makes the cache's apply loop
+	// observe the stop; the clearGroup belt-and-suspenders restart path
+	// remains for the degenerate case of every puller exiting (RT-13042 M4).
+	go func() {
+		g.wg.Wait()
+		close(items)
+		q.clearGroup(g)
+	}()
+
+	q.group = g
 	return items, nil
 }
 
-// stopConsumer cancels the active consumer goroutine and Naks the
-// in-flight item (if any) so the next leader picks it up immediately.
+// stopConsumer cancels the active consumer group and Naks each shard's
+// in-flight item (if any) so the next leader picks them up immediately.
 func (q *natsPersistedQueue) stopConsumer() error {
 	q.consumerM.Lock()
 	defer q.consumerM.Unlock()
-	if q.consumer == nil {
+	if q.group == nil {
 		return nil
 	}
-	c := q.consumer
-	q.consumer = nil
-	c.stop()
+	g := q.group
+	q.group = nil
+	g.stop()
 	return nil
 }
 
@@ -301,167 +337,55 @@ func (q *natsPersistedQueue) settleWait() time.Duration {
 	return defaultPersistedAckWait
 }
 
-// clearConsumer drops the active-consumer reference if it still points at c.
-// Called from the puller goroutine's exit path: when the consumer dies
-// spontaneously (e.g. the JetStream consumer was deleted server-side or hit
-// an unrecoverable JS error) the queue must not keep handing the dead
-// consumer's closed items channel out of startConsumer — that would make
-// the death permanent until a leadership flip AND an explicit
-// StopPersistedConsumer (RT-13042 M4). On the regular stop path
-// stopConsumer has already cleared the reference, so this is a no-op.
-func (q *natsPersistedQueue) clearConsumer(c *natsPersistedConsumer) {
+// clearGroup drops the active-group reference if it still points at g.
+// Called from the group's closer goroutine once every puller has exited.
+// A shard that dies spontaneously now rebuilds itself in place rather than
+// exiting, so on the regular stop path stopConsumer has already cleared the
+// reference and this is a no-op. It remains as a safety net for the degenerate
+// case of every puller exiting without a stopConsumer: the queue must not keep
+// handing the dead group's closed items channel out of startConsumer, or the
+// death would persist until a leadership flip AND an explicit
+// StopPersistedConsumer (RT-13042 M4).
+func (q *natsPersistedQueue) clearGroup(g *natsPersistedConsumerGroup) {
 	q.consumerM.Lock()
-	if q.consumer == c {
-		q.consumer = nil
+	if q.group == g {
+		q.group = nil
 	}
 	q.consumerM.Unlock()
 }
 
-// natsPersistedConsumer wraps the JS Messages pull context and the
-// outgoing PersistedItem channel.
-type natsPersistedConsumer struct {
-	queue  *natsPersistedQueue
-	items  chan PersistedItem
-	cancel context.CancelFunc
-	mctx   jetstream.MessagesContext
-
-	inflightM sync.Mutex
-	inflight  *natsPersistedItem
+// shardDurable returns the durable consumer name for shard i. With a single
+// shard it is the original unsuffixed name so existing durables are reused.
+func (q *natsPersistedQueue) shardDurable(i int) string {
+	if q.shards <= 1 {
+		return persistedConsumerNamePrefix
+	}
+	return fmt.Sprintf("%s-s%d", persistedConsumerNamePrefix, i)
 }
 
-// run is the puller loop: pull one message, hand it to the consumer
-// channel, repeat. With MaxAckPending = 1, JetStream itself enforces
-// the strict-FIFO single-in-flight invariant; we just need to keep up
-// the conventional ack/nak protocol.
-func (c *natsPersistedConsumer) run(ctx context.Context) {
-	defer close(c.items)
-	defer c.mctx.Stop()
-	defer c.queue.clearConsumer(c)
-	for {
-		msg, err := c.mctx.Next()
-		if err != nil {
-			// Either ctx canceled (Stop drained the context) or the
-			// consumer is being torn down. Either way, exit.
-			return
-		}
-
-		if ok := c.consume(ctx, msg); !ok {
-			return
-		}
-	}
+// shardFilter returns the subject filter for shard i's consumer.
+func (q *natsPersistedQueue) shardFilter(i int) string {
+	return fmt.Sprintf("%s.s%d.>", q.subjectBase, i)
 }
 
-// consume is the puller loop's message handler. It returns true if the
-// consumer should continue, false if it should exit.
-func (c *natsPersistedConsumer) consume(ctx context.Context, msg jetstream.Msg) bool {
-	item := &natsPersistedItem{
-		queue:   c.queue,
-		msg:     msg,
-		settled: make(chan struct{}),
+// shardSubject returns the publish subject for the given routing key. Keys
+// hash deterministically to a shard so all writes for one key keep their
+// relative order; an empty key routes to shard 0. With a single shard the
+// original subject is used unchanged.
+func (q *natsPersistedQueue) shardSubject(key string) string {
+	if q.shards <= 1 {
+		return q.subject
 	}
-	c.setInflight(item)
-	defer c.clearInflight(item)
-
-	// Terminal-delivery detection (RT-13042 M19): once NumDelivered reaches
-	// MaxDeliver, JetStream will not redeliver this message again. With
-	// WorkQueue retention and no DLQ that means a Nack here (e.g. another
-	// leader flip) drops the "persisted" write for good. We still process
-	// the delivery — most terminal deliveries do apply successfully — but we
-	// log loudly so an operator sees a write that is one Nack away from
-	// being lost rather than losing it silently.
-	if c.queue.maxDeliver > 0 {
-		if meta, mErr := msg.Metadata(); mErr == nil && meta.NumDelivered >= uint64(c.queue.maxDeliver) {
-			c.queue.logger.Error("persisted write reached terminal delivery; a further Nack will silently drop it",
-				"subject", msg.Subject(),
-				"num_delivered", meta.NumDelivered,
-				"max_deliver", c.queue.maxDeliver,
-			)
-		}
-	}
-
-	// Decode the command. If decoding fails we cannot deliver
-	// it to the consumer loop meaningfully — reject with
-	// `Term` (ack as a terminal failure so JetStream doesn't
-	// redeliver poison messages indefinitely) and continue.
-	var protoMsg pb.Store
-	if r := proto.Unmarshal(msg.Data(), &protoMsg); r != nil {
-		_ = c.replyDecodeError(item, r)
-		return true
-	}
-	item.command = &protoMsg
-
-	select {
-	case c.items <- item:
-	case <-ctx.Done():
-		// Consumer is going away. Nak the in-flight item so the
-		// next claimant gets it without waiting for AckWait.
-		_ = item.Nack(context.Background())
-		return false
-	}
-	// Wait for the consumer to settle the item before fetching
-	// the next one. With MaxAckPending = 1 the next Next() call
-	// would block on the server side anyway, but waiting locally
-	// also gives us a deterministic place to observe ctx
-	// cancellation against an unsettled inflight item.
-	select {
-	case <-item.settled:
-	case <-ctx.Done():
-		// The item is with the apply loop and may already be committed to
-		// raft. An immediate Nack here could void that successful apply:
-		// ReplySuccess loses the settle race, the publisher's reply never
-		// goes out, and the next leader applies the same command a second
-		// time. Prefer letting the in-flight apply settle, bounded by
-		// AckWait — past that JetStream redelivers anyway (RT-13042 M5).
-		select {
-		case <-item.settled:
-		case <-time.After(c.queue.settleWait()):
-			_ = item.Nack(context.Background())
-		}
-		return false
-	}
-	return true
+	return fmt.Sprintf("%s.s%d.msg", q.subjectBase, q.shardOf(key))
 }
 
-func (c *natsPersistedConsumer) setInflight(item *natsPersistedItem) {
-	c.inflightM.Lock()
-	c.inflight = item
-	c.inflightM.Unlock()
-}
-
-func (c *natsPersistedConsumer) clearInflight(item *natsPersistedItem) {
-	c.inflightM.Lock()
-	if c.inflight == item {
-		c.inflight = nil
+func (q *natsPersistedQueue) shardOf(key string) int {
+	if q.shards <= 1 || key == "" {
+		return 0
 	}
-	c.inflightM.Unlock()
-}
-
-func (c *natsPersistedConsumer) stop() {
-	c.cancel()
-	c.mctx.Stop()
-	c.inflightM.Lock()
-	in := c.inflight
-	c.inflightM.Unlock()
-	if in == nil {
-		return
-	}
-	// Same reasoning as the ctx.Done branch in consume: the in-flight item
-	// may be mid-apply on the loop side, so give it a bounded chance to
-	// settle before nacking it for redelivery (RT-13042 M5).
-	select {
-	case <-in.settled:
-	case <-time.After(c.queue.settleWait()):
-		_ = in.Nack(context.Background())
-	}
-}
-
-func (c *natsPersistedConsumer) replyDecodeError(item *natsPersistedItem, decodeErr error) error {
-	protoResp := &pb.CommandResponse{Error: decodeErr.Error()}
-	bts, _ := proto.Marshal(protoResp)
-	if reply := persistedReplyInbox(item.msg); reply != "" {
-		_ = c.queue.conn.Publish(reply, bts)
-	}
-	return item.msg.Ack()
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(q.shards))
 }
 
 // persistedReplyInbox extracts the publisher's reply-inbox subject from
@@ -475,83 +399,6 @@ func persistedReplyInbox(msg jetstream.Msg) string {
 		}
 	}
 	return msg.Reply()
-}
-
-// natsPersistedItem implements PersistedItem on top of a JetStream Msg.
-type natsPersistedItem struct {
-	queue   *natsPersistedQueue
-	msg     jetstream.Msg
-	command *pb.Store
-
-	settledM    sync.Mutex
-	settledDone bool
-	settled     chan struct{}
-}
-
-func (i *natsPersistedItem) Command() *pb.Store {
-	return i.command
-}
-
-// beginSettle claims the right to settle this item. It returns false when
-// the item was already settled — the caller lost the race and must not
-// touch the underlying message again. A lost race is reported to the loser
-// as ErrAlreadySettled (RT-13042 M5): silently no-oping made a Nack that
-// voided a successful apply undetectable on the apply side.
-func (i *natsPersistedItem) beginSettle() bool {
-	i.settledM.Lock()
-	defer i.settledM.Unlock()
-
-	if i.settledDone {
-		return false
-	}
-	i.settledDone = true
-	return true
-}
-
-func (i *natsPersistedItem) ReplySuccess(_ context.Context, resp *pb.StoreResponse) error {
-	return i.terminate(&pb.CommandResponse{Resp: &pb.CommandResponse_Store{Store: resp}}, true)
-}
-
-func (i *natsPersistedItem) ReplyError(_ context.Context, err error) error {
-	return i.terminate(&pb.CommandResponse{Error: err.Error()}, true)
-}
-
-func (i *natsPersistedItem) Nack(_ context.Context) error {
-	if !i.beginSettle() {
-		return ErrAlreadySettled
-	}
-	err := i.msg.Nak()
-	close(i.settled)
-	return err
-}
-
-func (i *natsPersistedItem) terminate(protoResp *pb.CommandResponse, ack bool) error {
-	if !i.beginSettle() {
-		return ErrAlreadySettled
-	}
-	defer close(i.settled)
-
-	bts, mErr := proto.Marshal(protoResp)
-	if mErr != nil {
-		// Even on marshal failure we need to ack to avoid
-		// poison-message redelivery storms; the publisher will
-		// time out and surface its own error.
-		_ = i.msg.Ack()
-		return mErr
-	}
-
-	var err error
-	if reply := persistedReplyInbox(i.msg); reply != "" {
-		if pErr := i.queue.conn.Publish(reply, bts); pErr != nil {
-			err = pErr
-		}
-	}
-	if ack {
-		if aErr := i.msg.Ack(); aErr != nil && err == nil {
-			err = aErr
-		}
-	}
-	return err
 }
 
 // sanitizeStreamName replaces JetStream-illegal characters (dots,
