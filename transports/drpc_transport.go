@@ -178,7 +178,7 @@ func (s *DRPCTransport) SupportsPersisted() bool {
 
 // StorePersisted always returns ErrPersistedNotSupported for the DRPC
 // transport.
-func (s *DRPCTransport) StorePersisted(_ context.Context, _ *pb.Store) (*pb.StoreResponse, error) {
+func (s *DRPCTransport) StorePersisted(_ context.Context, _ *pb.Store, _ PersistedStoreOpts) (*pb.StoreResponse, error) {
 	return nil, ErrPersistedNotSupported
 }
 

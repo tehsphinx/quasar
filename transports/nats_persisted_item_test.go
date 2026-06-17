@@ -87,17 +87,16 @@ func TestNatsPersistedConsumer_StopPrefersSettleOverNack(t *testing.T) {
 	pullCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := &natsPersistedConsumer{
-		queue:  item.queue,
-		items:  make(chan PersistedItem),
-		cancel: cancel,
-		mctx:   noopMessagesContext{ctx: pullCtx},
+		queue: item.queue,
+		items: make(chan PersistedItem),
+		mctx:  noopMessagesContext{ctx: pullCtx},
 	}
 	c.setInflight(item)
 
 	// Leadership flip: stop() runs while the apply loop is mid-apply.
 	stopped := make(chan struct{})
 	go func() {
-		c.stop()
+		c.drainInflight()
 		close(stopped)
 	}()
 
@@ -132,14 +131,13 @@ func TestNatsPersistedConsumer_StopNacksUnsettledItem(t *testing.T) {
 	pullCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := &natsPersistedConsumer{
-		queue:  item.queue,
-		items:  make(chan PersistedItem),
-		cancel: cancel,
-		mctx:   noopMessagesContext{ctx: pullCtx},
+		queue: item.queue,
+		items: make(chan PersistedItem),
+		mctx:  noopMessagesContext{ctx: pullCtx},
 	}
 	c.setInflight(item)
 
-	c.stop()
+	c.drainInflight()
 
 	if got := msg.naked.Load(); got != 1 {
 		t.Fatalf("unsettled in-flight item naked %d times, want 1", got)

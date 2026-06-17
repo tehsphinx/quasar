@@ -30,10 +30,9 @@ func TestNatsPersistedConsumer_TerminalDeliveryLogged(t *testing.T) {
 	// delivery check instead of blocking on the items channel.
 	cancel()
 	c := &natsPersistedConsumer{
-		queue:  q,
-		items:  make(chan PersistedItem),
-		cancel: cancel,
-		mctx:   noopMessagesContext{ctx: pullCtx},
+		queue: q,
+		items: make(chan PersistedItem),
+		mctx:  noopMessagesContext{ctx: pullCtx},
 	}
 
 	msg := &fakeJSMsg{numDelivered: uint64(q.maxDeliver)}
@@ -56,10 +55,9 @@ func TestNatsPersistedConsumer_NonTerminalDeliveryNotLogged(t *testing.T) {
 	pullCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	c := &natsPersistedConsumer{
-		queue:  q,
-		items:  make(chan PersistedItem),
-		cancel: cancel,
-		mctx:   noopMessagesContext{ctx: pullCtx},
+		queue: q,
+		items: make(chan PersistedItem),
+		mctx:  noopMessagesContext{ctx: pullCtx},
 	}
 
 	msg := &fakeJSMsg{numDelivered: 1}

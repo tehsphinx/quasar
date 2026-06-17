@@ -46,7 +46,7 @@ func TestInmemQueueHub_PublishConsumeReplySuccess(t *testing.T) {
 		drainErr <- nil
 	}()
 
-	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "k1", Data: []byte("v1")})
+	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "k1", Data: []byte("v1")}, PersistedStoreOpts{})
 	asrt.NoErr(err)
 	asrt.Equal(resp.Uid, uint64(42))
 
@@ -77,7 +77,7 @@ func TestInmemQueueHub_ReplyError(t *testing.T) {
 		}
 	}()
 
-	_, err = producer.StorePersisted(ctx, &pb.Store{Key: "k1"})
+	_, err = producer.StorePersisted(ctx, &pb.Store{Key: "k1"}, PersistedStoreOpts{})
 	asrt.True(err != nil)
 	asrt.Equal(err.Error(), applyErr.Error())
 
@@ -109,7 +109,7 @@ func TestInmemQueueHub_NackRequeuesToNextConsumer(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		r, e := producer.StorePersisted(ctx, &pb.Store{Key: "kFlip"})
+		r, e := producer.StorePersisted(ctx, &pb.Store{Key: "kFlip"}, PersistedStoreOpts{})
 		publishResult <- struct {
 			resp *pb.StoreResponse
 			err  error
@@ -180,7 +180,7 @@ func TestInmemQueueHub_FIFOOrder(t *testing.T) {
 	for i := 0; i < N; i++ {
 		k := "k" + time.Now().Format("150405.000000") + "_" + string(rune('a'+i))
 		keys = append(keys, k)
-		_, err := producer.StorePersisted(ctx, &pb.Store{Key: k})
+		_, err := producer.StorePersisted(ctx, &pb.Store{Key: k}, PersistedStoreOpts{})
 		asrt.NoErr(err)
 	}
 
@@ -210,7 +210,7 @@ func TestInmemQueueHub_PublisherCtxCancelDropsPending(t *testing.T) {
 	// in the queue with nobody draining it.
 	publishCtx, cancelPublish := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancelPublish()
-	_, err := producer.StorePersisted(publishCtx, &pb.Store{Key: "ghost"})
+	_, err := producer.StorePersisted(publishCtx, &pb.Store{Key: "ghost"}, PersistedStoreOpts{})
 	asrt.True(errors.Is(err, context.DeadlineExceeded))
 
 	// Start the consumer; it must NOT receive the cancelled item.

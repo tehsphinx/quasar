@@ -524,7 +524,7 @@ func (s *TCPTransport) SupportsPersisted() bool {
 
 // StorePersisted always returns ErrPersistedNotSupported for the TCP
 // transport.
-func (s *TCPTransport) StorePersisted(_ context.Context, _ *pb.Store) (*pb.StoreResponse, error) {
+func (s *TCPTransport) StorePersisted(_ context.Context, _ *pb.Store, _ PersistedStoreOpts) (*pb.StoreResponse, error) {
 	return nil, ErrPersistedNotSupported
 }
 

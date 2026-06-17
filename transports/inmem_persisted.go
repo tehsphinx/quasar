@@ -81,7 +81,9 @@ func WithInmemPersistedQueue(hub *InmemQueueHub) func(*InmemTransport) {
 
 // publish enqueues a Store command and blocks until the active
 // consumer either replies or the context is cancelled.
-func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store) (*pb.StoreResponse, error) {
+// The inmem hub is a single un-sharded queue, so PersistedStoreOpts (ShardKey)
+// carries nothing it needs to act on.
+func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store, _ PersistedStoreOpts) (*pb.StoreResponse, error) {
 	item := &inmemPersistedItem{
 		hub:     h,
 		command: command,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"time"
 
@@ -63,12 +64,14 @@ type natsPersistedQueue struct {
 	conn          *nats.Conn
 	js            jetstream.JetStream
 	streamName    string
+	subjectBase   string
 	subject       string
 	subjectFilter string
 	ackWait       time.Duration
 	maxAge        time.Duration
 	maxDeliver    int
 	replicas      int
+	shards        int
 	manageStream  bool
 	logger        hclog.Logger
 
@@ -84,7 +87,7 @@ type natsPersistedQueue struct {
 	// consumerM serializes Start/StopPersistedConsumer on this
 	// transport.
 	consumerM sync.Mutex
-	consumer  *natsPersistedConsumer
+	group     *natsPersistedConsumerGroup
 }
 
 // natsPersistedQueueConfig captures the construction-time parameters
@@ -96,6 +99,7 @@ type natsPersistedQueueConfig struct {
 	maxAge       time.Duration
 	maxDeliver   int
 	replicas     int
+	shards       int
 	manageStream bool
 }
 
@@ -114,6 +118,11 @@ func newNatsPersistedQueue(conn *nats.Conn, cacheName string, cfg natsPersistedQ
 	}
 	subject := fmt.Sprintf("quasar.%s.queue", cacheName)
 
+	shards := cfg.shards
+	if shards < 1 {
+		shards = 1
+	}
+
 	js, err := jetstream.New(conn)
 	if err != nil {
 		return nil, fmt.Errorf("init jetstream: %w", err)
@@ -127,12 +136,14 @@ func newNatsPersistedQueue(conn *nats.Conn, cacheName string, cfg natsPersistedQ
 		conn:          conn,
 		js:            js,
 		streamName:    streamName,
+		subjectBase:   subject,
 		subject:       subject + ".msg",
 		subjectFilter: subject + ".>",
 		ackWait:       cfg.ackWait,
 		maxDeliver:    cfg.maxDeliver,
 		maxAge:        cfg.maxAge,
 		replicas:      cfg.replicas,
+		shards:        shards,
 		manageStream:  cfg.manageStream,
 		logger:        hclog.New(&hclog.LoggerOptions{Name: "quasar-persisted"}),
 	}, nil
@@ -182,8 +193,9 @@ func (q *natsPersistedQueue) ensureStream(ctx context.Context) (jetstream.Stream
 }
 
 // publish marshals cmd onto the JS work-queue and blocks on a NATS
-// request-reply inbox for the leader's reply.
-func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store) (*pb.StoreResponse, error) {
+// request-reply inbox for the leader's reply. opts.ShardKey selects the FIFO
+// partition (RT-12964).
+func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error) {
 	if _, err := q.ensureStream(ctx); err != nil {
 		return nil, err
 	}
@@ -202,7 +214,7 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store) (*pb.St
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 
-	msg := nats.NewMsg(q.subject)
+	msg := nats.NewMsg(q.shardSubject(opts.ShardKey))
 	msg.Header.Set(persistedReplyHeader, inbox)
 	msg.Data = bts
 	if _, err = q.js.PublishMsg(ctx, msg); err != nil {
@@ -224,16 +236,24 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store) (*pb.St
 	return protoResp.GetStore(), nil
 }
 
-// startConsumer creates / opens the pull consumer and begins draining
-// the queue. Returns a channel of PersistedItem; close signals consumer
-// shutdown. Only one consumer is active per node at a time; concurrent
-// callers reuse the active consumer.
+// startConsumer creates / opens the per-shard pull consumers and begins
+// draining the queue. Returns a single channel of PersistedItem that fans in
+// every shard; close signals consumer shutdown. Only one consumer group is
+// active per node at a time; concurrent callers reuse the active group.
+//
+// Sharding (RT-12964): each of the q.shards partitions gets its own durable
+// consumer with MaxAckPending = 1, so writes stay strictly in order WITHIN a
+// shard while independent shards drain in parallel — a write that is stalling
+// or being redelivered only blocks its own shard, not every subsequent write
+// cluster-wide. With q.shards == 1 this is byte-for-byte the original
+// single-consumer behaviour (durable name and unfiltered subscription
+// unchanged), so existing deployments are unaffected.
 func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan PersistedItem, error) {
 	q.consumerM.Lock()
 	defer q.consumerM.Unlock()
 
-	if q.consumer != nil {
-		return q.consumer.items, nil
+	if q.group != nil {
+		return q.group.items, nil
 	}
 
 	stream, err := q.ensureStream(ctx)
@@ -241,54 +261,96 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan Persiste
 		return nil, err
 	}
 
-	// Durable consumer name keyed to the stream so a leadership flip
-	// resumes from the same pending state instead of starting from the
-	// beginning. The leader-flip handover happens by cancelling the
-	// previous consumer's puller (which Naks any in-flight item) and
-	// starting a fresh pull on the same durable.
-	consumerCfg := jetstream.ConsumerConfig{
-		Durable:       persistedConsumerNamePrefix,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		MaxAckPending: 1,
-		AckWait:       q.ackWait,
-		MaxDeliver:    q.maxDeliver,
-	}
-	jsConsumer, err := stream.CreateOrUpdateConsumer(ctx, consumerCfg)
-	if err != nil {
-		return nil, fmt.Errorf("create persisted consumer: %w", err)
-	}
-
 	pullCtx, cancel := context.WithCancel(context.Background())
-	mctx, err := jsConsumer.Messages(jetstream.PullHeartbeat(persistedPullHeartbeat))
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("start persisted messages context: %w", err)
+
+	// Open every shard's pull subscription first; only start the puller
+	// goroutines once all succeeded, so a mid-loop failure tears down cleanly
+	// without leaking half-started pullers.
+	mctxs := make([]jetstream.MessagesContext, 0, q.shards)
+	for i := 0; i < q.shards; i++ {
+		// Durable consumer name keyed to the stream (and shard) so a
+		// leadership flip resumes from the same pending state instead of
+		// starting from the beginning. The leader-flip handover cancels the
+		// previous group's pullers (which Nak any in-flight items) and starts
+		// fresh pulls on the same durables.
+		consumerCfg := jetstream.ConsumerConfig{
+			Durable:       q.shardDurable(i),
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			MaxAckPending: 1,
+			AckWait:       q.ackWait,
+			MaxDeliver:    q.maxDeliver,
+		}
+		// WorkQueue retention requires non-overlapping consumer filters; the
+		// per-shard subjects (…s0.>, …s1.>, …) are disjoint. With a single
+		// shard we keep the original unfiltered subscription.
+		if q.shards > 1 {
+			consumerCfg.FilterSubject = q.shardFilter(i)
+		}
+		jsConsumer, err := stream.CreateOrUpdateConsumer(ctx, consumerCfg)
+		if err != nil {
+			stopMessageContexts(mctxs)
+			cancel()
+			return nil, fmt.Errorf("create persisted consumer shard %d: %w", i, err)
+		}
+		mctx, err := jsConsumer.Messages(jetstream.PullHeartbeat(persistedPullHeartbeat))
+		if err != nil {
+			stopMessageContexts(mctxs)
+			cancel()
+			return nil, fmt.Errorf("start persisted messages context shard %d: %w", i, err)
+		}
+		mctxs = append(mctxs, mctx)
 	}
 
 	items := make(chan PersistedItem)
-	c := &natsPersistedConsumer{
-		queue:  q,
+	g := &natsPersistedConsumerGroup{
 		items:  items,
 		cancel: cancel,
-		mctx:   mctx,
 	}
-	q.consumer = c
+	for _, mctx := range mctxs {
+		c := &natsPersistedConsumer{
+			queue: q,
+			items: items,
+			mctx:  mctx,
+			group: g,
+		}
+		g.consumers = append(g.consumers, c)
+		g.wg.Add(1)
+		go c.run(pullCtx)
+	}
 
-	go c.run(pullCtx)
+	// Close the shared items channel once every puller has exited (regular
+	// stop, or any shard dying spontaneously — see run). Closing the channel
+	// is what makes the cache's apply loop observe the stop and, while still
+	// leader, restart the whole group (RT-13042 M4).
+	go func() {
+		g.wg.Wait()
+		close(items)
+		q.clearGroup(g)
+	}()
+
+	q.group = g
 	return items, nil
 }
 
-// stopConsumer cancels the active consumer goroutine and Naks the
-// in-flight item (if any) so the next leader picks it up immediately.
+// stopMessageContexts tears down already-opened pull subscriptions on the
+// startConsumer error path.
+func stopMessageContexts(mctxs []jetstream.MessagesContext) {
+	for _, m := range mctxs {
+		m.Stop()
+	}
+}
+
+// stopConsumer cancels the active consumer group and Naks each shard's
+// in-flight item (if any) so the next leader picks them up immediately.
 func (q *natsPersistedQueue) stopConsumer() error {
 	q.consumerM.Lock()
 	defer q.consumerM.Unlock()
-	if q.consumer == nil {
+	if q.group == nil {
 		return nil
 	}
-	c := q.consumer
-	q.consumer = nil
-	c.stop()
+	g := q.group
+	q.group = nil
+	g.stop()
 	return nil
 }
 
@@ -301,42 +363,103 @@ func (q *natsPersistedQueue) settleWait() time.Duration {
 	return defaultPersistedAckWait
 }
 
-// clearConsumer drops the active-consumer reference if it still points at c.
-// Called from the puller goroutine's exit path: when the consumer dies
-// spontaneously (e.g. the JetStream consumer was deleted server-side or hit
-// an unrecoverable JS error) the queue must not keep handing the dead
-// consumer's closed items channel out of startConsumer — that would make
-// the death permanent until a leadership flip AND an explicit
-// StopPersistedConsumer (RT-13042 M4). On the regular stop path
-// stopConsumer has already cleared the reference, so this is a no-op.
-func (q *natsPersistedQueue) clearConsumer(c *natsPersistedConsumer) {
+// clearGroup drops the active-group reference if it still points at g.
+// Called from the group's closer goroutine: when a shard dies spontaneously
+// (JetStream consumer deleted server-side, unrecoverable JS error) the whole
+// group tears down and the queue must not keep handing the dead group's
+// closed items channel out of startConsumer — that would make the death
+// permanent until a leadership flip AND an explicit StopPersistedConsumer
+// (RT-13042 M4). On the regular stop path stopConsumer has already cleared
+// the reference, so this is a no-op.
+func (q *natsPersistedQueue) clearGroup(g *natsPersistedConsumerGroup) {
 	q.consumerM.Lock()
-	if q.consumer == c {
-		q.consumer = nil
+	if q.group == g {
+		q.group = nil
 	}
 	q.consumerM.Unlock()
 }
 
-// natsPersistedConsumer wraps the JS Messages pull context and the
-// outgoing PersistedItem channel.
+// shardDurable returns the durable consumer name for shard i. With a single
+// shard it is the original unsuffixed name so existing durables are reused.
+func (q *natsPersistedQueue) shardDurable(i int) string {
+	if q.shards <= 1 {
+		return persistedConsumerNamePrefix
+	}
+	return fmt.Sprintf("%s-s%d", persistedConsumerNamePrefix, i)
+}
+
+// shardFilter returns the subject filter for shard i's consumer.
+func (q *natsPersistedQueue) shardFilter(i int) string {
+	return fmt.Sprintf("%s.s%d.>", q.subjectBase, i)
+}
+
+// shardSubject returns the publish subject for the given routing key. Keys
+// hash deterministically to a shard so all writes for one key keep their
+// relative order; an empty key routes to shard 0. With a single shard the
+// original subject is used unchanged.
+func (q *natsPersistedQueue) shardSubject(key string) string {
+	if q.shards <= 1 {
+		return q.subject
+	}
+	return fmt.Sprintf("%s.s%d.msg", q.subjectBase, q.shardOf(key))
+}
+
+func (q *natsPersistedQueue) shardOf(key string) int {
+	if q.shards <= 1 || key == "" {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(q.shards))
+}
+
+// natsPersistedConsumerGroup owns the shared fan-in items channel and the
+// per-shard pullers. A single context.CancelFunc stops every puller; the
+// WaitGroup gates closing the shared channel until all have exited.
+type natsPersistedConsumerGroup struct {
+	items     chan PersistedItem
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	consumers []*natsPersistedConsumer
+}
+
+// stop cancels every puller and Naks each shard's in-flight item for prompt
+// handover to the next leader. The shared items channel is closed by the
+// closer goroutine once all pullers have drained.
+func (g *natsPersistedConsumerGroup) stop() {
+	g.cancel()
+	for _, c := range g.consumers {
+		c.mctx.Stop()
+		c.drainInflight()
+	}
+}
+
+// natsPersistedConsumer wraps one shard's JS Messages pull context and the
+// shared outgoing PersistedItem channel.
 type natsPersistedConsumer struct {
-	queue  *natsPersistedQueue
-	items  chan PersistedItem
-	cancel context.CancelFunc
-	mctx   jetstream.MessagesContext
+	queue *natsPersistedQueue
+	items chan PersistedItem
+	mctx  jetstream.MessagesContext
+	group *natsPersistedConsumerGroup
 
 	inflightM sync.Mutex
 	inflight  *natsPersistedItem
 }
 
-// run is the puller loop: pull one message, hand it to the consumer
-// channel, repeat. With MaxAckPending = 1, JetStream itself enforces
-// the strict-FIFO single-in-flight invariant; we just need to keep up
-// the conventional ack/nak protocol.
+// run is one shard's puller loop: pull one message, hand it to the shared
+// consumer channel, repeat. With MaxAckPending = 1 JetStream enforces the
+// strict-FIFO single-in-flight invariant per shard; we just keep up the
+// conventional ack/nak protocol.
 func (c *natsPersistedConsumer) run(ctx context.Context) {
-	defer close(c.items)
+	defer c.group.wg.Done()
 	defer c.mctx.Stop()
-	defer c.queue.clearConsumer(c)
+	// Any puller exiting tears the whole group down: a sibling that died
+	// spontaneously (JS consumer deleted, unrecoverable error) must not be
+	// left silently stopped while the others keep running, or its shard
+	// stalls forever. Cancelling the shared pull context stops the siblings
+	// too; once all have exited the closer goroutine closes the shared items
+	// channel and the cache restarts the entire group (RT-13042 M4).
+	defer c.group.cancel()
 	for {
 		msg, err := c.mctx.Next()
 		if err != nil {
@@ -348,6 +471,22 @@ func (c *natsPersistedConsumer) run(ctx context.Context) {
 		if ok := c.consume(ctx, msg); !ok {
 			return
 		}
+	}
+}
+
+// drainInflight gives this shard's in-flight item a bounded chance to settle,
+// then Naks it for immediate redelivery to the next leader (RT-13042 M5).
+func (c *natsPersistedConsumer) drainInflight() {
+	c.inflightM.Lock()
+	in := c.inflight
+	c.inflightM.Unlock()
+	if in == nil {
+		return
+	}
+	select {
+	case <-in.settled:
+	case <-time.After(c.queue.settleWait()):
+		_ = in.Nack(context.Background())
 	}
 }
 
@@ -436,24 +575,6 @@ func (c *natsPersistedConsumer) clearInflight(item *natsPersistedItem) {
 	c.inflightM.Unlock()
 }
 
-func (c *natsPersistedConsumer) stop() {
-	c.cancel()
-	c.mctx.Stop()
-	c.inflightM.Lock()
-	in := c.inflight
-	c.inflightM.Unlock()
-	if in == nil {
-		return
-	}
-	// Same reasoning as the ctx.Done branch in consume: the in-flight item
-	// may be mid-apply on the loop side, so give it a bounded chance to
-	// settle before nacking it for redelivery (RT-13042 M5).
-	select {
-	case <-in.settled:
-	case <-time.After(c.queue.settleWait()):
-		_ = in.Nack(context.Background())
-	}
-}
 
 func (c *natsPersistedConsumer) replyDecodeError(item *natsPersistedItem, decodeErr error) error {
 	protoResp := &pb.CommandResponse{Error: decodeErr.Error()}

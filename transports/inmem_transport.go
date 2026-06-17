@@ -190,12 +190,12 @@ func (i *InmemTransport) SupportsPersisted() bool {
 
 // StorePersisted publishes a Store command into the Inmem persisted-FIFO
 // hub and waits for the leader's reply.
-func (i *InmemTransport) StorePersisted(ctx context.Context, command *pb.Store) (*pb.StoreResponse, error) {
+func (i *InmemTransport) StorePersisted(ctx context.Context, command *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error) {
 	hub := i.queueHub()
 	if hub == nil {
 		return nil, ErrPersistedNotSupported
 	}
-	return hub.publish(ctx, command)
+	return hub.publish(ctx, command, opts)
 }
 
 // StartPersistedConsumer claims the persisted-FIFO consumer for this

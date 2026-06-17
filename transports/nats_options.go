@@ -121,6 +121,22 @@ func WithPersistedReplicas(n int) PersistedQueueOption {
 	}
 }
 
+// WithPersistedShards sets the number of FIFO partitions on the
+// persisted-FIFO queue. Each shard gets its own consumer with
+// MaxAckPending = 1, so writes stay strictly ordered WITHIN a shard while
+// independent shards drain in parallel — a stalled or repeatedly-redelivered
+// write only blocks its own shard instead of every subsequent write
+// cluster-wide (RT-12964). Publishers select a shard via a per-write routing
+// key (see WithShardKey); writes with no key go to shard 0.
+//
+// Defaults to 1 (a single global FIFO — the original behaviour). Values < 1
+// are treated as 1.
+func WithPersistedShards(n int) PersistedQueueOption {
+	return func(cfg *natsPersistedQueueConfig) {
+		cfg.shards = n
+	}
+}
+
 // WithPersistedStreamManaged controls whether this node creates and updates
 // the JetStream stream backing the persisted-FIFO queue. When false, the node
 // only binds to an already-existing stream and never creates or mutates it —
@@ -153,6 +169,7 @@ func WithNATSPersistedQueue(streamName string, opts ...PersistedQueueOption) NAT
 			ackWait:      defaultPersistedAckWait,
 			maxDeliver:   defaultPersistedMaxDeliver,
 			maxAge:       defaultPersistedMaxAge,
+			shards:       1,
 			manageStream: true,
 		}
 		for _, o := range opts {

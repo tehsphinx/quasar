@@ -92,7 +92,7 @@ func TestNATSPersistedQueue_PublishConsumeReply(t *testing.T) {
 		drainErr <- nil
 	}()
 
-	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "lastseen", Data: []byte("42")})
+	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "lastseen", Data: []byte("42")}, PersistedStoreOpts{})
 	asrt.NoErr(err)
 	asrt.Equal(resp.Uid, uint64(99))
 
@@ -121,7 +121,7 @@ func TestNATSPersistedQueue_ReplyError(t *testing.T) {
 		}
 	}()
 
-	_, err = producer.StorePersisted(ctx, &pb.Store{Key: "k"})
+	_, err = producer.StorePersisted(ctx, &pb.Store{Key: "k"}, PersistedStoreOpts{})
 	asrt.True(err != nil)
 	asrt.Equal(err.Error(), applyErr.Error())
 
@@ -158,7 +158,7 @@ func TestNATSPersistedQueue_StreamManaged(t *testing.T) {
 
 	// Publishing before the stream exists fails, and crucially does not
 	// create the stream nor permanently cache the failure.
-	_, err = nonvoter.StorePersisted(ctx, &pb.Store{Key: "k"})
+	_, err = nonvoter.StorePersisted(ctx, &pb.Store{Key: "k"}, PersistedStoreOpts{})
 	asrt.True(err != nil)
 	_, err = js.Stream(ctx, streamName)
 	asrt.True(errors.Is(err, jetstream.ErrStreamNotFound))
@@ -174,7 +174,7 @@ func TestNATSPersistedQueue_StreamManaged(t *testing.T) {
 	}()
 
 	// The same nonvoter now binds to the existing stream and succeeds.
-	resp, err := nonvoter.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")})
+	resp, err := nonvoter.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")}, PersistedStoreOpts{})
 	asrt.NoErr(err)
 	asrt.Equal(resp.Uid, uint64(7))
 
@@ -229,7 +229,7 @@ func TestNATSPersistedQueue_RestartAfterConsumerDeleted(t *testing.T) {
 		}
 	}()
 
-	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")})
+	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "k", Data: []byte("v")}, PersistedStoreOpts{})
 	asrt.NoErr(err)
 	asrt.Equal(resp.Uid, uint64(11))
 
@@ -252,7 +252,7 @@ func TestNATSPersistedQueue_NotConfigured(t *testing.T) {
 
 	asrt.Equal(tr.SupportsPersisted(), false)
 
-	_, err = tr.StorePersisted(ctx, &pb.Store{Key: "k"})
+	_, err = tr.StorePersisted(ctx, &pb.Store{Key: "k"}, PersistedStoreOpts{})
 	asrt.True(errors.Is(err, ErrPersistedNotSupported))
 
 	_, err = tr.StartPersistedConsumer(ctx)

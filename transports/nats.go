@@ -640,11 +640,11 @@ func (s *NATSTransport) SupportsPersisted() bool {
 // and waits for the leader's reply via a NATS request-reply inbox.
 // Returns ErrPersistedNotSupported when the transport wasn't constructed
 // with WithNATSPersistedQueue.
-func (s *NATSTransport) StorePersisted(ctx context.Context, command *pb.Store) (*pb.StoreResponse, error) {
+func (s *NATSTransport) StorePersisted(ctx context.Context, command *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error) {
 	if s.queue == nil {
 		return nil, ErrPersistedNotSupported
 	}
-	return s.queue.publish(ctx, command)
+	return s.queue.publish(ctx, command, opts)
 }
 
 // StartPersistedConsumer begins draining the persisted-FIFO stream on
