@@ -208,20 +208,38 @@ func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
 // Apply-side errors (FSM rejection, persist failure) always reply with the
 // error to terminate the publisher's wait, regardless of the retry flag.
 func (s *Cache) applyPersistedItem(ctx context.Context, item transports.PersistedItem) {
-	// Time protection: a non-retry command picked up after its publisher's
-	// deadline must not be applied. The publisher has already returned an
-	// error to its caller, so a late apply would land a write the caller was
-	// told had failed. ReplyError acks the item (no redelivery); the deadline
-	// is the binding bound for non-retry writes. Retry commands are exempt —
-	// their contract is to apply whenever a leader is available, bounded by the
-	// queue's own MaxDeliver / maxAge budget.
+	// Time protection for non-retry commands. The publisher's deadline (which
+	// started when the call was sent) is the binding bound: once it passes, the
+	// publisher has already returned an error to its caller, so the command must
+	// never be applied — a late apply would land a write the caller was told had
+	// failed (RT-12964). It is enforced in two places that together close the
+	// window:
+	//
+	//  1. Here at pickup: an item already past its deadline is dropped before
+	//     any persist / marshal / raft work. ReplyError acks it (no redelivery).
+	//  2. By binding the raft apply below (applyCtx) to that same deadline. The
+	//     consumer's own ctx carries no per-item deadline, so without this the
+	//     apply would run under the fixed applyTimeout budget that effectively
+	//     restarts at pickup — letting an item picked up just before its
+	//     deadline keep applying and land seconds after the caller gave up.
+	//
+	// Retry commands are exempt from both: their at-least-once contract outlives
+	// the original caller's deadline, so they apply whenever a leader is
+	// available, bounded only by the queue's own MaxDeliver / maxAge budget.
 	if persistedExpired(item, time.Now()) {
 		_ = item.ReplyError(ctx, ErrNoLeader)
 		return
 	}
 
+	applyCtx := ctx
+	if dl, ok := item.Deadline(); ok && !item.Retry() {
+		var cancel context.CancelFunc
+		applyCtx, cancel = context.WithDeadline(ctx, dl)
+		defer cancel()
+	}
+
 	cmd := &pb.Command{Cmd: &pb.Command_Store{Store: item.Command()}}
-	resp, uid, err := s.applyLocal(ctx, cmd)
+	resp, uid, err := s.applyLocal(applyCtx, cmd)
 	if err != nil {
 		if isLeadershipTransitionError(err) {
 			if item.Retry() {
