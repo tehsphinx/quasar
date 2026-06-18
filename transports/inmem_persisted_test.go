@@ -230,3 +230,45 @@ func TestInmemQueueHub_PublisherCtxCancelDropsPending(t *testing.T) {
 
 	asrt.NoErr(consumer.StopPersistedConsumer())
 }
+
+// TestInmemQueueHub_RetryPublishSurvivesCtxCancel verifies the RT-12964
+// retry contract: a retry publish whose context is cancelled before any
+// consumer drains it stays on the queue (like a durable JetStream message) and
+// is delivered, retry flag and deadline intact, to a consumer that claims later
+// — whereas a non-retry publish is dropped on cancel
+// (TestInmemQueueHub_PublisherCtxCancelDropsPending).
+func TestInmemQueueHub_RetryPublishSurvivesCtxCancel(t *testing.T) {
+	asrt := is.New(t)
+
+	hub := NewInmemQueueHub()
+	_, producer := NewInmemTransport("")
+	_, consumer := NewInmemTransport("")
+	ConnectInmemQueueHub(hub, producer, consumer)
+
+	// Publish with retry set on a short-lived context and no consumer running;
+	// the publisher gives up but the item must remain queued.
+	publishCtx, cancelPublish := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancelPublish()
+	_, err := producer.StorePersisted(publishCtx, &pb.Store{Key: "kept"}, PersistedStoreOpts{Retry: true})
+	asrt.True(errors.Is(err, context.DeadlineExceeded))
+
+	// A consumer claiming afterwards must still receive the retry item.
+	consumeCtx, cancelConsume := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelConsume()
+	ch, err := consumer.StartPersistedConsumer(consumeCtx)
+	asrt.NoErr(err)
+
+	select {
+	case item, ok := <-ch:
+		asrt.True(ok)
+		asrt.Equal(string(item.Command().Key), "kept")
+		asrt.True(item.Retry())
+		_, hasDeadline := item.Deadline()
+		asrt.True(hasDeadline)
+		asrt.NoErr(item.ReplySuccess(consumeCtx, &pb.StoreResponse{Uid: 1}))
+	case <-time.After(1 * time.Second):
+		t.Fatal("retry item was not delivered to the later consumer")
+	}
+
+	asrt.NoErr(consumer.StopPersistedConsumer())
+}

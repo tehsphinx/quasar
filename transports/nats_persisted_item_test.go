@@ -5,6 +5,7 @@ package transports
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,13 +20,14 @@ type fakeJSMsg struct {
 	acked        atomic.Int32
 	naked        atomic.Int32
 	numDelivered uint64
+	headers      nats.Header
 }
 
 func (m *fakeJSMsg) Metadata() (*jetstream.MsgMetadata, error) {
 	return &jetstream.MsgMetadata{NumDelivered: m.numDelivered}, nil
 }
 func (m *fakeJSMsg) Data() []byte                     { return nil }
-func (m *fakeJSMsg) Headers() nats.Header             { return nil }
+func (m *fakeJSMsg) Headers() nats.Header             { return m.headers }
 func (m *fakeJSMsg) Subject() string                  { return "test.subject" }
 func (m *fakeJSMsg) Reply() string                    { return "" }
 func (m *fakeJSMsg) Ack() error                       { m.acked.Add(1); return nil }
@@ -142,6 +144,51 @@ func TestNatsPersistedConsumer_StopNacksUnsettledItem(t *testing.T) {
 	if got := msg.naked.Load(); got != 1 {
 		t.Fatalf("unsettled in-flight item naked %d times, want 1", got)
 	}
+}
+
+// TestNatsPersistedItem_RetryAndDeadlineHeaders verifies the RT-12964 wire
+// accessors: Retry() and Deadline() read the per-message headers stamped by
+// publish, and default to non-retry / no-deadline when the headers are absent
+// or malformed.
+func TestNatsPersistedItem_RetryAndDeadlineHeaders(t *testing.T) {
+	deadline := time.Unix(0, 1_700_000_000_000_000_000)
+
+	t.Run("headers present", func(t *testing.T) {
+		hdr := nats.Header{}
+		hdr.Set(persistedRetryHeader, "1")
+		hdr.Set(persistedDeadlineHeader, strconv.FormatInt(deadline.UnixNano(), 10))
+		item := newTestPersistedItem(&fakeJSMsg{headers: hdr})
+
+		if !item.Retry() {
+			t.Fatal("Retry() = false, want true")
+		}
+		got, ok := item.Deadline()
+		if !ok {
+			t.Fatal("Deadline() ok = false, want true")
+		}
+		if !got.Equal(deadline) {
+			t.Fatalf("Deadline() = %v, want %v", got, deadline)
+		}
+	})
+
+	t.Run("headers absent", func(t *testing.T) {
+		item := newTestPersistedItem(&fakeJSMsg{})
+		if item.Retry() {
+			t.Fatal("Retry() = true with no header, want false")
+		}
+		if _, ok := item.Deadline(); ok {
+			t.Fatal("Deadline() ok = true with no header, want false")
+		}
+	})
+
+	t.Run("malformed deadline", func(t *testing.T) {
+		hdr := nats.Header{}
+		hdr.Set(persistedDeadlineHeader, "not-a-number")
+		item := newTestPersistedItem(&fakeJSMsg{headers: hdr})
+		if _, ok := item.Deadline(); ok {
+			t.Fatal("Deadline() ok = true for malformed header, want false")
+		}
+	})
 }
 
 // noopMessagesContext satisfies jetstream.MessagesContext for consumer unit

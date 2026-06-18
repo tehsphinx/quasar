@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"strconv"
 	"sync"
 	"time"
 
@@ -62,6 +63,19 @@ const (
 	// because JetStream rewrites it to the ack-inbox subject when the
 	// message is delivered to a consumer.
 	persistedReplyHeader = "Quasar-Reply"
+
+	// persistedRetryHeader carries the publisher's WithRetry choice across
+	// the JetStream hop so the consuming leader (possibly a different node)
+	// can decide whether to redeliver or terminate a command it cannot apply
+	// yet. Present and "1" means retry; absent / anything else means non-retry
+	// (RT-12964).
+	persistedRetryHeader = "Quasar-Retry"
+
+	// persistedDeadlineHeader carries the publisher's call deadline (Unix
+	// nanoseconds) so the consumer can drop a non-retry command picked up
+	// after the publisher has already given up, instead of silently applying
+	// it late (RT-12964). Absent when the publisher had no deadline.
+	persistedDeadlineHeader = "Quasar-Deadline"
 )
 
 // natsPersistedQueue is the JetStream-backed persisted-FIFO mode for a
@@ -225,6 +239,12 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts Pe
 
 	msg := nats.NewMsg(q.shardSubject(opts.ShardKey))
 	msg.Header.Set(persistedReplyHeader, inbox)
+	if opts.Retry {
+		msg.Header.Set(persistedRetryHeader, "1")
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		msg.Header.Set(persistedDeadlineHeader, strconv.FormatInt(dl.UnixNano(), 10))
+	}
 	msg.Data = bts
 	if _, err = q.js.PublishMsg(ctx, msg); err != nil {
 		return nil, fmt.Errorf("publish persisted store: %w", err)
@@ -399,6 +419,34 @@ func persistedReplyInbox(msg jetstream.Msg) string {
 		}
 	}
 	return msg.Reply()
+}
+
+// persistedRetryFromMsg reports whether the message was published with the
+// retry flag set (persistedRetryHeader == "1"). Absent header means non-retry.
+func persistedRetryFromMsg(msg jetstream.Msg) bool {
+	if hdr := msg.Headers(); hdr != nil {
+		return hdr.Get(persistedRetryHeader) == "1"
+	}
+	return false
+}
+
+// persistedDeadlineFromMsg extracts the publisher's call deadline from the
+// message header. ok is false when no deadline header was stamped (publisher
+// had no deadline) or it cannot be parsed.
+func persistedDeadlineFromMsg(msg jetstream.Msg) (time.Time, bool) {
+	hdr := msg.Headers()
+	if hdr == nil {
+		return time.Time{}, false
+	}
+	v := hdr.Get(persistedDeadlineHeader)
+	if v == "" {
+		return time.Time{}, false
+	}
+	nanos, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, nanos), true
 }
 
 // sanitizeStreamName replaces JetStream-illegal characters (dots,

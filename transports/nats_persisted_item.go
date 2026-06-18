@@ -3,6 +3,7 @@ package transports
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/tehsphinx/quasar/pb/v1"
@@ -22,6 +23,14 @@ type natsPersistedItem struct {
 
 func (i *natsPersistedItem) Command() *pb.Store {
 	return i.command
+}
+
+func (i *natsPersistedItem) Retry() bool {
+	return persistedRetryFromMsg(i.msg)
+}
+
+func (i *natsPersistedItem) Deadline() (time.Time, bool) {
+	return persistedDeadlineFromMsg(i.msg)
 }
 
 // beginSettle claims the right to settle this item. It returns false when

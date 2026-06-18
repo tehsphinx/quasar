@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/tehsphinx/quasar/pb/v1"
 )
@@ -83,12 +84,14 @@ func WithInmemPersistedQueue(hub *InmemQueueHub) func(*InmemTransport) {
 // consumer either replies or the context is cancelled.
 // The inmem hub is a single un-sharded queue, so PersistedStoreOpts (ShardKey)
 // carries nothing it needs to act on.
-func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store, _ PersistedStoreOpts) (*pb.StoreResponse, error) {
+func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error) {
 	item := &inmemPersistedItem{
 		hub:     h,
 		command: command,
 		replyCh: make(chan inmemPersistedReply, 1),
+		retry:   opts.Retry,
 	}
+	item.deadline, item.hasDeadline = ctx.Deadline()
 
 	h.m.Lock()
 	h.queue = append(h.queue, item)
@@ -99,7 +102,14 @@ func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store, _ Persis
 	case reply := <-item.replyCh:
 		return reply.resp, reply.err
 	case <-ctx.Done():
-		h.cancelPublish(item)
+		// A non-retry publish gives up with its context: drop the still-queued
+		// item so it is never applied after the caller stopped waiting. A retry
+		// publish leaves the item on the queue — like a durable JetStream
+		// message, redelivery is independent of the publisher's wait, so the
+		// next leader still applies it (RT-12964).
+		if !opts.Retry {
+			h.cancelPublish(item)
+		}
 		return nil, ctx.Err()
 	}
 }
@@ -268,12 +278,27 @@ type inmemPersistedItem struct {
 	hub     *InmemQueueHub
 	command *pb.Store
 	replyCh chan inmemPersistedReply
-	settled bool
-	m       sync.Mutex
+	retry   bool
+	// deadline mirrors the publisher's call deadline; hasDeadline is false
+	// when the publisher had no deadline. Carried so the leader's apply path
+	// can drop a non-retry command picked up after the publisher gave up,
+	// exactly as the NATS transport does via persistedDeadlineHeader.
+	deadline    time.Time
+	hasDeadline bool
+	settled     bool
+	m           sync.Mutex
 }
 
 func (i *inmemPersistedItem) Command() *pb.Store {
 	return i.command
+}
+
+func (i *inmemPersistedItem) Retry() bool {
+	return i.retry
+}
+
+func (i *inmemPersistedItem) Deadline() (time.Time, bool) {
+	return i.deadline, i.hasDeadline
 }
 
 func (i *inmemPersistedItem) ReplySuccess(_ context.Context, resp *pb.StoreResponse) error {

@@ -29,7 +29,7 @@ const persistedConsumerRestartDelay = 500 * time.Millisecond
 // Without WithRetry() we return the underlying error unwrapped, which
 // stays compatible with today's ErrNoLeader-returning callers.
 func (s *Cache) routePersisted(ctx context.Context, storeCmd *pb.Store, opts storeOpts) (*pb.CommandResponse, uint64, error) {
-	pOpts := transports.PersistedStoreOpts{ShardKey: opts.shardKey}
+	pOpts := transports.PersistedStoreOpts{ShardKey: opts.shardKey, Retry: opts.retry}
 	resp, err := s.transport.StorePersisted(ctx, storeCmd, pOpts)
 	if err != nil {
 		err = reattachNoLeader(err)
@@ -192,18 +192,43 @@ func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
 	s.startPersistedConsumerOnce(ctx)
 }
 
-// applyPersistedItem runs the standard leader-local apply path for
-// the queued Store and routes the outcome back to the publisher.
-// Leadership-transition errors (raft.ErrNotLeader, ErrLeadershipLost,
-// ErrEnqueueTimeout, ErrRaftShutdown) Nak the item so the next leader's
-// consumer picks it up; apply-side errors (FSM rejection, persist
-// failure) reply with an error to terminate the publisher's wait.
+// applyPersistedItem runs the standard leader-local apply path for the queued
+// Store and routes the outcome back to the publisher. Whether a command that
+// cannot be applied is retried is a per-message property carried from the
+// publisher (WithRetry):
+//
+//   - retry: leadership-transition errors (raft.ErrNotLeader,
+//     ErrLeadershipLost, ErrEnqueueTimeout, ErrRaftShutdown) Nak the item so
+//     the next leader's consumer picks it up (at-least-once background sync).
+//   - non-retry: the item is terminated with ErrNoLeader instead of being
+//     redelivered, and it is dropped outright once the publisher's deadline
+//     has passed — a non-retry write must never be silently applied after the
+//     caller was already told it failed (RT-12964).
+//
+// Apply-side errors (FSM rejection, persist failure) always reply with the
+// error to terminate the publisher's wait, regardless of the retry flag.
 func (s *Cache) applyPersistedItem(ctx context.Context, item transports.PersistedItem) {
+	// Time protection: a non-retry command picked up after its publisher's
+	// deadline must not be applied. The publisher has already returned an
+	// error to its caller, so a late apply would land a write the caller was
+	// told had failed. ReplyError acks the item (no redelivery); the deadline
+	// is the binding bound for non-retry writes. Retry commands are exempt —
+	// their contract is to apply whenever a leader is available, bounded by the
+	// queue's own MaxDeliver / maxAge budget.
+	if persistedExpired(item, time.Now()) {
+		_ = item.ReplyError(ctx, ErrNoLeader)
+		return
+	}
+
 	cmd := &pb.Command{Cmd: &pb.Command_Store{Store: item.Command()}}
 	resp, uid, err := s.applyLocal(ctx, cmd)
 	if err != nil {
 		if isLeadershipTransitionError(err) {
-			_ = item.Nack(ctx)
+			if item.Retry() {
+				_ = item.Nack(ctx)
+			} else {
+				_ = item.ReplyError(ctx, ErrNoLeader)
+			}
 			return
 		}
 		_ = item.ReplyError(ctx, err)
@@ -223,6 +248,19 @@ func (s *Cache) applyPersistedItem(ctx context.Context, item transports.Persiste
 		s.logger.Warn("persisted item nacked despite successful apply; command will be redelivered — FSM applies must be idempotent",
 			"uid", storeResp.Uid)
 	}
+}
+
+// persistedExpired reports whether a queued command must be dropped without
+// applying it because it is a non-retry write whose publisher deadline has
+// already passed. Retry writes are never expired here — their at-least-once
+// contract outlives the original caller's deadline — nor are writes whose
+// publisher set no deadline (RT-12964).
+func persistedExpired(item transports.PersistedItem, now time.Time) bool {
+	if item.Retry() {
+		return false
+	}
+	dl, ok := item.Deadline()
+	return ok && now.After(dl)
 }
 
 // isLeadershipTransitionError reports whether err signals that the

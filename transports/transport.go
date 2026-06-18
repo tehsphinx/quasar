@@ -47,6 +47,15 @@ type PersistedStoreOpts struct {
 	// shard rather than every subsequent write cluster-wide. Empty routes to
 	// the default shard.
 	ShardKey string
+
+	// Retry marks the command as eligible for at-least-once redelivery. The
+	// flag travels with the published message so the consuming leader — which
+	// may be a different node than the publisher — can honor it when the apply
+	// cannot run yet (no leader / leadership lost): a retry command is Nak'd
+	// for redelivery to the next leader, a non-retry command is terminated so
+	// it is never silently applied after the publisher has already given up
+	// (RT-12964).
+	Retry bool
 }
 
 // Transport defines an extended raft.Transport with additional commands for the cache.
@@ -129,6 +138,20 @@ type Transport interface {
 type PersistedItem interface {
 	// Command returns the underlying Store command.
 	Command() *pb.Store
+
+	// Retry reports whether the publisher marked this command as eligible
+	// for at-least-once redelivery (PersistedStoreOpts.Retry). The consumer
+	// uses it to decide, on a leadership-transition error, whether to Nack
+	// for redelivery (retry) or terminate the publisher's call (non-retry).
+	Retry() bool
+
+	// Deadline returns the publisher's call deadline, if it set one. A
+	// non-retry command that is picked up after its deadline has passed must
+	// be terminated rather than applied: the publisher has already returned an
+	// error to its caller, so applying it late would silently land a write the
+	// caller was told had failed (RT-12964). ok is false when the publisher
+	// had no deadline, in which case no time bound applies.
+	Deadline() (deadline time.Time, ok bool)
 
 	// ReplySuccess sends the apply result back to the publisher and acks
 	// the underlying queue item. The next item is delivered after the
