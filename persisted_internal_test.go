@@ -23,6 +23,7 @@ func (f fakePersistedItem) Deadline() (time.Time, bool)                         
 func (fakePersistedItem) ReplySuccess(context.Context, *pb.StoreResponse) error { return nil }
 func (fakePersistedItem) ReplyError(context.Context, error) error               { return nil }
 func (fakePersistedItem) Nack(context.Context) error                            { return nil }
+func (fakePersistedItem) NackWithDelay(context.Context) error                   { return nil }
 
 var _ transports.PersistedItem = fakePersistedItem{}
 

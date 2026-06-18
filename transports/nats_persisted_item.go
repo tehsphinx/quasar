@@ -50,11 +50,11 @@ func (i *natsPersistedItem) beginSettle() bool {
 }
 
 func (i *natsPersistedItem) ReplySuccess(_ context.Context, resp *pb.StoreResponse) error {
-	return i.terminate(&pb.CommandResponse{Resp: &pb.CommandResponse_Store{Store: resp}}, true)
+	return i.terminate(&pb.CommandResponse{Resp: &pb.CommandResponse_Store{Store: resp}})
 }
 
 func (i *natsPersistedItem) ReplyError(_ context.Context, err error) error {
-	return i.terminate(&pb.CommandResponse{Error: err.Error()}, true)
+	return i.terminate(&pb.CommandResponse{Error: err.Error()})
 }
 
 func (i *natsPersistedItem) Nack(_ context.Context) error {
@@ -66,7 +66,18 @@ func (i *natsPersistedItem) Nack(_ context.Context) error {
 	return err
 }
 
-func (i *natsPersistedItem) terminate(protoResp *pb.CommandResponse, ack bool) error {
+func (i *natsPersistedItem) NackWithDelay(_ context.Context) error {
+	if !i.beginSettle() {
+		return ErrAlreadySettled
+	}
+	// Delay the redelivery by one AckWait so a leadership transition does not
+	// hot-loop through the MaxDeliver budget — see PersistedItem.NackBackoff.
+	err := i.msg.NakWithDelay(i.queue.ackWait)
+	close(i.settled)
+	return err
+}
+
+func (i *natsPersistedItem) terminate(protoResp *pb.CommandResponse) error {
 	if !i.beginSettle() {
 		return ErrAlreadySettled
 	}
@@ -87,10 +98,8 @@ func (i *natsPersistedItem) terminate(protoResp *pb.CommandResponse, ack bool) e
 			err = pErr
 		}
 	}
-	if ack {
-		if aErr := i.msg.Ack(); aErr != nil && err == nil {
-			err = aErr
-		}
+	if aErr := i.msg.Ack(); aErr != nil && err == nil {
+		err = aErr
 	}
 	return err
 }

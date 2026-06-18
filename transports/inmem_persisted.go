@@ -313,6 +313,13 @@ func (i *inmemPersistedItem) Nack(_ context.Context) error {
 	return i.terminate(inmemPersistedReply{}, true)
 }
 
+// NackBackoff requeues the item like Nack. The inmem hub redelivers from the
+// head with no MaxDeliver budget to exhaust, so the delayed-redelivery contract
+// (which exists to protect the NATS MaxDeliver budget) is a no-op here.
+func (i *inmemPersistedItem) NackWithDelay(_ context.Context) error {
+	return i.terminate(inmemPersistedReply{}, true)
+}
+
 func (i *inmemPersistedItem) terminate(reply inmemPersistedReply, requeue bool) error {
 	i.m.Lock()
 	if i.settled {

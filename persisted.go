@@ -198,8 +198,12 @@ func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
 // publisher (WithRetry):
 //
 //   - retry: leadership-transition errors (raft.ErrNotLeader,
-//     ErrLeadershipLost, ErrEnqueueTimeout, ErrRaftShutdown) Nak the item so
-//     the next leader's consumer picks it up (at-least-once background sync).
+//     ErrLeadershipLost, ErrEnqueueTimeout, ErrRaftShutdown) Nak the item with
+//     a backoff so the next leader's consumer picks it up (at-least-once
+//     background sync). The backoff (NackBackoff, not the immediate Nack used
+//     for step-down handover) keeps a leadership transition from re-pulling and
+//     re-failing the item in a tight loop that burns the MaxDeliver budget
+//     before a new leader can be elected.
 //   - non-retry: the item is terminated with ErrNoLeader instead of being
 //     redelivered, and it is dropped outright once the publisher's deadline
 //     has passed — a non-retry write must never be silently applied after the
@@ -208,24 +212,28 @@ func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
 // Apply-side errors (FSM rejection, persist failure) always reply with the
 // error to terminate the publisher's wait, regardless of the retry flag.
 func (s *Cache) applyPersistedItem(ctx context.Context, item transports.PersistedItem) {
-	// Time protection: a non-retry command picked up after its publisher's
-	// deadline must not be applied. The publisher has already returned an
-	// error to its caller, so a late apply would land a write the caller was
-	// told had failed. ReplyError acks the item (no redelivery); the deadline
-	// is the binding bound for non-retry writes. Retry commands are exempt —
-	// their contract is to apply whenever a leader is available, bounded by the
-	// queue's own MaxDeliver / maxAge budget.
+	// Non-retry deadline protection is enforced in two places: here at pickup,
+	// dropping an already-expired item before any work, and by binding the raft
+	// apply to the same deadline (applyCtx) so an item picked up just before its
+	// deadline can't keep applying past it (RT-12964).
 	if persistedExpired(item, time.Now()) {
 		_ = item.ReplyError(ctx, ErrNoLeader)
 		return
 	}
 
+	applyCtx := ctx
+	if dl, ok := item.Deadline(); ok && !item.Retry() {
+		var cancel context.CancelFunc
+		applyCtx, cancel = context.WithDeadline(ctx, dl)
+		defer cancel()
+	}
+
 	cmd := &pb.Command{Cmd: &pb.Command_Store{Store: item.Command()}}
-	resp, uid, err := s.applyLocal(ctx, cmd)
+	resp, uid, err := s.applyLocal(applyCtx, cmd)
 	if err != nil {
 		if isLeadershipTransitionError(err) {
 			if item.Retry() {
-				_ = item.Nack(ctx)
+				_ = item.NackWithDelay(ctx)
 			} else {
 				_ = item.ReplyError(ctx, ErrNoLeader)
 			}
@@ -250,11 +258,8 @@ func (s *Cache) applyPersistedItem(ctx context.Context, item transports.Persiste
 	}
 }
 
-// persistedExpired reports whether a queued command must be dropped without
-// applying it because it is a non-retry write whose publisher deadline has
-// already passed. Retry writes are never expired here — their at-least-once
-// contract outlives the original caller's deadline — nor are writes whose
-// publisher set no deadline (RT-12964).
+// persistedExpired reports whether a non-retry write must be dropped because
+// its publisher deadline has already passed (RT-12964).
 func persistedExpired(item transports.PersistedItem, now time.Time) bool {
 	if item.Retry() {
 		return false

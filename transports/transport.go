@@ -41,20 +41,12 @@ var ErrAlreadySettled = errors.New("persisted item already settled")
 // header / in-memory item field) so the consuming leader — which may be a
 // different node than the publisher — can honor it (RT-12964).
 type PersistedStoreOpts struct {
-	// ShardKey selects the FIFO partition this command is routed to. All
-	// commands sharing a key keep strict in-order delivery; different keys
-	// drain in parallel, so a stalled/retrying write only blocks its own
-	// shard rather than every subsequent write cluster-wide. Empty routes to
-	// the default shard.
+	// ShardKey selects the FIFO partition this command is routed to. Empty
+	// routes to the default shard.
 	ShardKey string
 
-	// Retry marks the command as eligible for at-least-once redelivery. The
-	// flag travels with the published message so the consuming leader — which
-	// may be a different node than the publisher — can honor it when the apply
-	// cannot run yet (no leader / leadership lost): a retry command is Nak'd
-	// for redelivery to the next leader, a non-retry command is terminated so
-	// it is never silently applied after the publisher has already given up
-	// (RT-12964).
+	// Retry marks the command as eligible for at-least-once redelivery when
+	// the apply cannot run yet (no leader / leadership lost).
 	Retry bool
 }
 
@@ -145,12 +137,9 @@ type PersistedItem interface {
 	// for redelivery (retry) or terminate the publisher's call (non-retry).
 	Retry() bool
 
-	// Deadline returns the publisher's call deadline, if it set one. A
-	// non-retry command that is picked up after its deadline has passed must
-	// be terminated rather than applied: the publisher has already returned an
-	// error to its caller, so applying it late would silently land a write the
-	// caller was told had failed (RT-12964). ok is false when the publisher
-	// had no deadline, in which case no time bound applies.
+	// Deadline returns the publisher's call deadline; ok is false when the
+	// publisher had no deadline. The consumer uses it to drop a non-retry
+	// command picked up after the caller already gave up (RT-12964).
 	Deadline() (deadline time.Time, ok bool)
 
 	// ReplySuccess sends the apply result back to the publisher and acks
@@ -169,6 +158,13 @@ type PersistedItem interface {
 	// (e.g. leader step-down) so the next leader doesn't have to wait
 	// for the AckWait window to expire.
 	Nack(ctx context.Context) error
+
+	// NackWithDelay returns the item to the queue for redelivery after a
+	// transport-chosen backoff (≈ the consumer's AckWait), rather than the
+	// immediate redelivery of Nack. Used on a leadership-transition error so a
+	// flip doesn't hot-loop the shard through its MaxDeliver budget before a new
+	// leader is elected (RT-12964).
+	NackWithDelay(ctx context.Context) error
 }
 
 func snapshotTimeout(origTimeout time.Duration, size int64) time.Duration {
