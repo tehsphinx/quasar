@@ -30,9 +30,33 @@ const persistedConsumerRestartDelay = 500 * time.Millisecond
 // stays compatible with today's ErrNoLeader-returning callers.
 func (s *Cache) routePersisted(ctx context.Context, storeCmd *pb.Store, opts storeOpts) (*pb.CommandResponse, uint64, error) {
 	pOpts := transports.PersistedStoreOpts{ShardKey: opts.shardKey, Retry: opts.retry}
+
+	// The publish into the persisted-FIFO stream is durable and leader-agnostic,
+	// but the reply only arrives once a leader's consumer applies the item. With
+	// no leader there is no consumer, so the reply wait would block until a
+	// leader appears (or ctx expires). When no leader is currently visible, gate
+	// the wait on leadership using the same fast quorum probe the forward path
+	// uses: the moment the cluster is confirmed leaderless, cancel the wait and
+	// return. The publish has already landed (the transport detaches a retry
+	// publish from this cancellation), so a retry write stays queued for the next
+	// leader (ErrRetrying) and a non-retry write is dropped by its deadline
+	// (ErrNoLeader) instead of the caller hanging (RT-12964).
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	if !s.hasLeader() {
+		go func() {
+			if _, _, err := s.getLeaderWait(ctx); err != nil {
+				cancel(ErrNoLeader)
+			}
+		}()
+	}
+
 	resp, err := s.transport.StorePersisted(ctx, storeCmd, pOpts)
 	if err != nil {
 		err = reattachNoLeader(err)
+		if cause := context.Cause(ctx); !opts.retry && errors.Is(cause, ErrNoLeader) {
+			return nil, 0, cause
+		}
 		if opts.retry && ctxTimedOut(ctx, err) {
 			return nil, 0, fmt.Errorf("%w: %w", ErrRetrying, err)
 		}

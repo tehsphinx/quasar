@@ -58,6 +58,14 @@ const (
 	persistedReconnectBackoff    = 250 * time.Millisecond
 	persistedReconnectMaxBackoff = 5 * time.Second
 
+	// persistedPublishTimeout bounds the durable publish of a retry write when
+	// the caller passed no deadline. The publish is deliberately detached from
+	// the caller's cancellation (see publish) so a retry write still reaches the
+	// stream when the caller cancels the reply wait the instant it detects there
+	// is no leader; this is the only backstop that keeps that detached publish
+	// from hanging if JetStream is unavailable.
+	persistedPublishTimeout = 10 * time.Second
+
 	// persistedReplyHeader carries the publisher's reply-inbox subject
 	// across the JetStream hop. We can't use the wire-level Reply field
 	// because JetStream rewrites it to the ack-inbox subject when the
@@ -246,7 +254,19 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts Pe
 		msg.Header.Set(persistedDeadlineHeader, strconv.FormatInt(dl.UnixNano(), 10))
 	}
 	msg.Data = bts
-	if _, err = q.js.PublishMsg(ctx, msg); err != nil {
+
+	// A retry write must reach the durable stream even if the caller cancels the
+	// reply wait the instant it detects there is no leader (quasar's leader
+	// gate): the queued write has to survive for the next leader. Detach the
+	// publish from the caller's cancellation so only the reply wait below honors
+	// ctx. Non-retry writes keep the old behaviour (a cancelled publish aborts).
+	pubCtx := ctx
+	if opts.Retry {
+		var cancel context.CancelFunc
+		pubCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), persistedPublishTimeout)
+		defer cancel()
+	}
+	if _, err = q.js.PublishMsg(pubCtx, msg); err != nil {
 		return nil, fmt.Errorf("publish persisted store: %w", err)
 	}
 
