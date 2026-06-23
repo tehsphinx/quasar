@@ -46,7 +46,13 @@ const (
 	// that recovers keeps the fallback parked, and small relative to the liveness
 	// window so the wedge clears promptly once leader pings stop.
 	bootstrapFallbackPoll = 1 * time.Second
-	observationChanSize   = 5
+	// recoveryRetryAfter is how soon the quorum-recovery watcher retries after a
+	// fire that found the leaderless window satisfied but could not yet recover
+	// (peer voter not yet aged out of the discovery alive-window, or not the
+	// captain). Short relative to recoverQuorumAfter so the secondary gate
+	// clearing does not cost an extra full window, but not a tight loop.
+	recoveryRetryAfter  = 1 * time.Second
+	observationChanSize = 5
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the
 	// discovery alive-window to expire. Sized for a healthy LAN: long
@@ -1211,40 +1217,117 @@ func (s *Cache) watchQuorumOnRaft(ctx, ctxRaft context.Context, rft *raft.Raft, 
 	rft.RegisterObserver(observer)
 	defer rft.DeregisterObserver(observer)
 
-	// fire is buffered so the timer goroutine can deliver without blocking.
-	// We drain it explicitly when we cancel; spurious wake-ups are harmless
-	// (the shouldRecoverQuorum check is the source of truth).
-	fire := make(chan struct{}, 1)
-	var timer *time.Timer
+	// fire attempts recovery once the leaderless window has elapsed. Returns
+	// true when raft was swapped (recovery happened), so the loop exits and the
+	// caller re-registers on the new raft.
+	fire := func() bool {
+		if !s.shouldRecoverQuorum(time.Now(), aliveCutoff) {
+			// Either a leader came back between fire and now, or we are not the
+			// captain / quorum is still reachable.
+			return false
+		}
+		if err := s.recoverQuorum(); err != nil {
+			// errNoVotersToRecover is a benign no-op (nothing to drop);
+			// anything else is a genuine failure worth logging. In both cases
+			// raft was not swapped (m6).
+			if !errors.Is(err, errNoVotersToRecover) {
+				s.logger.Error("quorum recovery failed", "error", err)
+			}
+			return false
+		}
+		// recoverQuorum shut down the old raft and installed a new one; ctxRaft
+		// is now done and the caller re-registers on the replacement.
+		return true
+	}
 
-	armTimer := func() {
-		if timer != nil {
+	recoveryLoop(ctx, ctxRaft, chObs, s.hasLeader, fire, after, s.leaderStableFor(after))
+}
+
+// leaderStableFor is how long a freshly-observed leader must persist before it
+// is allowed to cancel an armed recovery timer. Without this dwell a flapping
+// link that lets a brief, unstable leader form repeatedly resets the recovery
+// window, so recovery never fires even though the site is effectively
+// leaderless (RT-13283). Derived from noLeaderTimeout, clamped below half the
+// recovery window so a genuinely stable leader always cancels recovery in time.
+func (s *Cache) leaderStableFor(after time.Duration) time.Duration {
+	d := s.cfg.noLeaderTimeout
+	if half := after / 2; d > half {
+		d = half
+	}
+	return d
+}
+
+// recoveryLoop is the event-driven core of the quorum-recovery watcher. A
+// LeaderObservation either arms or cancels a one-shot timer set to fire after
+// `after` of leaderlessness; on fire it calls fire() to attempt recovery.
+//
+// A leader observation does NOT cancel the recovery timer immediately. Because
+// a flapping link can let a brief leader form, the recovery timer is only
+// cancelled once a leader has persisted for `stableFor` (the stability dwell).
+// A leaderless observation discards any half-finished dwell and keeps the
+// recovery clock running. This is what makes recovery robust to leadership
+// flapping (RT-13283).
+//
+// It is a free function taking its dependencies explicitly so the timing logic
+// can be exercised without a live raft.
+func recoveryLoop(ctx, ctxRaft context.Context, chObs <-chan raft.Observation, hasLeader, fire func() bool, after, stableFor time.Duration) {
+	// recoverFire / stableFire are buffered so the timer goroutines can deliver
+	// without blocking. We drain them explicitly when we cancel; spurious
+	// wake-ups are harmless (the fire / hasLeader checks are the source of truth).
+	recoverFire := make(chan struct{}, 1)
+	stableFire := make(chan struct{}, 1)
+	var recoverTimer, stableTimer *time.Timer
+
+	armRecover := func(in time.Duration) {
+		if recoverTimer != nil {
 			return
 		}
-		timer = time.AfterFunc(after, func() {
+		recoverTimer = time.AfterFunc(in, func() {
 			select {
-			case fire <- struct{}{}:
+			case recoverFire <- struct{}{}:
 			default:
 			}
 		})
 	}
-	cancelTimer := func() {
-		if timer != nil {
-			timer.Stop()
-			timer = nil
+	cancelRecover := func() {
+		if recoverTimer != nil {
+			recoverTimer.Stop()
+			recoverTimer = nil
 		}
 		select {
-		case <-fire:
+		case <-recoverFire:
 		default:
 		}
 	}
-	defer cancelTimer()
+	armStable := func() {
+		if stableTimer != nil {
+			return
+		}
+		stableTimer = time.AfterFunc(stableFor, func() {
+			select {
+			case stableFire <- struct{}{}:
+			default:
+			}
+		})
+	}
+	cancelStable := func() {
+		if stableTimer != nil {
+			stableTimer.Stop()
+			stableTimer = nil
+		}
+		select {
+		case <-stableFire:
+		default:
+		}
+	}
+	defer cancelRecover()
+	defer cancelStable()
 
 	// Seed: react to the current leader state. Initial LeaderObservation
 	// events arrive only on changes, so a node started without a leader
 	// would otherwise sit unarmed until the next election attempt.
-	if !s.hasLeader() {
-		armTimer()
+	if !hasLeader() {
+		armRecover(after)
 	}
 
 	for {
@@ -1254,41 +1337,41 @@ func (s *Cache) watchQuorumOnRaft(ctx, ctxRaft context.Context, rft *raft.Raft, 
 		case <-ctxRaft.Done():
 			return
 		case <-chObs:
-			if s.hasLeader() {
-				cancelTimer()
+			if hasLeader() {
+				// A leader appeared, but on a flapping link it may be a
+				// transient blip. Do not cancel the recovery timer yet — start
+				// the stability dwell; only a leader still present after
+				// stableFor is treated as real and stops recovery (RT-13283).
+				armStable()
 			} else {
-				armTimer()
+				// Leaderless: keep the recovery clock running and discard any
+				// half-finished stability dwell — the leader it was vetting is
+				// already gone.
+				cancelStable()
+				armRecover(after)
 			}
-		case <-fire:
-			timer = nil
-			if !s.shouldRecoverQuorum(time.Now(), aliveCutoff) {
-				// Either a leader came back between fire and now, or we
-				// are not the captain / quorum is still reachable. If we
-				// still have no leader, re-arm to retry on the next full
-				// window — avoids tight-looping when a transient condition
-				// (e.g. raft.GetConfiguration error) blocked recovery.
-				if !s.hasLeader() {
-					armTimer()
-				}
-				continue
+		case <-stableFire:
+			stableTimer = nil
+			// Leader held for the full dwell; treat it as stable and stop
+			// recovery. Re-check guards against a loss racing the timer.
+			if hasLeader() {
+				cancelRecover()
 			}
-			if err := s.recoverQuorum(); err != nil {
-				// errNoVotersToRecover is a benign no-op (nothing to drop);
-				// anything else is a genuine failure worth logging. In both
-				// cases raft was not swapped, so re-arm on the same raft to
-				// wait a full window before retrying — without this the
-				// watcher would sit idle while still leaderless (m6).
-				if !errors.Is(err, errNoVotersToRecover) {
-					s.logger.Error("quorum recovery failed", "error", err)
-				}
-				if !s.hasLeader() {
-					armTimer()
-				}
-				continue
+		case <-recoverFire:
+			recoverTimer = nil
+			if fire() {
+				// raft was swapped; let the caller re-register on the new raft.
+				return
 			}
-			// recoverQuorum shut down the old raft and installed a new
-			// one; ctxRaft is now done and we'll exit the select on the
-			// next iteration to let the outer loop re-register.
+			// Recovery was a no-op: a leader returned, we are not the captain,
+			// or the peer voter has not yet aged out of the discovery
+			// alive-window. The leaderless window itself is already satisfied,
+			// so when still leaderless retry on a short interval rather than a
+			// full window — otherwise a peer that dies just after the window
+			// opens costs an extra full `after` before recovery can fire.
+			if !hasLeader() {
+				armRecover(min(after, recoveryRetryAfter))
+			}
 		}
 	}
 }
