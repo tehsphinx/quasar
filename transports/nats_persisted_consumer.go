@@ -56,6 +56,24 @@ func (c *natsPersistedConsumer) connect(ctx context.Context, stream jetstream.St
 	if err != nil {
 		return fmt.Errorf("create persisted consumer shard %d: %w", c.shard, err)
 	}
+	// A durable that survived a server file-store corruption can come back
+	// half-dead: CreateOrUpdateConsumer still returns it, but the server can
+	// neither serve its info nor deliver from it, and a subscription on it
+	// blocks forever without erroring. Probe the info and rebuild the durable
+	// when it is unreadable. The stream keeps every unacked message
+	// (work-queue retention), so the fresh consumer resumes delivery from the
+	// pending state.
+	if _, infoErr := jsConsumer.Info(ctx); infoErr != nil {
+		c.queue.logger.Error("persisted consumer shard unreadable; rebuilding",
+			"shard", c.shard, "durable", consumerCfg.Durable, "error", infoErr)
+		if delErr := stream.DeleteConsumer(ctx, consumerCfg.Durable); delErr != nil {
+			return fmt.Errorf("delete unreadable persisted consumer shard %d: %w", c.shard, delErr)
+		}
+		jsConsumer, err = stream.CreateOrUpdateConsumer(ctx, consumerCfg)
+		if err != nil {
+			return fmt.Errorf("recreate persisted consumer shard %d: %w", c.shard, err)
+		}
+	}
 	mctx, err := jsConsumer.Messages(jetstream.PullHeartbeat(persistedPullHeartbeat))
 	if err != nil {
 		return fmt.Errorf("start persisted messages context shard %d: %w", c.shard, err)
