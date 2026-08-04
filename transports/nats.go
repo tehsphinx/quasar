@@ -41,8 +41,14 @@ func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverNam
 		chConsume:        make(chan raft.RPC, consumerChanSize),
 		chConsumeCache:   make(chan raft.RPC, consumerChanSize),
 	}
+	s.connLive = s.dialRaftConn(conn, "live")
+	s.connRepl = s.dialRaftConn(conn, "repl")
+	s.connBulk = s.dialRaftConn(conn, "bulk")
 	if config.persistedQueue != nil {
-		q, err := newNatsPersistedQueue(conn, cacheName, *config.persistedQueue)
+		// On the bulk connection: the queue carries whole Store payloads at
+		// the cache's write rate, so it is a bulk publisher by the 32 KB
+		// measure below.
+		q, err := newNatsPersistedQueue(s.connBulk, cacheName, *config.persistedQueue)
 		if err != nil {
 			return nil, err
 		}
@@ -58,7 +64,29 @@ func NewNATSTransport(ctx context.Context, conn *nats.Conn, cacheName, serverNam
 //
 //nolint:govet // Usually initialized once. Preferring readability to struct optimization here.
 type NATSTransport struct {
+	// conn is the connection the caller passed in — for the services using
+	// this transport that is their main application connection. No raft
+	// traffic is sent on it; it is only the fallback for a raft connection
+	// that could not be opened.
 	conn *nats.Conn
+
+	// Raft traffic is split across three own connections because
+	// nats.Conn.publish holds the connection mutex across a socket flush as
+	// soon as the pending write buffer crosses 32 KB (nats.go defaultBufSize),
+	// and a wait on that mutex cannot be cut short by the caller's context.
+	// One bulk publisher therefore delays every other publish on the same
+	// connection — which is how a snapshot install came to starve heartbeats
+	// until the leader lost its lease (RT-13733).
+	//
+	// The rule for connLive is a property, not a list: only traffic whose
+	// aggregate byte rate cannot keep crossing 32 KB belongs on it.
+	connLive *nats.Conn // heartbeats, votes, pre-votes, timeout-now
+	connRepl *nats.Conn // AppendEntries and the cache RPCs
+	connBulk *nats.Conn // snapshot streams, multi-part payloads, persisted queue
+
+	// ownedConns are the connections opened by this transport, to be closed
+	// on shutdown. Never contains conn.
+	ownedConns []*nats.Conn
 
 	logger hclog.Logger
 
@@ -83,47 +111,91 @@ type NATSTransport struct {
 	queue *natsPersistedQueue
 }
 
+// dialRaftConn opens one of the raft connections from the passed connection's
+// options, so it inherits its credentials, TLS config and server list. The
+// lifecycle callbacks are not inherited: they belong to the application
+// connection, and one that treats a disconnect as "my connection dropped"
+// would misreport — or, with a ClosedCB that exits the process, do worse.
+//
+// A connection that cannot be opened is not fatal: sharing one connection is
+// what this transport did before the split, so fall back to the passed
+// connection rather than refuse to build the transport.
+func (s *NATSTransport) dialRaftConn(conn *nats.Conn, role string) *nats.Conn {
+	opts := conn.Opts
+	// Distinct name per role, or `nats server report connections` becomes
+	// unreadable with three more connections per cache member.
+	opts.Name = fmt.Sprintf("quasar-%s-%s-%s", s.cacheName, s.serverName, role)
+	opts.DisconnectedCB = nil
+	opts.DisconnectedErrCB = func(_ *nats.Conn, err error) {
+		s.logger.Warn("raft NATS connection disconnected", "role", role, "error", err)
+	}
+	opts.ReconnectedCB = func(_ *nats.Conn) {
+		s.logger.Info("raft NATS connection reconnected", "role", role)
+	}
+	opts.ClosedCB = func(_ *nats.Conn) {
+		s.logger.Info("raft NATS connection closed", "role", role)
+	}
+	opts.AsyncErrorCB = func(_ *nats.Conn, sub *nats.Subscription, err error) {
+		s.logger.Error("raft NATS connection error", "role", role, "subject", sub.Subject, "error", err)
+	}
+	opts.DiscoveredServersCB = nil
+	opts.LameDuckModeHandler = nil
+
+	nc, err := opts.Connect()
+	if err != nil {
+		s.logger.Error("failed to open dedicated raft NATS connection, falling back to the shared connection",
+			"role", role, "error", err)
+		return conn
+	}
+	s.ownedConns = append(s.ownedConns, nc)
+	return nc
+}
+
 func (s *NATSTransport) listen(ctx context.Context) error {
 	subjPrefix := fmt.Sprintf("quasar.%s.%s", s.cacheName, s.serverName)
 	// fmt.Println("server =", s.serverName, " subjPrefix =", subjPrefix)
 
-	subEntries, err := s.conn.Subscribe(subjPrefix+".entries.append", s.handleEntries(ctx))
+	// The receive side is where the isolation is bought: NATS routes by
+	// subject regardless of which connection published, so an inbound
+	// heartbeat sits behind snapshot chunks unless the two subscriptions are
+	// on different sockets. Send paths pick their connection to match.
+	subEntries, err := s.connRepl.Subscribe(subjPrefix+".entries.append", s.handleEntries(ctx))
 	if err != nil {
 		return err
 	}
-	subHeartbeat, err := s.conn.Subscribe(subjPrefix+".entries.heartbeat", s.handleHeartbeat(ctx))
+	subHeartbeat, err := s.connLive.Subscribe(subjPrefix+".entries.heartbeat", s.handleHeartbeat(ctx))
 	if err != nil {
 		return err
 	}
-	subVote, err := s.conn.Subscribe(subjPrefix+".request.vote", s.handleVote(ctx))
+	subVote, err := s.connLive.Subscribe(subjPrefix+".request.vote", s.handleVote(ctx))
 	if err != nil {
 		return err
 	}
-	subPreVote, err := s.conn.Subscribe(subjPrefix+".request.prevote", s.handlePreVote(ctx))
+	subPreVote, err := s.connLive.Subscribe(subjPrefix+".request.prevote", s.handlePreVote(ctx))
 	if err != nil {
 		return err
 	}
-	subStore, err := s.conn.Subscribe(subjPrefix+".cache.store", s.handleStore(ctx))
+	subStore, err := s.connRepl.Subscribe(subjPrefix+".cache.store", s.handleStore(ctx))
 	if err != nil {
 		return err
 	}
-	subResetCache, err := s.conn.Subscribe(subjPrefix+".cache.reset", s.handleResetCache(ctx))
+	subResetCache, err := s.connRepl.Subscribe(subjPrefix+".cache.reset", s.handleResetCache(ctx))
 	if err != nil {
 		return err
 	}
-	subRemoveServer, err := s.conn.Subscribe(subjPrefix+".cache.server.remove", s.handleRemoveServer(ctx))
+	subRemoveServer, err := s.connRepl.Subscribe(subjPrefix+".cache.server.remove", s.handleRemoveServer(ctx))
 	if err != nil {
 		return err
 	}
-	subLatestUID, err := s.conn.Subscribe(subjPrefix+".cache.uid.latest", s.handleLatestUID(ctx))
+	subLatestUID, err := s.connRepl.Subscribe(subjPrefix+".cache.uid.latest", s.handleLatestUID(ctx))
 	if err != nil {
 		return err
 	}
-	subInstallSnapshot, err := s.conn.Subscribe(subjPrefix+".install.snapshot", s.handleInstallSnapshot(ctx))
+	subInstallSnapshot, err := s.connBulk.Subscribe(subjPrefix+".install.snapshot", s.handleInstallSnapshot(ctx))
 	if err != nil {
 		return err
 	}
-	subTimeoutNow, err := s.conn.Subscribe(subjPrefix+".timeout.now", s.handleTimeoutNow(ctx))
+	subTimeoutNow, err := s.connLive.Subscribe(subjPrefix+".timeout.now", s.handleTimeoutNow(ctx))
 	if err != nil {
 		return err
 	}
@@ -140,6 +212,10 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 		_ = subLatestUID.Unsubscribe()
 		_ = subInstallSnapshot.Unsubscribe()
 		_ = subTimeoutNow.Unsubscribe()
+		// Only the connections opened here; the caller owns the one it passed in.
+		for _, nc := range s.ownedConns {
+			nc.Close()
+		}
 	}()
 	return nil
 }
@@ -258,7 +334,7 @@ func (s *NATSTransport) ResetCache(ctx context.Context, _ raft.ServerID, address
 	subj := fmt.Sprintf("quasar.%s.%s.cache.reset", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.requestSmall(ctx, subj, request, &protoResp); err != nil {
+	if err := s.requestSmall(ctx, s.connRepl, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -281,7 +357,7 @@ func (s *NATSTransport) RemoveServer(ctx context.Context, _ raft.ServerID, addre
 	subj := fmt.Sprintf("quasar.%s.%s.cache.server.remove", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.requestSmall(ctx, subj, request, &protoResp); err != nil {
+	if err := s.requestSmall(ctx, s.connRepl, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -324,7 +400,7 @@ func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address 
 	subj := fmt.Sprintf("quasar.%s.%s.cache.uid.latest", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.requestSmall(ctx, subj, request, &protoResp); err != nil {
+	if err := s.requestSmall(ctx, s.connRepl, subj, request, &protoResp); err != nil {
 		return nil, err
 	}
 	if errStr := protoResp.GetError(); errStr != "" {
@@ -389,7 +465,7 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 		}
 		hbSubj := fmt.Sprintf("quasar.%s.%s.entries.heartbeat", s.cacheName, address)
 		var protoResp pb.CommandResponse
-		err := s.requestSmall(hbCtx, hbSubj, pb.ToAppendEntriesRequest(request), &protoResp)
+		err := s.requestSmall(hbCtx, s.connLive, hbSubj, pb.ToAppendEntriesRequest(request), &protoResp)
 		hbCancel()
 		if err == nil {
 			payload, rErr := checkRaftResponse(&protoResp, (*pb.CommandResponse).GetAppendEntries)
@@ -527,7 +603,7 @@ func (s *NATSTransport) RequestVote(_ raft.ServerID, address raft.ServerAddress,
 	subj := fmt.Sprintf("quasar.%s.%s.request.vote", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.requestSmall(ctx, subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
+	if err := s.requestSmall(ctx, s.connLive, subj, pb.ToRequestVoteRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -551,7 +627,7 @@ func (s *NATSTransport) RequestPreVote(_ raft.ServerID, address raft.ServerAddre
 	subj := fmt.Sprintf("quasar.%s.%s.request.prevote", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.requestSmall(ctx, subj, pb.ToRequestPreVoteRequest(request), &protoResp); err != nil {
+	if err := s.requestSmall(ctx, s.connLive, subj, pb.ToRequestPreVoteRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -615,7 +691,7 @@ func (s *NATSTransport) TimeoutNow(_ raft.ServerID, address raft.ServerAddress, 
 	subj := fmt.Sprintf("quasar.%s.%s.timeout.now", s.cacheName, address)
 
 	var protoResp pb.CommandResponse
-	if err := s.requestSmall(ctx, subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
+	if err := s.requestSmall(ctx, s.connLive, subj, pb.ToTimeoutNowRequest(request), &protoResp); err != nil {
 		return err
 	}
 
@@ -686,13 +762,20 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 	}
 
 	// Split the message if it is too large and build the last message part.
+	conn := s.connRepl
 	reqMsg := nats.NewMsg(subj)
 	if s.maxMsgSize < len(bts) {
+		// A multi-part payload is bulk traffic, so it goes on connBulk — parts
+		// AND the final part that carries the request. Both must use the same
+		// connection: the receiving assembler rejects a part that does not
+		// follow the previous one, and only a single TCP stream orders them.
+		conn = s.connBulk
+
 		var (
 			requestIDStr  string
 			lastPartIndex int
 		)
-		bts, requestIDStr, lastPartIndex, err = s.publishMultiPart(subj, bts)
+		bts, requestIDStr, lastPartIndex, err = s.publishMultiPart(conn, subj, bts)
 		if err != nil {
 			return 0, err
 		}
@@ -706,7 +789,7 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 	// above; sending raw bytes would strip them, so the receiver could
 	// neither validate the final part against the assembly nor detect a
 	// lost middle part (RT-13042 M2).
-	response, err := s.conn.RequestMsgWithContext(ctx, reqMsg)
+	response, err := conn.RequestMsgWithContext(ctx, reqMsg)
 	if err != nil {
 		return len(bts), err
 	}
@@ -735,16 +818,17 @@ func checkRaftResponse[T any](protoResp *pb.CommandResponse, get func(*pb.Comman
 	return payload, nil
 }
 
-// requestSmall sends msg on subj as a single NATS message. Use this for RPCs
+// requestSmall sends msg on conn as a single NATS message. Use this for RPCs
 // whose payload is bounded by a few small fields (RequestVote, TimeoutNow,
 // LatestUid, ResetCache, RemoveServer, heartbeat AppendEntries) — the
-// multi-part path in request is dead code for them.
-func (s *NATSTransport) requestSmall(ctx context.Context, subj string, msg, protoResp proto.Message) error {
+// multi-part path in request is dead code for them. conn is connLive for the
+// liveness RPCs and connRepl for the cache RPCs.
+func (s *NATSTransport) requestSmall(ctx context.Context, conn *nats.Conn, subj string, msg, protoResp proto.Message) error {
 	bts, err := proto.Marshal(msg)
 	if err != nil {
 		return err
 	}
-	response, err := s.conn.RequestWithContext(ctx, subj, bts)
+	response, err := conn.RequestWithContext(ctx, subj, bts)
 	if err != nil {
 		return err
 	}

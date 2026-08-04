@@ -3,7 +3,9 @@
 package transports
 
 import (
+	"cmp"
 	"context"
+	"os"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -16,11 +18,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// NATS connection settings - adjust these for your test environment
-const (
-	natsURL     = "nats://localhost:4222"
-	natsTimeout = 5 * time.Second
-)
+// NATS connection settings - adjust these for your test environment.
+// Override the URL with NATS_URL when localhost:4222 is taken by another
+// server (e.g. one that requires credentials).
+const natsTimeout = 5 * time.Second
+
+var natsURL = cmp.Or(os.Getenv("NATS_URL"), "nats://localhost:4222")
 
 func makeNATSTransport(ctx context.Context, t *testing.T, cacheName, serverName string) (*NATSTransport, error) {
 	t.Helper()

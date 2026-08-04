@@ -31,7 +31,7 @@ func (m *Message) Append(b []byte) {
 	m.updatedAt = time.Now()
 }
 
-func (s *NATSTransport) publishMultiPart(subj string, data []byte) ([]byte, string, int, error) {
+func (s *NATSTransport) publishMultiPart(conn *nats.Conn, subj string, data []byte) ([]byte, string, int, error) {
 	var (
 		partID    int
 		requestID = atomic.AddUint64(&s.requestIDCounter, 1)
@@ -55,7 +55,7 @@ func (s *NATSTransport) publishMultiPart(subj string, data []byte) ([]byte, stri
 		msg.Header.Set("pkg_part", strconv.Itoa(partID))
 
 		// Publish the part (no response expected)
-		if err := s.conn.PublishMsg(msg); err != nil {
+		if err := conn.PublishMsg(msg); err != nil {
 			return nil, "", 0, fmt.Errorf("failed to publish part %d: %w", partID, err)
 		}
 	}

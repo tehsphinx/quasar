@@ -33,7 +33,7 @@ func (s *NATSTransport) InstallSnapshot(_ raft.ServerID, address raft.ServerAddr
 	// exited on ctx.Done() never blocks the subscription callback goroutine.
 	chResp := make(chan []byte, 1)
 	recvSubj := protoRespCh.GetSubject() + ".resp"
-	respSub, err := s.conn.Subscribe(recvSubj, func(msg *nats.Msg) {
+	respSub, err := s.connBulk.Subscribe(recvSubj, func(msg *nats.Msg) {
 		chResp <- msg.Data
 	})
 	if err != nil {
@@ -70,7 +70,7 @@ func (s *NATSTransport) sendSnapshot(sendSubj string, data io.Reader) error {
 		n, r := data.Read(buf)
 		if r != nil {
 			if errors.Is(r, io.EOF) {
-				if e := s.conn.Publish(sendSubj+".EOF", buf[:n]); e != nil {
+				if e := s.connBulk.Publish(sendSubj+".EOF", buf[:n]); e != nil {
 					return e
 				}
 				break
@@ -79,7 +79,7 @@ func (s *NATSTransport) sendSnapshot(sendSubj string, data io.Reader) error {
 		}
 
 		counter++
-		if e := s.conn.Publish(sendSubj+"."+strconv.Itoa(counter), buf[:n]); e != nil {
+		if e := s.connBulk.Publish(sendSubj+"."+strconv.Itoa(counter), buf[:n]); e != nil {
 			return e
 		}
 	}
@@ -95,7 +95,7 @@ func (s *NATSTransport) requestOpenChannel(ctx context.Context, address raft.Ser
 	}
 
 	subj := fmt.Sprintf("quasar.%s.%s.install.snapshot", s.cacheName, address)
-	response, err := s.conn.RequestWithContext(ctx, subj, bts)
+	response, err := s.connBulk.RequestWithContext(ctx, subj, bts)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +148,7 @@ func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(*nats.Ms
 		}
 
 		respSubj := chanSubj + ".resp"
-		if r := s.conn.Publish(respSubj, bts); r != nil {
+		if r := s.connBulk.Publish(respSubj, bts); r != nil {
 			s.logger.Error("failed to send response", "error", r)
 		}
 	}
@@ -160,7 +160,7 @@ func (s *NATSTransport) openNatsStream(subj string) (*io.PipeReader, *nats.Subsc
 		_ = pipeWriter.CloseWithError(context.DeadlineExceeded)
 	})
 
-	chanSub, err := s.conn.Subscribe(subj+".send.*", func(msg *nats.Msg) {
+	chanSub, err := s.connBulk.Subscribe(subj+".send.*", func(msg *nats.Msg) {
 		writeSnapshotPkg(timer, pipeWriter, msg.Subject, msg.Data)
 	})
 	return pipeReader, chanSub, err
