@@ -442,7 +442,7 @@ type Cache struct {
 // requires fresh stores; the recovery path is the exception (it reuses the
 // existing stores via raft.RecoverCluster).
 func (s *Cache) newStores() {
-	s.logStore = wrapStore(raft.NewInmemStore(), s.fsm)
+	s.logStore = wrapStore(stores.NewLogRing(), s.fsm)
 	s.stableStore = stores.NewStableInMemory()
 	s.snapshotStore = wrapSnapshotStore(raft.NewInmemSnapshotStore(), s.fsm)
 }

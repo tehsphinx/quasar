@@ -45,6 +45,19 @@ func (s *store) StoreLog(log *raft.Log) error {
 	return s.LogStore.StoreLog(log)
 }
 
+// IsMonotonic implements the raft.MonotonicLogStore interface by forwarding to
+// the wrapped store, the shim raft itself uses for LogCache. Embedding
+// raft.LogStore promotes only that interface's method set, so without this
+// raft's `logs.(MonotonicLogStore)` assertion fails whatever the wrapped store
+// says — and a store that cannot represent a gap, such as stores.LogRing, would
+// silently keep getting one from the snapshot-install and user-restore paths.
+func (s *store) IsMonotonic() bool {
+	if monotonic, ok := s.LogStore.(raft.MonotonicLogStore); ok {
+		return monotonic.IsMonotonic()
+	}
+	return false
+}
+
 // StoreLogs stores multiple log entries. By default, the logs stored may not be contiguous with previous logs
 // (i.e. may have a gap in Index since the last log written). If an implementation can't tolerate this it may
 // optionally implement `MonotonicLogStore` to indicate that this is not allowed. This changes Raft's behaviour
