@@ -18,6 +18,15 @@ const (
 	maxPkgSize        = 900 * 1024 // 900KB
 	snapshotPkgTimout = 5 * time.Second
 	base10            = 10
+
+	// maxInflightCacheRPCs bounds how many RPCs one cache subject serves at
+	// the same time. High enough that raft's dispatchLogs sees a real batch
+	// of forwarded writes — the point of serving them concurrently — and low
+	// enough to bound goroutines and in-flight applies on the leader. A cache
+	// only reaches it when apply latency is already pathological. A constant
+	// because no caller has needed to tune it; it becomes a NATSOption with
+	// this default if one ever does.
+	maxInflightCacheRPCs = 256
 )
 
 var (
@@ -175,19 +184,30 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	subStore, err := s.connRepl.Subscribe(subjPrefix+".cache.store", s.handleStore(ctx))
+	// One semaphore per cache subject, not one shared across them: a burst of
+	// forwarded Stores must not shed the cache.uid.latest probes peers use to
+	// detect quorum, nor a cache.reset that rebuilds raft.
+	subjStore := subjPrefix + ".cache.store"
+	subStore, err := s.connRepl.Subscribe(subjStore,
+		s.handleStore(ctx, newInflightSem(s.logger, subjStore, maxInflightCacheRPCs)))
 	if err != nil {
 		return err
 	}
-	subResetCache, err := s.connRepl.Subscribe(subjPrefix+".cache.reset", s.handleResetCache(ctx))
+	subjResetCache := subjPrefix + ".cache.reset"
+	subResetCache, err := s.connRepl.Subscribe(subjResetCache,
+		s.handleResetCache(ctx, newInflightSem(s.logger, subjResetCache, maxInflightCacheRPCs)))
 	if err != nil {
 		return err
 	}
-	subRemoveServer, err := s.connRepl.Subscribe(subjPrefix+".cache.server.remove", s.handleRemoveServer(ctx))
+	subjRemoveServer := subjPrefix + ".cache.server.remove"
+	subRemoveServer, err := s.connRepl.Subscribe(subjRemoveServer,
+		s.handleRemoveServer(ctx, newInflightSem(s.logger, subjRemoveServer, maxInflightCacheRPCs)))
 	if err != nil {
 		return err
 	}
-	subLatestUID, err := s.connRepl.Subscribe(subjPrefix+".cache.uid.latest", s.handleLatestUID(ctx))
+	subjLatestUID := subjPrefix + ".cache.uid.latest"
+	subLatestUID, err := s.connRepl.Subscribe(subjLatestUID,
+		s.handleLatestUID(ctx, newInflightSem(s.logger, subjLatestUID, maxInflightCacheRPCs)))
 	if err != nil {
 		return err
 	}
@@ -238,10 +258,23 @@ func (s *NATSTransport) CacheConsumer() <-chan raft.RPC {
 // wraps the consumer's response in the matching CommandResponse oneof. When
 // assembler is non-nil the payload is first reassembled from multi-part NATS
 // messages (Store, AppendEntries); otherwise msg.Data is single-part.
+//
+// sem decides whether the RPC is answered on the callback goroutine or on its
+// own. nil — every raft RPC — keeps the callback blocked until the answer is
+// sent: raft drains chConsume serially anyway and depends on the arrival order
+// per peer. Non-nil — the cache RPCs — replies from a goroutine admitted by
+// sem, because awaiting the answer there is awaiting a full raft commit and
+// apply, and nats.go serves one async subscription from a single goroutine. A
+// leader would otherwise serve every forwarded write in the cluster strictly
+// one at a time while its own local writes go through raft.Apply concurrently
+// (RT-13899). Reassembly, decoding and the hand-off onto ch stay on the
+// callback goroutine either way, so the order RPCs enter the consumer channel
+// is unchanged.
 func rpcHandler[Req proto.Message](
 	s *NATSTransport,
 	ctx context.Context,
 	ch chan raft.RPC,
+	sem *inflightSem,
 	assembler *multipartAssembler,
 	newReq func() Req,
 	toCommand func(Req) interface{},
@@ -269,20 +302,63 @@ func rpcHandler[Req proto.Message](
 			return
 		}
 
+		// Admission happens before the enqueue: an RPC that is enqueued but
+		// shed would still be applied, with nobody left to answer it.
+		if sem != nil && !sem.acquire() {
+			s.replyOverload(msg)
+			return
+		}
+
 		chResp := make(chan raft.RPCResponse, 1)
 		ch <- raft.RPC{
 			RespChan: chResp,
 			Command:  toCommand(req),
 		}
 
-		bts, err := s.awaitResponse(ctx, chResp, toResp)
-		if err != nil {
-			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
+		if sem == nil {
+			s.serveResponse(ctx, msg, chResp, toResp)
 			return
 		}
-		if r := msg.Respond(bts); r != nil {
-			s.logger.Error("failed to send response", "error", r)
-		}
+		go func() {
+			defer sem.release()
+
+			s.serveResponse(ctx, msg, chResp, toResp)
+		}()
+	}
+}
+
+// serveResponse waits for the consumer's answer to one enqueued RPC and
+// replies to the requester.
+func (s *NATSTransport) serveResponse(
+	ctx context.Context,
+	msg *nats.Msg,
+	chResp <-chan raft.RPCResponse,
+	toResp func(interface{}) *pb.CommandResponse,
+) {
+	bts, err := s.awaitResponse(ctx, chResp, toResp)
+	if err != nil {
+		s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send response", "error", r)
+	}
+}
+
+// replyOverload answers an RPC that was not admitted, so the caller fails
+// immediately and attributably instead of waiting out its request timeout.
+// It does not log: the semaphore logs the overload as a state transition.
+func (s *NATSTransport) replyOverload(msg *nats.Msg) {
+	resp := &pb.CommandResponse{
+		Error: fmt.Sprintf("leader overloaded: too many cache RPCs in flight on %q", msg.Subject),
+	}
+	bts, err := proto.Marshal(resp)
+	if err != nil {
+		s.logger.Error("failed to marshal overload response", "error", err, "subject", msg.Subject)
+		return
+	}
+	if r := msg.Respond(bts); r != nil {
+		s.logger.Error("failed to send overload response", "error", r, "subject", msg.Subject)
 	}
 }
 
@@ -306,13 +382,13 @@ func (s *NATSTransport) Store(ctx context.Context, _ raft.ServerID, address raft
 	return protoResp.GetStore(), nil
 }
 
-func (s *NATSTransport) handleStore(ctx context.Context) func(*nats.Msg) {
+func (s *NATSTransport) handleStore(ctx context.Context, sem *inflightSem) func(*nats.Msg) {
 	// Reassembly is keyed by the sender-qualified request_id: unlike
 	// AppendEntries (one leader, sequential), ANY node — and multiple
 	// goroutines per node — may forward large Stores to this subject
 	// concurrently, so interleaved parts must not share one buffer
 	// (RT-13042 M3).
-	return rpcHandler(s, ctx, s.chConsumeCache, newMultipartAssembler(),
+	return rpcHandler(s, ctx, s.chConsumeCache, sem, newMultipartAssembler(),
 		func() *pb.Store { return &pb.Store{} },
 		func(r *pb.Store) interface{} { return r },
 		func(i interface{}) *pb.CommandResponse {
@@ -367,8 +443,8 @@ func (s *NATSTransport) RemoveServer(ctx context.Context, _ raft.ServerID, addre
 	return protoResp.GetRemoveServer(), nil
 }
 
-func (s *NATSTransport) handleResetCache(ctx context.Context) func(*nats.Msg) {
-	return rpcHandler(s, ctx, s.chConsumeCache, nil,
+func (s *NATSTransport) handleResetCache(ctx context.Context, sem *inflightSem) func(*nats.Msg) {
+	return rpcHandler(s, ctx, s.chConsumeCache, sem, nil,
 		func() *pb.ResetCache { return &pb.ResetCache{} },
 		func(r *pb.ResetCache) interface{} { return r },
 		func(i interface{}) *pb.CommandResponse {
@@ -377,8 +453,8 @@ func (s *NATSTransport) handleResetCache(ctx context.Context) func(*nats.Msg) {
 		})
 }
 
-func (s *NATSTransport) handleRemoveServer(ctx context.Context) func(*nats.Msg) {
-	return rpcHandler(s, ctx, s.chConsumeCache, nil,
+func (s *NATSTransport) handleRemoveServer(ctx context.Context, sem *inflightSem) func(*nats.Msg) {
+	return rpcHandler(s, ctx, s.chConsumeCache, sem, nil,
 		func() *pb.RemoveServer { return &pb.RemoveServer{} },
 		func(r *pb.RemoveServer) interface{} { return r },
 		func(i interface{}) *pb.CommandResponse {
@@ -409,8 +485,8 @@ func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address 
 	return protoResp.GetLatestUid(), nil
 }
 
-func (s *NATSTransport) handleLatestUID(ctx context.Context) func(*nats.Msg) {
-	return rpcHandler(s, ctx, s.chConsumeCache, nil,
+func (s *NATSTransport) handleLatestUID(ctx context.Context, sem *inflightSem) func(*nats.Msg) {
+	return rpcHandler(s, ctx, s.chConsumeCache, sem, nil,
 		func() *pb.LatestUid { return &pb.LatestUid{} },
 		func(r *pb.LatestUid) interface{} { return r },
 		func(i interface{}) *pb.CommandResponse {
@@ -502,7 +578,7 @@ func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddres
 }
 
 func (s *NATSTransport) handleEntries(ctx context.Context) func(*nats.Msg) {
-	return rpcHandler(s, ctx, s.chConsume, newMultipartAssembler(),
+	return rpcHandler(s, ctx, s.chConsume, nil, newMultipartAssembler(),
 		func() *pb.AppendEntriesRequest { return &pb.AppendEntriesRequest{} },
 		func(r *pb.AppendEntriesRequest) interface{} { return r.Convert() },
 		func(i interface{}) *pb.CommandResponse {
@@ -640,7 +716,7 @@ func (s *NATSTransport) RequestPreVote(_ raft.ServerID, address raft.ServerAddre
 }
 
 func (s *NATSTransport) handlePreVote(ctx context.Context) func(*nats.Msg) {
-	return rpcHandler(s, ctx, s.chConsume, nil,
+	return rpcHandler(s, ctx, s.chConsume, nil, nil,
 		func() *pb.RequestPreVoteRequest { return &pb.RequestPreVoteRequest{} },
 		func(r *pb.RequestPreVoteRequest) interface{} { return r.Convert() },
 		func(i interface{}) *pb.CommandResponse {
@@ -650,7 +726,7 @@ func (s *NATSTransport) handlePreVote(ctx context.Context) func(*nats.Msg) {
 }
 
 func (s *NATSTransport) handleVote(ctx context.Context) func(*nats.Msg) {
-	return rpcHandler(s, ctx, s.chConsume, nil,
+	return rpcHandler(s, ctx, s.chConsume, nil, nil,
 		func() *pb.RequestVoteRequest { return &pb.RequestVoteRequest{} },
 		func(r *pb.RequestVoteRequest) interface{} { return r.Convert() },
 		func(i interface{}) *pb.CommandResponse {
@@ -743,7 +819,7 @@ func (s *NATSTransport) StopPersistedConsumer() error {
 }
 
 func (s *NATSTransport) handleTimeoutNow(ctx context.Context) func(*nats.Msg) {
-	return rpcHandler(s, ctx, s.chConsume, nil,
+	return rpcHandler(s, ctx, s.chConsume, nil, nil,
 		func() *pb.TimeoutNowRequest { return &pb.TimeoutNowRequest{} },
 		func(r *pb.TimeoutNowRequest) interface{} { return r.Convert() },
 		func(i interface{}) *pb.CommandResponse {
