@@ -13,6 +13,35 @@ import (
 	"github.com/tehsphinx/quasar/transports"
 )
 
+// TestRaftStatsCarriesLivenessKeys covers RT-13896: the keys gatex scrapes as
+// raft liveness gauges must be present in the raw stats map.
+func TestRaftStatsCarriesLivenessKeys(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	asrt := is.New(t)
+
+	addr, transport := transports.NewInmemTransport("")
+	cache, err := quasar.NewCache(ctx, exampleFSM.NewInMemoryFSM(),
+		quasar.WithLocalID("cache1"),
+		quasar.WithTransport(transport),
+		quasar.WithServers([]raft.Server{{ID: "cache1", Address: addr, Suffrage: raft.Voter}}),
+	)
+	asrt.NoErr(err)
+	defer cache.Shutdown()
+
+	asrt.NoErr(cache.WaitReady(ctx))
+
+	stats := cache.RaftStats()
+	for _, key := range []string{
+		"last_log_index", "last_snapshot_index", "applied_index", "commit_index", "fsm_pending",
+	} {
+		if _, ok := stats[key]; !ok {
+			t.Errorf("RaftStats is missing %q, got %v", key, stats)
+		}
+	}
+}
+
 // TestGetRaftStatusHealthyOnFollower is the RT-13042 H3 regression test.
 // GetRaftStatus used VerifyLeader on every node, but followers answer the
 // verify future with ErrNotLeader (raft v1.7.3), so a healthy follower always
