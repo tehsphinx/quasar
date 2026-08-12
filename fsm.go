@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/hashicorp/raft"
-	"github.com/tehsphinx/quasar/cond"
+	"github.com/tehsphinx/quasar/internal/cond"
 	"github.com/tehsphinx/quasar/pb/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -52,11 +52,9 @@ type logApplier interface {
 }
 
 func wrapFSM(fsm FSM) *fsmWrapper {
-	mutex := &sync.Mutex{}
 	s := &fsmWrapper{
-		fsm:   fsm,
-		condM: mutex,
-		cond:  cond.New(mutex),
+		fsm:  fsm,
+		cond: cond.New(),
 	}
 	// The logApplier fast path returns the unexported applyResponse, which
 	// applyLocal type-asserts. Only the internal kvFSM can satisfy that
@@ -84,7 +82,6 @@ type fsmWrapper struct {
 	restoreIndex uint64
 	sysUIDsM     sync.Mutex
 	sysUIDs      []uint64
-	condM        *sync.Mutex
 	cond         *cond.Cond
 
 	// hasLeader reports whether the cache currently sees a raft leader.
@@ -228,27 +225,53 @@ func (s *fsmWrapper) store(log *raft.Log, cmd *pb.Store) (*pb.CommandResponse, e
 	return respStore(&pb.StoreResponse{Uid: log.Index}), err
 }
 
+// WaitFor blocks until the FSM has applied uid, or until ctx expires.
+//
+// The wait takes no lock on purpose. The broadcast sites run on raft's own
+// goroutines — uidApplied on the FSM goroutine, regSystemUID on the main
+// goroutine via the store wrapper — and sharing a mutex with the waiters made
+// their per-broadcast cost grow with the number of in-flight waiters, enough to
+// stall either one under a client retry storm (RT-13896). What replaces the
+// mutex is an ordering: the applier publishes lastApplied BEFORE swapping and
+// closing the wait channel, and a waiter installs the wait channel BEFORE
+// re-reading lastApplied. Go's atomics are sequentially consistent, so whichever
+// side goes first is observed by the other and no wakeup is lost.
+//
+// This makes the WAKE path lock-free, not the whole apply path: applySysUIDs
+// still takes sysUIDsM, shared with queueSysUID on the main goroutine. That
+// contention is bounded by two goroutines and a slice reslice, not by the
+// waiter count, which is why it stays.
 func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
-	s.condM.Lock()
-	defer s.condM.Unlock()
+	for {
+		if s.getLastApplied() >= uid {
+			return nil
+		}
 
-	for s.getLastApplied() < uid {
-		if err := s.cond.WaitContext(ctx); err != nil {
+		// Install first, then re-check: see the ordering note above.
+		ch := s.cond.WaitChan()
+		if s.getLastApplied() >= uid {
+			return nil
+		}
+
+		select {
+		case <-ch:
+			// Broadcast wakes every waiter on every applied entry, so loop to
+			// find out whether the entry that landed is this waiter's.
+		case <-ctx.Done():
 			// The wait channel may have been closed by a Broadcast at the same
 			// instant the context expired; select then picks ctx.Done() at
 			// random even though the condition was actually met. Re-check once
-			// (the lock is held again here) so a wait that succeeded exactly at
-			// the deadline is not reported as a timeout (m25).
+			// so a wait that succeeded exactly at the deadline is not reported
+			// as a timeout (m25).
 			if s.getLastApplied() >= uid {
 				return nil
 			}
 			if s.hasLeader != nil && !s.hasLeader() {
-				return errors.Join(err, ErrWaitFor, ErrNoLeader)
+				return errors.Join(ctx.Err(), ErrWaitFor, ErrNoLeader)
 			}
-			return errors.Join(err, ErrWaitFor)
+			return errors.Join(ctx.Err(), ErrWaitFor)
 		}
 	}
-	return nil
 }
 
 func (s *fsmWrapper) uidApplied(uid uint64) {
@@ -256,9 +279,8 @@ func (s *fsmWrapper) uidApplied(uid uint64) {
 
 	s.applySysUIDs()
 
-	s.condM.Lock()
-	defer s.condM.Unlock()
-
+	// No lock: lastApplied is published above, before Broadcast swaps and closes
+	// the wait channel. See WaitFor.
 	s.cond.Broadcast()
 }
 
@@ -270,9 +292,6 @@ func (s *fsmWrapper) regSystemUID(uid uint64) {
 		// commits, so the commit-time registration must pop the queue or
 		// lastApplied stalls until the first command applies.
 		s.applySysUIDs()
-
-		s.condM.Lock()
-		defer s.condM.Unlock()
 
 		s.cond.Broadcast()
 		return

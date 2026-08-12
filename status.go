@@ -129,6 +129,37 @@ func (s *Cache) GetRaftStatus() RaftStatus {
 	return status
 }
 
+// RaftStats returns raft's raw statistics map (raft.Raft.Stats), which carries
+// the counters that distinguish a healthy cluster from a stalled one. The two
+// stalls report differently, so read the keys in two groups:
+//
+//   - fsm_pending is the only FSM gauge: it is len(raft's fsmMutateCh), which
+//     raft buffers at 128. Saturated at 128 while commit_index keeps climbing
+//     is a stopped FSM goroutine.
+//   - last_log_index, commit_index, last_snapshot_index and applied_index
+//     track the raft MAIN goroutine. applied_index in particular is set at the
+//     end of raft's processLogs, after the batch is handed to fsmMutateCh and
+//     not after the FSM applied it, so a wedged FSM lets it climb by up to a
+//     full 128-batch buffer before it freezes too — and once frozen it reports
+//     the main goroutine blocked on the FSM, the second-order symptom.
+//
+// It deliberately does NOT go through GetRaftStatus: on the leader that calls
+// VerifyLeader, which round-trips through the raft main goroutine. When the FSM
+// stalls, that goroutine is exactly what is blocked, so a scrape built on it
+// hangs instead of reporting, and the leader's series go absent at the moment
+// they matter most (RT-13896). raft.Stats() only reads atomics and short-lived
+// mutexes; its GetConfiguration call is answered inline from an atomic.Value.
+//
+// Returns nil before raft has been started.
+func (s *Cache) RaftStats() map[string]string {
+	cacheRaft := s.raft()
+	if cacheRaft == nil {
+		return nil
+	}
+
+	return cacheRaft.Stats()
+}
+
 // heartbeatTimeout returns the HeartbeatTimeout the raft instance runs with —
 // the user-supplied raft config when set, raft's default otherwise. Read-only:
 // deliberately does not go through raftConfig, which mutates the config.

@@ -21,3 +21,13 @@ func TestDetermineClusterHealthNoUnderflow(t *testing.T) {
 		t.Fatal("expected healthy when LastApplied > CommitIndex (lag underflow)")
 	}
 }
+
+// TestRaftStatsBeforeStart covers RT-13896: the metrics scrape calls RaftStats
+// on whatever cache exists, including one whose raft instance is not up yet.
+func TestRaftStatsBeforeStart(t *testing.T) {
+	c := &Cache{}
+
+	if stats := c.RaftStats(); stats != nil {
+		t.Fatalf("expected nil stats before raft is started, got %v", stats)
+	}
+}
