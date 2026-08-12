@@ -404,6 +404,12 @@ func TestNATSTransport_RaftRPCErrorEnvelope(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 	defer func() { _ = sub.Unsubscribe() }()
+	// The RPCs below go out on connLive/connRepl, not on this connection, so
+	// the SUB has to reach the server first or they find no responder
+	// (RT-13901).
+	if err := trans.conn.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
 	voteArgs := raft.RequestVoteRequest{Term: 20, RPCHeader: raft.RPCHeader{Addr: []byte("butters")}}
 	var voteResp raft.RequestVoteResponse

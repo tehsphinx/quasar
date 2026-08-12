@@ -5,6 +5,7 @@ package transports
 import (
 	"bytes"
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,6 +90,10 @@ func (t *testAddrProvider) ServerAddr(id raft.ServerID) (raft.ServerAddress, err
 // map them into calls to testing.T.Log, so that you only see
 // the logging for failed tests.
 type testLoggerAdapter struct {
+	// mu guards the t.Log call itself, not just done: without it a write that
+	// has already passed the done check can still land after the cleanup ran.
+	mu     sync.Mutex
+	done   bool
 	tb     testing.TB
 	prefix string
 }
@@ -96,6 +101,12 @@ type testLoggerAdapter struct {
 func (a *testLoggerAdapter) Write(d []byte) (int, error) {
 	if d[len(d)-1] == '\n' {
 		d = d[:len(d)-1]
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.done {
+		return len(d), nil
 	}
 	if a.prefix != "" {
 		l := a.prefix + ": " + string(d)
@@ -130,8 +141,18 @@ func newTestLoggerWithPrefix(tb testing.TB, prefix string) hclog.Logger {
 		return hclog.New(&hclog.LoggerOptions{Name: prefix})
 	}
 
+	adapter := &testLoggerAdapter{tb: tb, prefix: prefix}
+	// NATS runs the connection callbacks on its own dispatcher goroutine, so
+	// closing a transport at the end of a test logs after the test returned and
+	// t.Log panics — the hazard the comment above warns about (RT-13901).
+	tb.Cleanup(func() {
+		adapter.mu.Lock()
+		adapter.done = true
+		adapter.mu.Unlock()
+	})
+
 	return hclog.New(&hclog.LoggerOptions{
 		Name:   prefix,
-		Output: &testLoggerAdapter{tb: tb, prefix: prefix},
+		Output: adapter,
 	})
 }

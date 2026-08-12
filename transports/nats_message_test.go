@@ -241,6 +241,12 @@ func TestNATSTransport_MultipartFinalPartCarriesHeaders(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 	defer func() { _ = sub.Unsubscribe() }()
+	// request() publishes on connRepl/connBulk, not on nc: without waiting for
+	// the server to register this SUB the request can arrive before it and get
+	// no responder (RT-13901).
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 
 	// Payload well above maxMsgSize so request() takes the multipart path.
 	req := &pb.Store{Key: "big", Data: bytes.Repeat([]byte("x"), 4*1024)}

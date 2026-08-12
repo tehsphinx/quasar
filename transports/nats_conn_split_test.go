@@ -5,6 +5,7 @@ package transports
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -68,6 +69,10 @@ func TestNATSTransport_RaftConnsSplitBySubject(t *testing.T) {
 // is driven twice, once from a split sender and once from a sender whose three
 // connections are collapsed back onto one, and the split must be materially
 // faster. Collapse the assignment and this fails.
+//
+// Medians, not worst round trips: the worst beat of a run is one scheduler
+// hiccup, which on a loaded machine lands on the split run as easily as on the
+// shared one and inverts the comparison (RT-13901).
 func TestNATSTransport_HeartbeatSurvivesBulkTraffic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -93,25 +98,25 @@ func TestNATSTransport_HeartbeatSurvivesBulkTraffic(t *testing.T) {
 		}
 	}()
 
-	split := worstBeatUnderBulkLoad(ctx, t, receiver, "bulkload-split", false)
-	shared := worstBeatUnderBulkLoad(ctx, t, receiver, "bulkload-shared", true)
-	t.Logf("worst heartbeat round trip under bulk load: split=%s shared=%s", split, shared)
+	split := medianBeatUnderBulkLoad(ctx, t, receiver, "bulkload-split", false)
+	shared := medianBeatUnderBulkLoad(ctx, t, receiver, "bulkload-shared", true)
+	t.Logf("median heartbeat round trip under bulk load: split=%s shared=%s", split, shared)
 
 	// A factor, not a wall-clock bound: the blocking is structural (one
 	// connection mutex held across socket flushes), so the gap is large — 15 ms
 	// vs 100 ms when this was written — and 2× leaves room for a noisy machine.
 	const minGain = 2
 	if split*minGain > shared {
-		t.Fatalf("split heartbeat round trip %s is not %dx better than sharing one connection (%s) — the connection assignment is no longer isolating the beat",
+		t.Fatalf("median heartbeat round trip %s is not %dx better than sharing one connection (%s) — the connection assignment is no longer isolating the beat",
 			split, minGain, shared)
 	}
 }
 
-// worstBeatUnderBulkLoad drives a snapshot stream and full replication batches
-// at receiver from a fresh sender, and returns the worst heartbeat round trip
+// medianBeatUnderBulkLoad drives a snapshot stream and full replication batches
+// at receiver from a fresh sender, and returns the median heartbeat round trip
 // measured while that load runs. With collapse set, the sender publishes
 // everything on one connection — the pre-RT-13733 behaviour.
-func worstBeatUnderBulkLoad(ctx context.Context, t *testing.T, receiver *NATSTransport, name string, collapse bool) time.Duration {
+func medianBeatUnderBulkLoad(ctx context.Context, t *testing.T, receiver *NATSTransport, name string, collapse bool) time.Duration {
 	t.Helper()
 
 	sender, err := makeNATSTransport(ctx, t, "test-cache", name)
@@ -159,21 +164,21 @@ func worstBeatUnderBulkLoad(ctx context.Context, t *testing.T, receiver *NATSTra
 		beats   = 50
 		beatGap = 10 * time.Millisecond
 	)
-	var worst time.Duration
+	rtts := make([]time.Duration, 0, beats)
 	for i := 0; i < beats; i++ {
 		var out raft.AppendEntriesResponse
 		start := time.Now()
 		if err := sender.AppendEntries("id1", receiver.LocalAddr(), &hbArgs, &out); err != nil {
 			t.Fatalf("heartbeat %d failed while bulk traffic was streaming: %v", i, err)
 		}
-		if d := time.Since(start); worst < d {
-			worst = d
-		}
+		rtts = append(rtts, time.Since(start))
 		time.Sleep(beatGap)
 	}
 	stopLoad()
 	load.Wait()
-	return worst
+
+	slices.Sort(rtts)
+	return rtts[len(rtts)/2]
 }
 
 // makeAppendRPCFullBatch is a MaxAppendEntries=512 batch of contact-version

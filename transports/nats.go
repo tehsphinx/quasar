@@ -220,6 +220,17 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 		return err
 	}
 
+	// Subscribe only queues the SUB on the local connection, so the server may
+	// not know about these subjects yet. Every send path publishes on another
+	// connection, and a member that announces itself the moment the transport
+	// is built has its first requests answered by nobody unless the SUBs are
+	// registered first (RT-13901).
+	for _, nc := range []*nats.Conn{s.connLive, s.connRepl, s.connBulk} {
+		if err := nc.Flush(); err != nil {
+			return err
+		}
+	}
+
 	go func() {
 		<-ctx.Done()
 		_ = subEntries.Unsubscribe()
