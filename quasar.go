@@ -425,6 +425,12 @@ type Cache struct {
 	quorumProbeAt      time.Time
 	quorumProbeReached bool
 
+	// verifyInFlight single-flights the leader-side VerifyLeader probe of
+	// GetRaftStatus, so a stalled raft main goroutine costs one parked
+	// goroutine in total rather than one per status request (RT-13900).
+	verifyM        sync.Mutex
+	verifyInFlight bool
+
 	ctx   context.Context
 	close context.CancelFunc
 
