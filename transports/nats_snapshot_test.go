@@ -360,7 +360,7 @@ func TestNATSTransport_InstallSnapshotLargerThanClientPendingLimit(t *testing.T)
 // silently drops the rest. If a nats.go upgrade ever changes these semantics,
 // this test says so explicitly.
 func TestNATSSubscriptionDefaultPendingLimitDropsOversizedStream(t *testing.T) {
-	nc, err := nats.Connect(natsURL, nats.Timeout(natsTimeout))
+	nc, err := nats.Connect(natsURL, natsTestOptions()...)
 	if err != nil {
 		t.Skipf("NATS not available: %v", err)
 	}

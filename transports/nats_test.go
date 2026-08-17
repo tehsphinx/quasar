@@ -5,6 +5,7 @@ package transports
 import (
 	"cmp"
 	"context"
+	"crypto/tls"
 	"errors"
 	"os"
 	"reflect"
@@ -26,11 +27,24 @@ const natsTimeout = 5 * time.Second
 
 var natsURL = cmp.Or(os.Getenv("NATS_URL"), "nats://localhost:4222")
 
+// natsTestOptions returns the connect options for test connections. Set
+// NATS_TLS_INSECURE=1 to skip certificate verification when NATS_URL points
+// at a TLS server reached under a name its certificate does not cover (e.g.
+// a QA host addressed by an internal hostname).
+func natsTestOptions() []nats.Option {
+	opts := []nats.Option{nats.Timeout(natsTimeout)}
+	if os.Getenv("NATS_TLS_INSECURE") == "1" {
+		//nolint:gosec // test-only escape hatch, opt-in via env
+		opts = append(opts, nats.Secure(&tls.Config{InsecureSkipVerify: true}))
+	}
+	return opts
+}
+
 func makeNATSTransport(ctx context.Context, t *testing.T, cacheName, serverName string) (*NATSTransport, error) {
 	t.Helper()
 
 	// Connect to NATS
-	nc, err := nats.Connect(natsURL, nats.Timeout(natsTimeout))
+	nc, err := nats.Connect(natsURL, natsTestOptions()...)
 	if err != nil {
 		return nil, err
 	}
