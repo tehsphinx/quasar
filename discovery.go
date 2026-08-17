@@ -30,6 +30,15 @@ const addServerHardResetTimeout = 5 * time.Second
 // caller for the whole lease, so bound the commit-wait explicitly (L8).
 const addServerCommitTimeout = 5 * time.Second
 
+// addMissingServersInterval is the cadence of the leader's periodic sweep
+// re-adding discovery-known peers that are missing from the raft
+// configuration. addServer runs once per newly discovered peer, and a single
+// transient failure (a hard-reset RPC into a restarting pod, a commit timeout)
+// used to exile that peer permanently: it stayed "known", so no later ping
+// retried the add, and its own restarts kept it pinging too often to ever be
+// pruned back into "new" (RT-13934). The sweep is the retry path.
+const addMissingServersInterval = 3 * time.Second
+
 // Discovery defines a auto discovery for servers of the cache.
 type Discovery interface {
 	Inject(cache *DiscoveryInjector)
@@ -196,9 +205,22 @@ func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status Peer
 	}
 
 	if err := s.addServer(srv); err != nil {
-		// TODO: log?
+		s.logAddServerFailure(srv, err)
 		return
 	}
+}
+
+// logAddServerFailure reports a failed addServer attempt. Every node processes
+// every discovery ping, so on a non-leader the failure is the expected
+// "not the leader" and stays at debug; anything else is a real error — the
+// kind that used to be swallowed here and exile the peer (RT-13934).
+func (s *DiscoveryInjector) logAddServerFailure(srv raft.Server, err error) {
+	if errors.Is(err, raft.ErrNotLeader) {
+		s.Logger().Debug("not adding discovered server: not the leader", "server", srv.ID)
+		return
+	}
+	s.Logger().Error("failed to add discovered server to raft",
+		"server", srv.ID, "address", srv.Address, "error", err)
 }
 
 // PeerInCluster returns a channel that is closed when ProcessServer (with
@@ -343,6 +365,14 @@ func (s *DiscoveryInjector) regObservation(ctx context.Context, rft *raft.Raft) 
 	// above stops the predecessor's ticker along with its observer.
 	if s.cache.cfg.pruneAfter != 0 {
 		s.registerPruning(ctx, s.cache.cfg.pruneAfter)
+
+		// The leader's periodic re-add sweep shares the per-raft cancel with
+		// pruning and the observer for the same reason (RT-13042 M9). It is
+		// tied to pruning on purpose: the sweep's premise is that the servers
+		// map only holds recently-alive peers, and only the prune ticker
+		// upholds that — without it the sweep would retry long-dead peers
+		// forever instead of ending the exile of live ones.
+		s.registerAddMissingServers(ctx)
 	}
 
 	// Non-blocking observer: raft's `observe` holds observersLock.RLock
@@ -428,17 +458,62 @@ func (s *DiscoveryInjector) refreshVoterCount(rft *raft.Raft) {
 	s.voterCount.Store(count)
 }
 
+// addMissingServers (re-)adds every discovery-known peer that is absent from
+// the raft configuration or recorded there under a stale address. It compares
+// against the configuration itself rather than the applied bookkeeping: peer
+// observations are delivered on the leader only and on a droppable channel,
+// so the applied set goes stale across leadership changes — and a stale entry
+// would keep the peer it covers exiled (RT-13934).
 func (s *DiscoveryInjector) addMissingServers() {
+	rft := s.cache.raft()
+	if rft == nil {
+		return
+	}
+	cfgFut := rft.GetConfiguration()
+	if err := cfgFut.Error(); err != nil {
+		return
+	}
+	inConfig := make(map[raft.ServerID]raft.ServerAddress)
+	for _, srv := range cfgFut.Configuration().Servers {
+		inConfig[srv.ID] = srv.Address
+	}
+
 	for _, srv := range s.getServers() {
-		if s.hasApplied(srv.ID) {
+		if srv.ID == raft.ServerID(s.cache.localID) {
+			continue
+		}
+		if addr, ok := inConfig[srv.ID]; ok && addr == srv.Address {
 			continue
 		}
 
-		//nolint:staticcheck // empty branch will be filled later
 		if err := s.addServer(srv); err != nil {
-			// TODO: log?
+			s.logAddServerFailure(srv, err)
 		}
 	}
+}
+
+// registerAddMissingServers starts the leader's periodic addMissingServers
+// sweep. The inline addServer on a peer's first ping is a single attempt;
+// this sweep is its retry, ending the exile of any pinging peer whose add
+// failed transiently (RT-13934).
+func (s *DiscoveryInjector) registerAddMissingServers(ctx context.Context) {
+	tick := time.NewTicker(addMissingServersInterval)
+
+	go func() {
+		defer tick.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if !s.cache.IsLeader() {
+					continue
+				}
+				s.addMissingServers()
+			}
+		}
+	}()
 }
 
 func (s *DiscoveryInjector) registerPruning(ctx context.Context, after time.Duration) {
