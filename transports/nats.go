@@ -144,9 +144,7 @@ func (s *NATSTransport) dialRaftConn(conn *nats.Conn, role string) *nats.Conn {
 	opts.ClosedCB = func(_ *nats.Conn) {
 		s.logger.Info("raft NATS connection closed", "role", role)
 	}
-	opts.AsyncErrorCB = func(_ *nats.Conn, sub *nats.Subscription, err error) {
-		s.logger.Error("raft NATS connection error", "role", role, "subject", sub.Subject, "error", err)
-	}
+	opts.AsyncErrorCB = raftConnErrorHandler(s.logger, role)
 	opts.DiscoveredServersCB = nil
 	opts.LameDuckModeHandler = nil
 
@@ -158,6 +156,20 @@ func (s *NATSTransport) dialRaftConn(conn *nats.Conn, role string) *nats.Conn {
 	}
 	s.ownedConns = append(s.ownedConns, nc)
 	return nc
+}
+
+// raftConnErrorHandler is the AsyncErrorCB of the dedicated raft connections.
+// The nats client passes a nil subscription for connection-level errors (a
+// failed flush, for one) — only subscription-level errors like a slow
+// consumer carry one — so the subject must not be read unguarded (RT-13934).
+func raftConnErrorHandler(logger hclog.Logger, role string) func(*nats.Conn, *nats.Subscription, error) {
+	return func(_ *nats.Conn, sub *nats.Subscription, err error) {
+		subject := ""
+		if sub != nil {
+			subject = sub.Subject
+		}
+		logger.Error("raft NATS connection error", "role", role, "subject", subject, "error", err)
+	}
 }
 
 func (s *NATSTransport) listen(ctx context.Context) error {
