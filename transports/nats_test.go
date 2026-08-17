@@ -5,6 +5,7 @@ package transports
 import (
 	"cmp"
 	"context"
+	"errors"
 	"os"
 	"reflect"
 	"strings"
@@ -791,4 +792,15 @@ func TestNATSTransport_Heartbeat_NilHandlerRoutesToConsumer(t *testing.T) {
 	if !servedViaConsumer.Load() {
 		t.Fatalf("nil-handler heartbeat was not served via the consumer (chConsume)")
 	}
+}
+
+// TestRaftConnErrorHandlerNilSubscription reproduces the RT-13934 panic: the
+// nats client invokes AsyncErrorCB with a nil subscription for
+// connection-level errors (e.g. a failed flush); the handler must not
+// dereference it.
+func TestRaftConnErrorHandlerNilSubscription(t *testing.T) {
+	handler := raftConnErrorHandler(newTestLogger(t), "bulk")
+
+	handler(nil, nil, errors.New("nats: connection closed"))
+	handler(nil, &nats.Subscription{Subject: "quasar.some.subject"}, errors.New("nats: slow consumer"))
 }
