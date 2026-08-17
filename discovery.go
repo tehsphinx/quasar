@@ -561,6 +561,8 @@ func (s *DiscoveryInjector) pruneExpiredServers(pruneBefore time.Time) {
 			if s.cache.IsLeader() {
 				// only remove from raft when leader
 				if err := s.removeServer(srv.ID); err != nil {
+					s.Logger().Warn("failed to remove expired server from raft",
+						"server", srv.ID, "error", err)
 					continue
 				}
 			}
