@@ -445,3 +445,98 @@ func TestAdmissionWipeKeyedToCurrentIncarnation(t *testing.T) {
 		t.Fatalf("expected the peer to adopt the leader's instance ID %q at the admission wipe, got %q", leaderInst, got)
 	}
 }
+
+// TestAddMissingServersSweepEndsExile is the RT-13934 regression test.
+//
+// addServer runs exactly once per newly discovered peer: ProcessServerWithStatus
+// records the peer as known BEFORE adding it, and a failed add was silently
+// discarded. A single transient failure (a hard-reset RPC into a restarting
+// pod, a commit timeout) therefore exiled the peer permanently — it stayed
+// "known", so no later ping retried the add, and a crash-looping peer pings
+// far too often to ever be pruned back into "new". On production siteC this
+// left an fserver out of the raft configuration across every restart: nothing
+// contacted it and WaitReady died on its timeout, no matter its length.
+//
+// The fix is the leader's periodic addMissingServers sweep, which compares
+// discovery-known peers against the raft configuration itself. This test
+// creates exactly the latched state — a peer known to discovery, absent from
+// the configuration, with no leadership change in sight — and asserts the
+// sweep adds it.
+func TestAddMissingServersSweepEndsExile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewKVCache(ctx,
+		WithLocalID("leader"),
+		WithTransport(tr),
+		WithBootstrap(true),
+		// The sweep registers only alongside pruning — its premise that the
+		// servers map holds recently-alive peers is upheld by the prune
+		// ticker. The window is far longer than the test so the never-pinging
+		// ghost is not pruned while the sweep is under assertion.
+		WithAutoPrune(time.Minute),
+	)
+	if err != nil {
+		t.Fatalf("NewKVCache: %v", err)
+	}
+	defer func() { _ = c.Shutdown() }()
+
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	if !c.IsLeader() {
+		t.Fatal("bootstrapped lone voter did not become leader")
+	}
+
+	// The latched state ProcessServerWithStatus leaves behind when its inline
+	// addServer attempt failed: known to discovery, absent from the raft
+	// configuration. The leader's own instance ID skips the admission wipe —
+	// the ghost has no live process to answer a hard-reset RPC.
+	ghost := raft.Server{ID: "ghost", Address: "ghost-addr", Suffrage: raft.Nonvoter}
+	c.discovery.setServerWithInstanceID(ghost, c.getInstanceID())
+
+	srvs, err := c.GetServerList()
+	if err != nil {
+		t.Fatalf("GetServerList: %v", err)
+	}
+	if containsServer(srvs, ghost.ID) {
+		t.Fatal("precondition failed: ghost already in raft configuration")
+	}
+
+	// No ping from the ghost will ever retry the add (it is not "new"), and
+	// leadership does not change: only the periodic sweep can end the exile.
+	deadline := time.Now().Add(3 * addMissingServersInterval)
+	for {
+		srvs, err := c.GetServerList()
+		if err != nil {
+			t.Fatalf("GetServerList: %v", err)
+		}
+		if containsServer(srvs, ghost.ID) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("periodic sweep did not add the exiled peer to the raft configuration")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// A peer that is in the configuration on its current address must not be
+	// re-added: every sweep would otherwise commit a fresh (identical)
+	// configuration entry.
+	idx := configIndex(t, c)
+	c.discovery.addMissingServers()
+	if got := configIndex(t, c); got != idx {
+		t.Fatalf("sweep re-added an in-config peer: configuration index moved %d -> %d", idx, got)
+	}
+}
+
+func configIndex(t *testing.T, c *KVCache) uint64 {
+	t.Helper()
+
+	fut := c.raft().GetConfiguration()
+	if err := fut.Error(); err != nil {
+		t.Fatalf("GetConfiguration: %v", err)
+	}
+	return fut.Index()
+}
