@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"io"
 	"math/rand"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
 )
@@ -101,6 +103,15 @@ type snapshotStreamResult struct {
 // directly, without NATS.
 func startSnapshotStream(t *testing.T) (func(subject string, data []byte), chan snapshotStreamResult) {
 	t.Helper()
+	return startSnapshotStreamWithLogger(t, newTestLogger(t), 0)
+}
+
+// startSnapshotStreamWithLogger is startSnapshotStream with the handler's
+// logger and announced snapshot size under the test's control, so the progress
+// reporting can be asserted on.
+func startSnapshotStreamWithLogger(t *testing.T, logger hclog.Logger, size int64,
+) (func(subject string, data []byte), chan snapshotStreamResult) {
+	t.Helper()
 
 	pipeReader, pipeWriter := io.Pipe()
 	timer := time.AfterFunc(time.Second, func() {
@@ -108,7 +119,7 @@ func startSnapshotStream(t *testing.T) (func(subject string, data []byte), chan 
 	})
 	t.Cleanup(func() { timer.Stop() })
 
-	handler := snapshotPkgHandler(newTestLogger(t), timer, pipeWriter)
+	handler := snapshotPkgHandler(logger, timer, pipeWriter, size)
 
 	chResult := make(chan snapshotStreamResult, 1)
 	go func() {
@@ -402,5 +413,118 @@ func TestNATSSubscriptionDefaultPendingLimitDropsOversizedStream(t *testing.T) {
 			t.Fatalf("no messages dropped after %d x %d bytes on a default-limit subscription", totalMsgs, maxPkgSize)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// captureJSONLogger returns an hclog logger writing JSON into buf, plus the
+// buf, so a test can assert on the fields of individual log lines.
+func captureJSONLogger() (hclog.Logger, *bytes.Buffer) {
+	buf := &bytes.Buffer{}
+	return hclog.New(&hclog.LoggerOptions{
+		Output:     buf,
+		JSONFormat: true,
+		Level:      hclog.Info,
+	}), buf
+}
+
+// progressLines returns the "snapshot transfer progress" lines found in buf,
+// decoded, ignoring anything else the stream logged.
+func progressLines(t *testing.T, buf *bytes.Buffer) []map[string]interface{} {
+	t.Helper()
+
+	var lines []map[string]interface{}
+	for _, raw := range bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+		if len(raw) == 0 {
+			continue
+		}
+		var line map[string]interface{}
+		if err := json.Unmarshal(raw, &line); err != nil {
+			t.Fatalf("undecodable log line %q: %v", raw, err)
+		}
+		if line["@message"] == "snapshot transfer progress" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// TestSnapshotProgressReportsBytesAndPercent covers RT-14059: the receiver must
+// report snapshot transfer progress itself. raft monitors the same transfer, but
+// its first line only lands after a hardcoded 10s, so an install that completes
+// sooner was reported by nothing but a closing 100% line and a slower one far
+// too rarely. Every stream must at minimum close with a line carrying the bytes
+// received and the percentage of the announced size.
+func TestSnapshotProgressReportsBytesAndPercent(t *testing.T) {
+	logger, buf := captureJSONLogger()
+	handler, chResult := startSnapshotStreamWithLogger(t, logger, 10)
+
+	handler("subj.send.1", []byte("abcd"))
+	handler("subj.send.2", []byte("efgh"))
+	handler("subj.send.EOF", []byte("ij"))
+
+	if result := <-chResult; result.err != nil {
+		t.Fatalf("intact stream errored: %v", result.err)
+	}
+
+	lines := progressLines(t, buf)
+	// All three packages arrive well inside snapshotProgressInterval, so the
+	// closing line is the only one — the interval throttles the rest.
+	if len(lines) != 1 {
+		t.Fatalf("got %d progress lines, want 1 (the closing one): %s", len(lines), buf.String())
+	}
+	if got := lines[0]["read-bytes"]; got != float64(10) {
+		t.Fatalf("read-bytes = %v, want 10", got)
+	}
+	if got := lines[0]["percent-complete"]; got != "100.00%" {
+		t.Fatalf("percent-complete = %v, want 100.00%%", got)
+	}
+}
+
+// TestSnapshotProgressLogsOncePerInterval pins the cadence: a package arriving
+// after snapshotProgressInterval reports mid-stream, so a long transfer stays
+// observable while it runs instead of only at the end.
+func TestSnapshotProgressLogsOncePerInterval(t *testing.T) {
+	logger, buf := captureJSONLogger()
+	progress := newSnapshotProgress(logger, 100)
+
+	progress.record(10, false)
+	if lines := progressLines(t, buf); len(lines) != 0 {
+		t.Fatalf("got %d progress lines within the interval, want 0", len(lines))
+	}
+
+	// Age the last line past the interval instead of sleeping through it.
+	progress.lastLog = time.Now().Add(-2 * snapshotProgressInterval)
+	progress.record(15, false)
+
+	lines := progressLines(t, buf)
+	if len(lines) != 1 {
+		t.Fatalf("got %d progress lines after the interval elapsed, want 1: %s", len(lines), buf.String())
+	}
+	if got := lines[0]["read-bytes"]; got != float64(25) {
+		t.Fatalf("read-bytes = %v, want 25", got)
+	}
+	if got := lines[0]["percent-complete"]; got != "25.00%" {
+		t.Fatalf("percent-complete = %v, want 25.00%%", got)
+	}
+}
+
+// TestSnapshotProgressWithoutSize guards the percentage against a snapshot size
+// the leader did not announce: the line must still report the bytes received
+// rather than degenerate into NaN or +Inf.
+func TestSnapshotProgressWithoutSize(t *testing.T) {
+	logger, buf := captureJSONLogger()
+	progress := newSnapshotProgress(logger, 0)
+
+	progress.record(7, true)
+
+	lines := progressLines(t, buf)
+	if len(lines) != 1 {
+		t.Fatalf("got %d progress lines, want 1: %s", len(lines), buf.String())
+	}
+	if got := lines[0]["read-bytes"]; got != float64(7) {
+		t.Fatalf("read-bytes = %v, want 7", got)
+	}
+	if got := lines[0]["percent-complete"]; got != "unknown" {
+		t.Fatalf("percent-complete = %v, want unknown", got)
 	}
 }

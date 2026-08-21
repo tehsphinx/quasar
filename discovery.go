@@ -211,12 +211,13 @@ func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status Peer
 }
 
 // logAddServerFailure reports a failed addServer attempt. Every node processes
-// every discovery ping, so on a non-leader the failure is the expected
-// "not the leader" and stays at debug; anything else is a real error — the
-// kind that used to be swallowed here and exile the peer (RT-13934).
+// every discovery ping and only the leader can change the configuration, so
+// ErrNotLeader is the expected outcome on every other node — once per newly
+// discovered peer — and is dropped rather than logged (RT-14059). Anything
+// else is a real error: the kind that used to be swallowed here and exile the
+// peer (RT-13934).
 func (s *DiscoveryInjector) logAddServerFailure(srv raft.Server, err error) {
 	if errors.Is(err, raft.ErrNotLeader) {
-		s.Logger().Debug("not adding discovered server: not the leader", "server", srv.ID)
 		return
 	}
 	s.Logger().Error("failed to add discovered server to raft",
