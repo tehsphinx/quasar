@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
@@ -387,6 +388,10 @@ func (s *NATSTransport) replyOverload(msg *nats.Msg) {
 
 // Store asks the master to apply a change command to the raft cluster.
 func (s *NATSTransport) Store(ctx context.Context, _ raft.ServerID, address raft.ServerAddress, request *pb.Store) (*pb.StoreResponse, error) {
+	// The round trip spans the leader's full commit and apply, so this timer
+	// is the caller-side view of leader write latency (RT-13902).
+	defer metrics.MeasureSince([]string{"quasar", "cache", "store", "forward"}, time.Now())
+
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.timeout)
