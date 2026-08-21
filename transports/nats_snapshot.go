@@ -129,8 +129,17 @@ func (s *NATSTransport) requestOpenChannel(ctx context.Context, address raft.Ser
 
 func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(*nats.Msg) {
 	return func(msg *nats.Msg) {
+		// Decoded before the stream is opened: the request carries the snapshot
+		// size, which the receive side needs to report transfer progress as a
+		// percentage (RT-14059).
+		var protoMsg pb.InstallSnapshotRequest
+		if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
+			s.logger.Error("failed to decode incoming command", "error", r)
+			return
+		}
+
 		chanSubj := "quasar.snapshot.channel." + uuid.NewString()
-		pipeReader, chanSub, err := s.openNatsStream(chanSubj)
+		pipeReader, chanSub, err := s.openNatsStream(chanSubj, protoMsg.GetSize())
 		if err != nil {
 			s.logger.Error("failed to open snapshot channel", "error", err)
 			return
@@ -147,11 +156,7 @@ func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(*nats.Ms
 			return
 		}
 
-		chResp, rpc, err := s.buildConsumeMsg(msg, pipeReader)
-		if err != nil {
-			s.logger.Error("failed to decode incoming command", "error", err)
-			return
-		}
+		chResp, rpc := buildConsumeMsg(&protoMsg, pipeReader)
 
 		s.chConsume <- rpc
 
@@ -173,13 +178,13 @@ func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(*nats.Ms
 	}
 }
 
-func (s *NATSTransport) openNatsStream(subj string) (*io.PipeReader, *nats.Subscription, error) {
+func (s *NATSTransport) openNatsStream(subj string, size int64) (*io.PipeReader, *nats.Subscription, error) {
 	pipeReader, pipeWriter := io.Pipe()
 	timer := time.AfterFunc(snapshotPkgTimout, func() {
 		_ = pipeWriter.CloseWithError(context.DeadlineExceeded)
 	})
 
-	handler := snapshotPkgHandler(s.logger, timer, pipeWriter)
+	handler := snapshotPkgHandler(s.logger, timer, pipeWriter, size)
 	chanSub, err := s.connBulk.Subscribe(subj+".send.*", func(msg *nats.Msg) {
 		handler(msg.Subject, msg.Data)
 	})
@@ -218,16 +223,22 @@ var errSnapshotStreamBroken = errors.New("snapshot stream broken")
 // nats.go dispatches the callbacks of one async subscription serially from a
 // single goroutine — the ordered, blocking pipe writes already depend on
 // that — so the closure state needs no locking.
-func snapshotPkgHandler(logger hclog.Logger, timer *time.Timer, pipeWriter *io.PipeWriter) func(subject string, data []byte) {
+//
+// size is the snapshot size announced in the InstallSnapshot request and is
+// only used to report transfer progress.
+func snapshotPkgHandler(logger hclog.Logger, timer *time.Timer, pipeWriter *io.PipeWriter, size int64,
+) func(subject string, data []byte) {
 	expected := 1
 	failed := false
+	progress := newSnapshotProgress(logger, size)
 	return func(subject string, data []byte) {
 		if failed {
 			// The sender is fire-and-forget: after an abort the rest of the
 			// stream still arrives and is dropped here without further logs.
 			return
 		}
-		if !strings.HasSuffix(subject, ".EOF") {
+		isEOF := strings.HasSuffix(subject, ".EOF")
+		if !isEOF {
 			var err error
 			token := subject[strings.LastIndex(subject, ".")+1:]
 			got, convErr := strconv.Atoi(token)
@@ -246,8 +257,64 @@ func snapshotPkgHandler(logger hclog.Logger, timer *time.Timer, pipeWriter *io.P
 			}
 			expected++
 		}
-		writeSnapshotPkg(timer, pipeWriter, subject, data)
+		if writeSnapshotPkg(timer, pipeWriter, subject, data) {
+			progress.record(len(data), isEOF)
+		}
 	}
+}
+
+// snapshotProgressInterval is the minimum gap between receiver-side snapshot
+// transfer progress lines.
+const snapshotProgressInterval = time.Second
+
+// snapshotProgress logs the receiver's view of one snapshot transfer. raft
+// monitors the same transfer, but on a hardcoded 10s tick
+// (snapshotRestoreMonitorInterval) whose first line is only emitted once the
+// interval elapses — so a transfer finishing sooner is reported by a single
+// closing 100% line, and a slower one by very little (RT-14059).
+//
+// Progress is driven by the arriving packages rather than by a ticker: the pipe
+// write each package goes through blocks until raft consumes it, so the byte
+// count tracks what the FSM side has really ingested, and there is no goroutine
+// to tear down on the abort, timeout and EOF paths. A stream that stalls
+// therefore stops reporting; that case is already covered by the inter-package
+// timer, which fails the install with context.DeadlineExceeded.
+type snapshotProgress struct {
+	logger  hclog.Logger
+	size    int64
+	read    int64
+	lastLog time.Time
+}
+
+func newSnapshotProgress(logger hclog.Logger, size int64) *snapshotProgress {
+	return &snapshotProgress{logger: logger, size: size, lastLog: time.Now()}
+}
+
+// record accounts for one package handed to the FSM-side reader and logs
+// progress at most every snapshotProgressInterval. The last package of a
+// stream always logs, so every transfer closes with a final line. Field names
+// match raft's own progress monitor so both read alike.
+func (p *snapshotProgress) record(n int, last bool) {
+	p.read += int64(n)
+	if !last && time.Since(p.lastLog) < snapshotProgressInterval {
+		return
+	}
+	p.lastLog = time.Now()
+
+	p.logger.Info("snapshot transfer progress",
+		"read-bytes", p.read,
+		"size", p.size,
+		"percent-complete", p.percent())
+}
+
+// percent renders the share of the announced snapshot size received so far.
+// The size is whatever the leader put in the InstallSnapshot request; a
+// missing or nonsensical one must not turn the progress line into NaN or Inf.
+func (p *snapshotProgress) percent() string {
+	if p.size <= 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%0.2f%%", float64(100*p.read)/float64(p.size))
 }
 
 // writeSnapshotPkg hands one received snapshot package to the FSM-side reader
@@ -256,25 +323,24 @@ func snapshotPkgHandler(logger hclog.Logger, timer *time.Timer, pipeWriter *io.P
 // local reader (or a reinit window) must not be mistaken for a stalled network.
 // The timer only measures the gap between network packages, so it is re-armed
 // after a successful (non-EOF) write.
-func writeSnapshotPkg(timer *time.Timer, pipeWriter *io.PipeWriter, subject string, data []byte) {
+//
+// It reports whether the package reached the reader, so a caller tracking
+// transfer progress does not count a package the pipe rejected.
+func writeSnapshotPkg(timer *time.Timer, pipeWriter *io.PipeWriter, subject string, data []byte) bool {
 	timer.Stop()
 	if _, r := pipeWriter.Write(data); r != nil {
 		_ = pipeWriter.CloseWithError(r)
-		return
+		return false
 	}
 	if strings.HasSuffix(subject, ".EOF") {
 		_ = pipeWriter.Close()
-		return
+		return true
 	}
 	timer.Reset(snapshotPkgTimout)
+	return true
 }
 
-func (s *NATSTransport) buildConsumeMsg(msg *nats.Msg, pipeReader *io.PipeReader) (chan raft.RPCResponse, raft.RPC, error) {
-	var protoMsg pb.InstallSnapshotRequest
-	if r := proto.Unmarshal(msg.Data, &protoMsg); r != nil {
-		return nil, raft.RPC{}, r
-	}
-
+func buildConsumeMsg(protoMsg *pb.InstallSnapshotRequest, pipeReader *io.PipeReader) (chan raft.RPCResponse, raft.RPC) {
 	// Create the RPC object
 	chResp := make(chan raft.RPCResponse, 1)
 	rpc := raft.RPC{
@@ -282,5 +348,5 @@ func (s *NATSTransport) buildConsumeMsg(msg *nats.Msg, pipeReader *io.PipeReader
 		Command:  protoMsg.Convert(),
 		Reader:   pipeReader,
 	}
-	return chResp, rpc, nil
+	return chResp, rpc
 }
