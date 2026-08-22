@@ -84,8 +84,7 @@ func (s *Cache) GetRaftStatus() RaftStatus {
 	// follower start an election.
 	if status.HasLeader {
 		if status.IsLeader {
-			verifyFuture := cacheRaft.VerifyLeader()
-			status.LeaderHealthy = verifyFuture.Error() == nil
+			status.LeaderHealthy = s.verifyLeaderBounded(func() error { return cacheRaft.VerifyLeader().Error() })
 		} else {
 			status.LeaderHealthy = time.Since(cacheRaft.LastContact()) <= s.heartbeatTimeout()
 		}
@@ -127,6 +126,54 @@ func (s *Cache) GetRaftStatus() RaftStatus {
 	status.Healthy = s.determineClusterHealth(status)
 
 	return status
+}
+
+// verifyLeaderBounded reports whether raft's leadership verification succeeded
+// within the raft HeartbeatTimeout, without ever waiting longer than that.
+//
+// The verification is the one part of the status path that has to rendezvous
+// with raft's main goroutine, and that goroutine is exactly what stalls in the
+// failure this status is read to diagnose (RT-13900). It blocks in two places,
+// so bounding the future alone is not enough: VerifyLeader() itself blocks
+// sending on raft's verifyCh (capacity 64), and only then does the returned
+// future need an answer from the same goroutine. Both sit behind verify, which
+// therefore runs on its own goroutine.
+//
+// A stalled verify is single-flighted: a call made while one is outstanding
+// reports unhealthy immediately instead of parking another goroutine. Without
+// that, a 15s scrape over a multi-hour stall accumulates one goroutine and one
+// entry in raft's leaderState.notify per scrape, all of them released only when
+// the main goroutine recovers.
+func (s *Cache) verifyLeaderBounded(verify func() error) bool {
+	s.verifyM.Lock()
+	if s.verifyInFlight {
+		s.verifyM.Unlock()
+
+		return false
+	}
+	s.verifyInFlight = true
+	s.verifyM.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		err := verify()
+
+		s.verifyM.Lock()
+		s.verifyInFlight = false
+		s.verifyM.Unlock()
+
+		done <- err
+	}()
+
+	timer := time.NewTimer(s.heartbeatTimeout())
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err == nil
+	case <-timer.C:
+		return false
+	}
 }
 
 // RaftStats returns raft's raw statistics map (raft.Raft.Stats), which carries
