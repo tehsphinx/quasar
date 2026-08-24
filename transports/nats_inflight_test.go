@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/armon/go-metrics"
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar/pb/v1"
@@ -157,6 +158,51 @@ func TestNATSTransport_OverloadShedsWithExplicitError(t *testing.T) {
 	held.Respond(&pb.StoreResponse{Uid: 1}, nil)
 	if err := <-first; err != nil {
 		t.Fatalf("held store failed: %v", err)
+	}
+}
+
+// TestInflightSem_EmitsMetrics checks the RT-13902 emissions: sheds count into
+// a labeled counter and the in-flight depth tracks acquire/release in a labeled
+// gauge, so an overloaded leader is visible on a dashboard instead of only in
+// the two transition log lines.
+func TestInflightSem_EmitsMetrics(t *testing.T) {
+	sink := metrics.NewInmemSink(time.Minute, time.Minute)
+	cfg := metrics.DefaultConfig("")
+	cfg.EnableHostname = false
+	cfg.EnableRuntimeMetrics = false
+	if _, err := metrics.NewGlobal(cfg, sink); err != nil {
+		t.Fatalf("install inmem sink: %v", err)
+	}
+
+	const subj = "quasar.test-cache.metrics.cache.store"
+	sem := newInflightSem(newTestLogger(t), subj, 1)
+
+	if !sem.acquire() {
+		t.Fatal("first acquire on an empty semaphore was shed")
+	}
+	if sem.acquire() {
+		t.Fatal("second acquire on a single-slot semaphore was admitted")
+	}
+	sem.release()
+
+	interval := sink.Data()[0]
+	interval.RLock()
+	defer interval.RUnlock()
+
+	gauge, ok := interval.Gauges["quasar.cache.rpc.inflight;subject="+subj]
+	if !ok {
+		t.Fatalf("in-flight gauge missing, have gauges: %v", interval.Gauges)
+	}
+	if gauge.Value != 0 {
+		t.Fatalf("in-flight gauge after release = %v, want 0", gauge.Value)
+	}
+
+	shed, ok := interval.Counters["quasar.cache.rpc.shed;subject="+subj]
+	if !ok {
+		t.Fatalf("shed counter missing, have counters: %v", interval.Counters)
+	}
+	if shed.Sum != 1 {
+		t.Fatalf("shed counter = %v, want 1", shed.Sum)
 	}
 }
 

@@ -3,6 +3,7 @@ package transports
 import (
 	"sync/atomic"
 
+	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-hclog"
 )
 
@@ -15,8 +16,13 @@ import (
 // Overload is reported as a state transition, not per request: the incident
 // this replaces produced 152k dropped-message log lines on one leader, and
 // logging every shed request would reproduce that symptom in a new place.
+// Per-request visibility comes from go-metrics instead (RT-13902): every shed
+// increments a counter and every admit/release updates an in-flight gauge,
+// labeled with the subject, through the same process-global sink raft and
+// tcp_transport.go emit into.
 type inflightSem struct {
 	subject string
+	labels  []metrics.Label
 	slots   chan struct{}
 	logger  hclog.Logger
 
@@ -27,6 +33,7 @@ type inflightSem struct {
 func newInflightSem(logger hclog.Logger, subject string, size int) *inflightSem {
 	return &inflightSem{
 		subject: subject,
+		labels:  []metrics.Label{{Name: "subject", Value: subject}},
 		slots:   make(chan struct{}, size),
 		logger:  logger,
 	}
@@ -39,12 +46,14 @@ func newInflightSem(logger hclog.Logger, subject string, size int) *inflightSem 
 func (s *inflightSem) acquire() bool {
 	select {
 	case s.slots <- struct{}{}:
+		metrics.SetGaugeWithLabels([]string{"quasar", "cache", "rpc", "inflight"}, float32(len(s.slots)), s.labels)
 		if s.shedding.CompareAndSwap(true, false) {
 			s.logger.Warn("cache RPC overload cleared",
 				"subject", s.subject, "shed", s.shed.Swap(0))
 		}
 		return true
 	default:
+		metrics.IncrCounterWithLabels([]string{"quasar", "cache", "rpc", "shed"}, 1, s.labels)
 		s.shed.Add(1)
 		if s.shedding.CompareAndSwap(false, true) {
 			s.logger.Error("overloaded, shedding cache RPCs",
@@ -56,4 +65,5 @@ func (s *inflightSem) acquire() bool {
 
 func (s *inflightSem) release() {
 	<-s.slots
+	metrics.SetGaugeWithLabels([]string{"quasar", "cache", "rpc", "inflight"}, float32(len(s.slots)), s.labels)
 }
