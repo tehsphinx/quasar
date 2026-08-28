@@ -263,6 +263,10 @@ func (s *Cache) applyPersistedItem(ctx context.Context, item transports.Persiste
 		// it right now. A retry item goes back on the queue for a later leader
 		// instead of being terminated — otherwise a load shed would turn into
 		// a dropped write (RT-13906).
+		//
+		// The consumer loop applies one item at a time, so a bound above 1 does
+		// not shed on this path today; the branch keeps a shed from ever falling
+		// through to the terminate path below if that ever changes.
 		if errors.Is(err, ErrOverloaded) {
 			if item.Retry() {
 				_ = item.NackWithDelay(ctx)
