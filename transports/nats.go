@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -534,12 +535,6 @@ func (s *NATSTransport) LocalAddr() raft.ServerAddress {
 	return raft.ServerAddress(s.serverName)
 }
 
-// AppendEntriesPipeline returns an interface that can be used to pipeline
-// AppendEntries requests.
-func (s *NATSTransport) AppendEntriesPipeline(_ raft.ServerID, _ raft.ServerAddress) (raft.AppendPipeline, error) {
-	return nil, raft.ErrPipelineReplicationNotSupported
-}
-
 // AppendEntries sends the appropriate RPC to the target node.
 func (s *NATSTransport) AppendEntries(_ raft.ServerID, address raft.ServerAddress, request *raft.AppendEntriesRequest,
 	resp *raft.AppendEntriesResponse,
@@ -865,28 +860,19 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 		return 0, err
 	}
 
-	// Split the message if it is too large and build the last message part.
 	conn := s.connRepl
-	reqMsg := nats.NewMsg(subj)
 	if s.maxMsgSize < len(bts) {
 		// A multi-part payload is bulk traffic, so it goes on connBulk — parts
 		// AND the final part that carries the request. Both must use the same
 		// connection: the receiving assembler rejects a part that does not
 		// follow the previous one, and only a single TCP stream orders them.
 		conn = s.connBulk
-
-		var (
-			requestIDStr  string
-			lastPartIndex int
-		)
-		bts, requestIDStr, lastPartIndex, err = s.publishMultiPart(conn, subj, bts)
-		if err != nil {
-			return 0, err
-		}
-		reqMsg.Header.Set("request_id", requestIDStr)
-		reqMsg.Header.Set("pkg_part", fmt.Sprintf("%d", lastPartIndex))
 	}
-	reqMsg.Data = bts
+
+	reqMsg, err := s.buildRequestMsg(conn, subj, bts)
+	if err != nil {
+		return 0, err
+	}
 
 	// Send the prepared message — NOT the raw bytes. The final part of a
 	// multi-part request carries the request_id / pkg_part headers set
@@ -895,12 +881,36 @@ func (s *NATSTransport) request(ctx context.Context, subj string, msg, protoResp
 	// lost middle part (RT-13042 M2).
 	response, err := conn.RequestMsgWithContext(ctx, reqMsg)
 	if err != nil {
-		return len(bts), err
+		return len(reqMsg.Data), err
 	}
 
 	err = proto.Unmarshal(response.Data, protoResp)
 	// fmt.Println("response data:", fmt.Sprintf("%+v", protoResp))
-	return len(bts), err
+	return len(reqMsg.Data), err
+}
+
+// buildRequestMsg prepares the message that carries a request on subj: bts
+// itself when it fits, otherwise the final part of a multi-part payload whose
+// earlier parts this call has already published on conn. Both the parts and
+// the returned message must be sent on the same connection — the receiving
+// assembler rejects a part that does not follow the previous one, and only a
+// single stream orders them.
+func (s *NATSTransport) buildRequestMsg(conn *nats.Conn, subj string, bts []byte) (*nats.Msg, error) {
+	reqMsg := nats.NewMsg(subj)
+	if len(bts) <= s.maxMsgSize {
+		reqMsg.Data = bts
+		return reqMsg, nil
+	}
+
+	lastPart, requestIDStr, lastPartIndex, err := s.publishMultiPart(conn, subj, bts)
+	if err != nil {
+		return nil, err
+	}
+	reqMsg.Header.Set("request_id", requestIDStr)
+	reqMsg.Header.Set("pkg_part", strconv.Itoa(lastPartIndex))
+	reqMsg.Data = lastPart
+
+	return reqMsg, nil
 }
 
 // checkRaftResponse validates the CommandResponse envelope of a raft RPC and
