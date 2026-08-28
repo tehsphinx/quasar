@@ -12,6 +12,7 @@ import (
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
+	"github.com/tehsphinx/quasar/internal/inflight"
 	"github.com/tehsphinx/quasar/pb/v1"
 )
 
@@ -115,7 +116,7 @@ func TestNATSTransport_OverloadShedsWithExplicitError(t *testing.T) {
 	const boundAddr = "shed-bound"
 	subj := "quasar.test-cache." + boundAddr + ".cache.store"
 	sub, err := leader.connRepl.Subscribe(subj,
-		leader.handleStore(ctx, newInflightSem(newTestLogger(t), subj, 1)))
+		leader.handleStore(ctx, inflight.NewRPC(newTestLogger(t), subj, 1)))
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -175,15 +176,15 @@ func TestInflightSem_EmitsMetrics(t *testing.T) {
 	}
 
 	const subj = "quasar.test-cache.metrics.cache.store"
-	sem := newInflightSem(newTestLogger(t), subj, 1)
+	sem := inflight.NewRPC(newTestLogger(t), subj, 1)
 
-	if !sem.acquire() {
+	if !sem.Acquire() {
 		t.Fatal("first acquire on an empty semaphore was shed")
 	}
-	if sem.acquire() {
+	if sem.Acquire() {
 		t.Fatal("second acquire on a single-slot semaphore was admitted")
 	}
-	sem.release()
+	sem.Release()
 
 	interval := sink.Data()[0]
 	interval.RLock()
@@ -285,9 +286,9 @@ func BenchmarkNATSForwardedStores(b *testing.B) {
 
 			addr := raft.ServerAddress("bench-" + bc.name)
 			subj := "quasar.test-cache." + string(addr) + ".cache.store"
-			var sem *inflightSem
+			var sem *inflight.Sem
 			if bc.inflight > 0 {
-				sem = newInflightSem(newTestLogger(b), subj, bc.inflight)
+				sem = inflight.NewRPC(newTestLogger(b), subj, bc.inflight)
 			}
 			sub, err := leader.connRepl.Subscribe(subj, leader.handleStore(ctx, sem))
 			if err != nil {

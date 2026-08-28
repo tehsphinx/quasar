@@ -38,6 +38,7 @@ type options struct {
 	bootstrapWait      time.Duration
 	bootstrapFallback  time.Duration
 	noLeaderTimeout    time.Duration
+	maxInflightApplies int
 	hclogLogger        hclog.Logger
 	slogLogger         *slog.Logger
 
@@ -280,6 +281,29 @@ func WithNoLeaderTimeout(timeout time.Duration) Option {
 
 // WithRaftConfig allows passing in a custom raft configuration. Only the LocalID will
 // still be overwritten which can be set WithLocalID.
+// WithMaxInflightApplies bounds how many Store applies the leader has in
+// flight at the same time. Past the bound applyLocal returns ErrOverloaded
+// immediately instead of calling raft.Apply, so a caller fails in microseconds
+// rather than occupying the leader for the apply timeout while the FSM is
+// stalled (RT-13906).
+//
+// n <= 0 (the default) means unbounded — nothing is ever shed and the apply
+// path behaves exactly as it did before the bound existed. That default keeps
+// tests and in-memory transports unchanged; embedders that carry cluster-wide
+// write load set a bound.
+//
+// Size it above whatever the transports can push at the leader on their own,
+// with headroom for the leader's own writes: a bound at or below the
+// transport's per-subject in-flight limit could be saturated by forwarded
+// writes alone, and the leader's own writes would then shed at zero load on
+// themselves. Reaching the bound already means apply latency is pathological;
+// below it nothing changes.
+func WithMaxInflightApplies(n int) Option {
+	return func(o *options) {
+		o.maxInflightApplies = n
+	}
+}
+
 func WithRaftConfig(cfg *raft.Config) Option {
 	return func(o *options) {
 		o.raftConfig = cfg

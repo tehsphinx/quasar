@@ -233,6 +233,9 @@ func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
 //     has passed — a non-retry write must never be silently applied after the
 //     caller was already told it failed (RT-12964).
 //
+// A shed apply (ErrOverloaded) is handled like a leadership transition — Nak
+// for retry items, ErrOverloaded to the publisher otherwise.
+//
 // Apply-side errors (FSM rejection, persist failure) always reply with the
 // error to terminate the publisher's wait, regardless of the retry flag.
 func (s *Cache) applyPersistedItem(ctx context.Context, item transports.PersistedItem) {
@@ -255,6 +258,19 @@ func (s *Cache) applyPersistedItem(ctx context.Context, item transports.Persiste
 	cmd := &pb.Command{Cmd: &pb.Command_Store{Store: item.Command()}}
 	resp, uid, err := s.applyLocal(applyCtx, cmd)
 	if err != nil {
+		// An overloaded leader is transient in the same way a leadership
+		// transition is: the work is still valid, this leader just cannot take
+		// it right now. A retry item goes back on the queue for a later leader
+		// instead of being terminated — otherwise a load shed would turn into
+		// a dropped write (RT-13906).
+		if errors.Is(err, ErrOverloaded) {
+			if item.Retry() {
+				_ = item.NackWithDelay(ctx)
+			} else {
+				_ = item.ReplyError(ctx, ErrOverloaded)
+			}
+			return
+		}
 		if isLeadershipTransitionError(err) {
 			if item.Retry() {
 				_ = item.NackWithDelay(ctx)
