@@ -207,3 +207,60 @@ func makeAppendRPCFullBatch() raft.AppendEntriesRequest {
 		RPCHeader:         raft.RPCHeader{Addr: []byte("cartman")},
 	}
 }
+
+// TestNATSTransport_PipelineStaysOffTheLiveConn holds RT-13772 to the RT-13733
+// rule. Pipelining publishes a whole window of AppendEntries without waiting
+// for a reply, so it is the loudest publisher the transport has; those bytes,
+// and the subscription their replies land on, must stay on the replication
+// connection. On the live connection they would sit in front of a heartbeat
+// the moment the 32 KB write buffer flushes.
+func TestNATSTransport_PipelineStaysOffTheLiveConn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	stub := newStubFollower(t, "pipeline-split-follower")
+	trans, err := makeNATSTransport(ctx, t, "test-cache", "pipeline-split-leader")
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	defer trans.conn.Close()
+
+	liveSubs, replSubs := trans.connLive.NumSubscriptions(), trans.connRepl.NumSubscriptions()
+
+	pipe, err := trans.AppendEntriesPipeline("id1", raft.ServerAddress(stub.address))
+	if err != nil {
+		t.Fatalf("AppendEntriesPipeline: %v", err)
+	}
+	defer func() { _ = pipe.Close() }()
+
+	if got := trans.connLive.NumSubscriptions(); got != liveSubs {
+		t.Errorf("the pipeline put %d subscriptions on the live connection", got-liveSubs)
+	}
+	if got := trans.connRepl.NumSubscriptions(); got != replSubs+1 {
+		t.Errorf("replication connection has %d subscriptions, want %d: the pipeline's replies are elsewhere",
+			got, replSubs+1)
+	}
+
+	live, repl, bulk := trans.connLive.Stats(), trans.connRepl.Stats(), trans.connBulk.Stats()
+
+	// A full window of production-sized batches, with nobody answering.
+	for i := 0; i < maxPipelineInflight; i++ {
+		args := makeAppendRPCFullBatch()
+		if _, err := pipe.AppendEntries(&args, new(raft.AppendEntriesResponse)); err != nil {
+			t.Fatalf("AppendEntries %d: %v", i, err)
+		}
+	}
+	if err := trans.connRepl.FlushTimeout(5 * time.Second); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	if got := trans.connLive.Stats().OutMsgs - live.OutMsgs; got != 0 {
+		t.Errorf("the pipeline published %d messages on the live connection", got)
+	}
+	if got := trans.connBulk.Stats().OutMsgs - bulk.OutMsgs; got != 0 {
+		t.Errorf("the pipeline published %d messages on the bulk connection", got)
+	}
+	if got := trans.connRepl.Stats().OutMsgs - repl.OutMsgs; got < maxPipelineInflight {
+		t.Errorf("the replication connection carried %d of %d pipelined requests", got, maxPipelineInflight)
+	}
+}
