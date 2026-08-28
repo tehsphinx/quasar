@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
+	"github.com/tehsphinx/quasar/internal/inflight"
 	"github.com/tehsphinx/quasar/pb/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -203,25 +204,25 @@ func (s *NATSTransport) listen(ctx context.Context) error {
 	// detect quorum, nor a cache.reset that rebuilds raft.
 	subjStore := subjPrefix + ".cache.store"
 	subStore, err := s.connRepl.Subscribe(subjStore,
-		s.handleStore(ctx, newInflightSem(s.logger, subjStore, maxInflightCacheRPCs)))
+		s.handleStore(ctx, inflight.NewRPC(s.logger, subjStore, maxInflightCacheRPCs)))
 	if err != nil {
 		return err
 	}
 	subjResetCache := subjPrefix + ".cache.reset"
 	subResetCache, err := s.connRepl.Subscribe(subjResetCache,
-		s.handleResetCache(ctx, newInflightSem(s.logger, subjResetCache, maxInflightCacheRPCs)))
+		s.handleResetCache(ctx, inflight.NewRPC(s.logger, subjResetCache, maxInflightCacheRPCs)))
 	if err != nil {
 		return err
 	}
 	subjRemoveServer := subjPrefix + ".cache.server.remove"
 	subRemoveServer, err := s.connRepl.Subscribe(subjRemoveServer,
-		s.handleRemoveServer(ctx, newInflightSem(s.logger, subjRemoveServer, maxInflightCacheRPCs)))
+		s.handleRemoveServer(ctx, inflight.NewRPC(s.logger, subjRemoveServer, maxInflightCacheRPCs)))
 	if err != nil {
 		return err
 	}
 	subjLatestUID := subjPrefix + ".cache.uid.latest"
 	subLatestUID, err := s.connRepl.Subscribe(subjLatestUID,
-		s.handleLatestUID(ctx, newInflightSem(s.logger, subjLatestUID, maxInflightCacheRPCs)))
+		s.handleLatestUID(ctx, inflight.NewRPC(s.logger, subjLatestUID, maxInflightCacheRPCs)))
 	if err != nil {
 		return err
 	}
@@ -299,7 +300,7 @@ func rpcHandler[Req proto.Message](
 	s *NATSTransport,
 	ctx context.Context,
 	ch chan raft.RPC,
-	sem *inflightSem,
+	sem *inflight.Sem,
 	assembler *multipartAssembler,
 	newReq func() Req,
 	toCommand func(Req) interface{},
@@ -329,7 +330,7 @@ func rpcHandler[Req proto.Message](
 
 		// Admission happens before the enqueue: an RPC that is enqueued but
 		// shed would still be applied, with nobody left to answer it.
-		if sem != nil && !sem.acquire() {
+		if sem != nil && !sem.Acquire() {
 			s.replyOverload(msg)
 			return
 		}
@@ -345,7 +346,7 @@ func rpcHandler[Req proto.Message](
 			return
 		}
 		go func() {
-			defer sem.release()
+			defer sem.Release()
 
 			s.serveResponse(ctx, msg, chResp, toResp)
 		}()
@@ -411,7 +412,7 @@ func (s *NATSTransport) Store(ctx context.Context, _ raft.ServerID, address raft
 	return protoResp.GetStore(), nil
 }
 
-func (s *NATSTransport) handleStore(ctx context.Context, sem *inflightSem) func(*nats.Msg) {
+func (s *NATSTransport) handleStore(ctx context.Context, sem *inflight.Sem) func(*nats.Msg) {
 	// Reassembly is keyed by the sender-qualified request_id: unlike
 	// AppendEntries (one leader, sequential), ANY node — and multiple
 	// goroutines per node — may forward large Stores to this subject
@@ -472,7 +473,7 @@ func (s *NATSTransport) RemoveServer(ctx context.Context, _ raft.ServerID, addre
 	return protoResp.GetRemoveServer(), nil
 }
 
-func (s *NATSTransport) handleResetCache(ctx context.Context, sem *inflightSem) func(*nats.Msg) {
+func (s *NATSTransport) handleResetCache(ctx context.Context, sem *inflight.Sem) func(*nats.Msg) {
 	return rpcHandler(s, ctx, s.chConsumeCache, sem, nil,
 		func() *pb.ResetCache { return &pb.ResetCache{} },
 		func(r *pb.ResetCache) interface{} { return r },
@@ -482,7 +483,7 @@ func (s *NATSTransport) handleResetCache(ctx context.Context, sem *inflightSem) 
 		})
 }
 
-func (s *NATSTransport) handleRemoveServer(ctx context.Context, sem *inflightSem) func(*nats.Msg) {
+func (s *NATSTransport) handleRemoveServer(ctx context.Context, sem *inflight.Sem) func(*nats.Msg) {
 	return rpcHandler(s, ctx, s.chConsumeCache, sem, nil,
 		func() *pb.RemoveServer { return &pb.RemoveServer{} },
 		func(r *pb.RemoveServer) interface{} { return r },
@@ -514,7 +515,7 @@ func (s *NATSTransport) LatestUID(ctx context.Context, _ raft.ServerID, address 
 	return protoResp.GetLatestUid(), nil
 }
 
-func (s *NATSTransport) handleLatestUID(ctx context.Context, sem *inflightSem) func(*nats.Msg) {
+func (s *NATSTransport) handleLatestUID(ctx context.Context, sem *inflight.Sem) func(*nats.Msg) {
 	return rpcHandler(s, ctx, s.chConsumeCache, sem, nil,
 		func() *pb.LatestUid { return &pb.LatestUid{} },
 		func(r *pb.LatestUid) interface{} { return r },

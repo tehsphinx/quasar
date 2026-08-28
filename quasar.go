@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+	"github.com/tehsphinx/quasar/internal/inflight"
 	"github.com/tehsphinx/quasar/pb/v1"
 	"github.com/tehsphinx/quasar/stores"
 	"github.com/tehsphinx/quasar/transports"
@@ -83,6 +84,17 @@ var (
 	// for at-least-once semantics with WithRetry().
 	ErrRetrying = errors.New("failed to apply: retrying in background")
 
+	// ErrOverloaded indicates the leader is already at its in-flight apply
+	// bound (see WithMaxInflightApplies) and refused the command without
+	// proposing it to raft. It deliberately does NOT wrap
+	// raft.ErrEnqueueTimeout: that error means raft's main goroutine is not
+	// draining applyCh, this one means we never tried. Keeping them separable
+	// is the point — a caller past the bound fails in microseconds instead of
+	// occupying the leader for applyTimeout, and each of those 5s hangs is
+	// what bought another retry until a raft wedge became a cluster-wide
+	// write outage (RT-13906).
+	ErrOverloaded = errors.New("leader overloaded: too many applies in flight")
+
 	// errNoVotersToRecover is returned by recoverQuorum when the current
 	// configuration has no peer voters to drop, so there is nothing for
 	// recovery to do. It is a benign no-op signal (not a failure): the
@@ -123,6 +135,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, inject func(*FSMInjector), c
 		logger:    cfg.getLogger(),
 		newRaftFn: newRaft,
 	}
+	c.applySem = inflight.NewApply(c.logger, cfg.cacheName, cfg.maxInflightApplies)
 	fsm.hasLeader = c.hasLeader
 	inject(&FSMInjector{cache: c})
 
@@ -417,6 +430,10 @@ type Cache struct {
 	suffrage  raft.ServerSuffrage
 	logger    hclog.Logger
 
+	// applySem bounds how many Store applies are in flight on the leader.
+	// Unbounded unless the embedder sets WithMaxInflightApplies (RT-13906).
+	applySem *inflight.Sem
+
 	// quorumProbe* cache the last quorumProbeReachable result so a burst
 	// of leaderless requests doesn't re-fan-out one LatestUID RPC per
 	// voter per call. quorumProbeAt zero means "no cached value";
@@ -531,6 +548,21 @@ func (s *Cache) apply(ctx context.Context, cmd *pb.Command, opts storeOpts) (*pb
 }
 
 func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandResponse, uint64, error) {
+	// Only Store commands are shed. Reset, RemoveServer and LatestUid are the
+	// reset, membership and liveness paths: rare, bounded by their own callers,
+	// and the ones the startup path depends on — shedding them would fail a
+	// cache reset or a quorum probe to protect against a write overload.
+	//
+	// Admission happens before persist(): a shed must have no side effect, and
+	// persist() writes the payload to the persistent store before the entry is
+	// ever proposed.
+	if cmd.GetStore() != nil {
+		if !s.applySem.Acquire() {
+			return nil, 0, ErrOverloaded
+		}
+		defer s.applySem.Release()
+	}
+
 	cmd, err := s.persist(cmd)
 	if err != nil {
 		return nil, 0, err
