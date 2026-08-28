@@ -179,11 +179,13 @@ func (p *natsPipeline) decodeResponses() {
 		select {
 		case entry := <-p.inprogressCh:
 			err := p.awaitReply(entry)
-			if err != nil {
+			if err != nil && !errors.Is(err, raft.ErrPipelineShutdown) {
 				// The response stays zero-valued, which reaches raft as
 				// Success=false and aborts the pipeline back to synchronous
 				// replication (replication.go pipelineDecode). Log it here:
-				// raft only logs that the pipeline aborted, not why.
+				// raft only logs that the pipeline aborted, not why. Shutdown
+				// is not a failure: Close raced the reply, which happens on
+				// every step-down and every cache shutdown.
 				p.trans.logger.Error("pipelined append entries failed", "error", err, "subject", p.subj)
 			}
 			entry.future.respond(err)
