@@ -279,8 +279,6 @@ func WithNoLeaderTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithRaftConfig allows passing in a custom raft configuration. Only the LocalID will
-// still be overwritten which can be set WithLocalID.
 // WithMaxInflightApplies bounds how many Store applies the leader has in
 // flight at the same time. Past the bound applyLocal returns ErrOverloaded
 // immediately instead of calling raft.Apply, so a caller fails in microseconds
@@ -298,12 +296,19 @@ func WithNoLeaderTimeout(timeout time.Duration) Option {
 // writes alone, and the leader's own writes would then shed at zero load on
 // themselves. Reaching the bound already means apply latency is pathological;
 // below it nothing changes.
+//
+// The bound governs leader-local applies: the leader's own writes plus the
+// writes transports forward to it. In persisted-FIFO mode the consumer loop
+// applies queued Stores one at a time, so that path holds at most one apply in
+// flight and a bound above 1 never sheds there.
 func WithMaxInflightApplies(n int) Option {
 	return func(o *options) {
 		o.maxInflightApplies = n
 	}
 }
 
+// WithRaftConfig allows passing in a custom raft configuration. Only the LocalID will
+// still be overwritten which can be set WithLocalID.
 func WithRaftConfig(cfg *raft.Config) Option {
 	return func(o *options) {
 		o.raftConfig = cfg
