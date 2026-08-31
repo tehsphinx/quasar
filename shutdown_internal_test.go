@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tehsphinx/quasar/transports"
+	"go.uber.org/goleak"
 )
 
 // closeCountingTransport wraps a Transport and counts Close calls so a test
@@ -62,4 +63,36 @@ func TestShutdownClosesTransportOnce(t *testing.T) {
 	if got := tr.closes.Load(); got != 2 {
 		t.Fatalf("expected the transport closed by a single shutdown body (2), got %d (shutdown ran more than once)", got)
 	}
+}
+
+// TestShutdownLeavesNoGoroutines is the RT-14152 leak check. The equivalent
+// checks in the NATS discovery tests were commented out because a bare
+// goleak.VerifyNone also sees goroutines left by earlier tests; this one
+// snapshots the ignore set before the cache exists. It runs on InmemTransport,
+// so it needs no NATS server and runs on every machine.
+func TestShutdownLeavesNoGoroutines(t *testing.T) {
+	ignore := goleak.IgnoreCurrent()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, inmem := transports.NewInmemTransport("")
+
+	c, err := NewCache(ctx, &stubFSM{},
+		WithLocalID("solo"),
+		WithTransport(inmem),
+		WithBootstrap(true),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	if err := c.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	goleak.VerifyNone(t, ignore)
 }

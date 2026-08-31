@@ -18,9 +18,9 @@ func TestStableNatsKV(t *testing.T) {
 		},
 	}
 
-	nc, err := nats.Connect("nats://localhost:4222")
+	nc, err := nats.Connect(natsURL)
 	if err != nil {
-		t.Skip("test needs NATS running on localhost:4222")
+		t.Skipf("NATS not available at %s: %v", natsURL, err)
 	}
 
 	js, err := nc.JetStream()
@@ -29,13 +29,13 @@ func TestStableNatsKV(t *testing.T) {
 	}
 
 	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
-		Bucket: "quasar_test",
+		Bucket: t.Name(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		if r := js.DeleteKeyValue("quasar_test"); r != nil {
+		if r := js.DeleteKeyValue(t.Name()); r != nil {
 			t.Error(r)
 		}
 	}()

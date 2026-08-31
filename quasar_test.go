@@ -1,10 +1,12 @@
 package quasar_test
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -18,6 +20,63 @@ import (
 	"github.com/tehsphinx/quasar/stores"
 	"github.com/tehsphinx/quasar/transports"
 )
+
+const natsTimeout = 5 * time.Second
+
+// natsURL is the NATS server the cluster tests dial. Override with NATS_URL.
+var natsURL = cmp.Or(os.Getenv("NATS_URL"), "nats://localhost:4222")
+
+// connectNATS dials natsURL and skips the test when no server answers. The
+// connection stays caller-owned — NATSTransport never closes what it was
+// handed — so the cleanup closes it after the test's own shutdown defers.
+func connectNATS(t *testing.T) *nats.Conn {
+	t.Helper()
+
+	nc, err := nats.Connect(natsURL, nats.Timeout(natsTimeout))
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	return nc
+}
+
+// freePorts reserves n loopback ports so two concurrent `go test` runs do not
+// fight over fixed ones. The window between releasing a reservation and the
+// transport binding it is inherently racy; add a retry loop if it ever flakes.
+func freePorts(t *testing.T, n int) []int {
+	t.Helper()
+
+	ports := make([]int, 0, n)
+
+	for range n {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve port: %v", err)
+		}
+
+		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
+
+		if err := l.Close(); err != nil {
+			t.Fatalf("release port: %v", err)
+		}
+	}
+
+	return ports
+}
+
+// serverAddr renders a loopback raft server address for the given port.
+func serverAddr(port int) raft.ServerAddress {
+	return raft.ServerAddress(net.JoinHostPort("localhost", strconv.Itoa(port)))
+}
+
+// tcpTransport builds the loopback TCP transport option for the given port.
+func tcpTransport(port int) quasar.Option {
+	return quasar.WithTCPTransport(
+		net.JoinHostPort("", strconv.Itoa(port)),
+		&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: port},
+	)
+}
 
 func TestSingleCache(t *testing.T) {
 	type test struct {
@@ -207,17 +266,19 @@ func TestCacheClusterTCP(t *testing.T) {
 
 	asrtMain := is.New(t)
 
+	ports := freePorts(t, 3)
+
 	fsm1 := exampleFSM.NewInMemoryFSM()
 	fsm2 := exampleFSM.NewInMemoryFSM()
 	fsm3 := exampleFSM.NewInMemoryFSM()
 
 	cache1, err := quasar.NewCache(ctxMain, fsm1,
 		quasar.WithLocalID("cache1"),
-		quasar.WithTCPTransport(":28230", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28230}),
+		tcpTransport(ports[0]),
 		quasar.WithServers([]raft.Server{
-			{ID: "cache1", Address: "localhost:28230"},
-			{ID: "cache2", Address: "localhost:28231"},
-			{ID: "cache3", Address: "localhost:28232"},
+			{ID: "cache1", Address: serverAddr(ports[0])},
+			{ID: "cache2", Address: serverAddr(ports[1])},
+			{ID: "cache3", Address: serverAddr(ports[2])},
 		}),
 	)
 	asrtMain.NoErr(err)
@@ -225,14 +286,14 @@ func TestCacheClusterTCP(t *testing.T) {
 
 	cache2, err := quasar.NewCache(ctxMain, fsm2,
 		quasar.WithLocalID("cache2"),
-		quasar.WithTCPTransport(":28231", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28231}),
+		tcpTransport(ports[1]),
 	)
 	asrtMain.NoErr(err)
 	defer cache2.Shutdown()
 
 	cache3, err := quasar.NewCache(ctxMain, fsm3,
 		quasar.WithLocalID("cache3"),
-		quasar.WithTCPTransport(":28232", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28232}),
+		tcpTransport(ports[2]),
 	)
 	asrtMain.NoErr(err)
 	defer cache3.Shutdown()
@@ -322,15 +383,9 @@ func TestCacheClusterNATS(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
-	defer nc3.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
+	nc3 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
@@ -445,12 +500,8 @@ func TestNatsFail(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
@@ -548,15 +599,9 @@ func TestInstallSnapshot(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
-	defer nc3.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
+	nc3 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
@@ -675,15 +720,9 @@ func TestCacheClusterNATSDiscovery(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
-	defer nc3.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
+	nc3 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
@@ -816,15 +855,9 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
-	defer nc3.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
+	nc3 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
@@ -930,11 +963,7 @@ func TestCacheClusterNATSDiscoveryNonVoter(t *testing.T) {
 }
 
 func TestCacheDiscoveryRestart(t *testing.T) {
-	// Enable to verify if cache shuts down properly. Will fail with other tests running as well.
-	// defer func() {
-	// 	time.Sleep(100 * time.Millisecond)
-	// 	goleak.VerifyNone(t)
-	// }()
+	// Shutdown-leak coverage: TestShutdownLeavesNoGoroutines in shutdown_internal_test.go.
 
 	type test struct {
 		name      string
@@ -968,15 +997,9 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
-	defer nc3.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
+	nc3 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
@@ -1089,11 +1112,7 @@ func TestCacheDiscoveryRestart(t *testing.T) {
 }
 
 func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
-	// Enable to verify if cache shuts down properly. Will fail with other tests running as well.
-	// defer func() {
-	// 	time.Sleep(100 * time.Millisecond)
-	// 	goleak.VerifyNone(t)
-	// }()
+	// Shutdown-leak coverage: TestShutdownLeavesNoGoroutines in shutdown_internal_test.go.
 
 	type test struct {
 		name      string
@@ -1127,12 +1146,8 @@ func TestCacheDiscoveryRestartNonVoter(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
@@ -1254,15 +1269,9 @@ func TestVoterNodeRestart(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
-	defer nc3.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
+	nc3 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
@@ -1412,15 +1421,9 @@ func TestCacheDiscoveryAutoPrune(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	defer nc1.Close()
-	defer nc2.Close()
-	defer nc3.Close()
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
+	nc3 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
