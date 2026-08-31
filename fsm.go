@@ -29,6 +29,14 @@ const uint64Bytes = 8
 // library resets the FSM first (see recoverQuorum, M2) so a single replay
 // is exact, but a command whose effect depends on prior state (counters,
 // appends, toggles) is still safest written idempotently.
+//
+// Reset (and ResetFull, see FullResetter) may be called CONCURRENTLY with
+// ApplyCmd and must serialize against it internally. A hard reset applied on
+// the raft leader clears the FSM from an RPC goroutine while raft keeps
+// applying, by design — the leader keeps its raft so its heartbeats can catch
+// the wiped followers up (see Cache.HardReset). The follower rebuild paths do
+// join raft's goroutines before resetting, but they are not the only callers
+// (RT-14147).
 type FSM interface {
 	Inject(fsm *FSMInjector)
 	ApplyCmd(cmd []byte) error

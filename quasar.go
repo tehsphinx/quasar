@@ -1135,11 +1135,6 @@ func (s *Cache) localHardReset(resetID, initiatorInstanceID string, full bool) e
 // the cache-only (KeepOnReset) stores too. Fork-history adoption passes false
 // (it recovers consensus, it does not wipe cache-only data).
 func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) error {
-	if err := s.fsm.applyReset(full); err != nil {
-		return err
-	}
-
-	s.fsm.applyRaftReset()
 	// Unbind the transport's heartbeat fast-path BEFORE shutting the old raft
 	// down. raft's processHeartbeat returns on a closed shutdownCh WITHOUT
 	// responding, so a beat landing on a torn-down instance is silently
@@ -1150,7 +1145,23 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	// indefinitely, if newRaft fails) the transport routes beats to the live
 	// consumer instead of dropping them.
 	s.transport.SetHeartbeatHandler(nil)
-	s.raft().Shutdown()
+	// Await the shutdown. Shutdown() only closes shutdownCh; run, runFSM and
+	// runSnapshots exit on their own schedule and only shutdownFuture.Error()
+	// joins them. Unawaited, the old runFSM could apply a batch into the FSM
+	// wiped below and its deferred uidApplied would overwrite lastApplied = 0
+	// with a stale high index, making WaitFor return early — stale reads until
+	// the new raft has genuinely caught up (RT-14147). Awaiting is safe because
+	// raft was handed a transport wrapper that hides Close(); see hideClose.
+	if err := s.raft().Shutdown().Error(); err != nil {
+		return fmt.Errorf("shutting down raft for reinit: %w", err)
+	}
+
+	// No raft goroutine is left running: the FSM wipe and the store swap below
+	// cannot race an apply or a snapshot.
+	if err := s.fsm.applyReset(full); err != nil {
+		return err
+	}
+	s.fsm.applyRaftReset()
 
 	s.newStores()
 	if adoptInstanceID != "" {
@@ -1497,16 +1508,18 @@ func (s *Cache) recoverQuorum() error {
 	// torn-down instance (RT-13010, RT-13042). newRaft below rebinds it to
 	// the live raft.
 	s.transport.SetHeartbeatHandler(nil)
-	// IMPORTANT: do not call .Error() on the shutdown future here.
-	// hashicorp/raft's shutdownFuture.Error() additionally invokes Close()
-	// on the transport (raft@v1.7.3 future.go), which the InmemTransport
-	// implements as DisconnectAll() and the TCPTransport implements as
-	// permanently shutting the listener down. Either would brick the
-	// transport for the new raft instance we're about to spin up on top of
-	// the same transport. raft.Shutdown() itself is synchronous enough —
-	// it sets the shutdown flag and closes the channel that all internal
-	// goroutines select on. reinitRaftAdoptingInstance uses the same pattern.
-	rft.Shutdown()
+	// Await the shutdown before touching the FSM or the stores below:
+	// RecoverCluster restores the FSM, writes a snapshot and deletes the log
+	// range, none of which may overlap a still-running raft generation
+	// (RT-14147). shutdownFuture.Error() is the only thing that joins raft's
+	// goroutines, and it would additionally call Close() on the transport — for
+	// the InmemTransport a DisconnectAll(), for the TCPTransport a permanent
+	// listener shutdown, either of which would brick the transport the new raft
+	// instance below runs on. Hence hideClose: the transport raft holds does not
+	// satisfy raft.WithClose, which makes the wait safe.
+	if err := rft.Shutdown().Error(); err != nil {
+		return fmt.Errorf("shutting down raft for recovery: %w", err)
+	}
 
 	// Mint a fresh instance ID — recoverQuorum forks the consensus
 	// history line on purpose (RT-12862). Surviving peers compare the
