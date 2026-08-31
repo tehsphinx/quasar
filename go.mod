@@ -1,6 +1,6 @@
 module github.com/tehsphinx/quasar
 
-go 1.21
+go 1.22
 
 require (
 	github.com/armon/go-metrics v0.4.1
@@ -11,6 +11,7 @@ require (
 	github.com/magefile/mage v1.15.0
 	github.com/matryer/is v1.4.1
 	github.com/nats-io/nats.go v1.34.0
+	go.uber.org/goleak v1.3.0
 	golang.org/x/exp v0.0.0-20240613232115-7f521ea00fb8
 	google.golang.org/protobuf v1.34.2
 	storj.io/drpc v0.0.33

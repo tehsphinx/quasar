@@ -26,6 +26,7 @@ cluster loses quorum.
 - [Resilience and recovery](#resilience-and-recovery)
 - [Options reference](#options-reference)
 - [Operational notes](#operational-notes)
+- [Running the tests](#running-the-tests)
 
 ## Install
 
@@ -380,3 +381,18 @@ Load options: `WaitForUID(uid)` — wait for a specific write before reading.
 - For NATS deployments, pair `WithNatsTransport` with
   `discoveries.NewNATSDiscovery` and consider the persisted-FIFO queue for
   write availability during leader flaps.
+
+## Running the tests
+
+```sh
+go test -race ./...
+```
+
+Tests that need a NATS server dial `nats://localhost:4222` and **skip** when
+nothing answers, so the suite passes on a machine without NATS — it just covers
+less. To exercise the NATS transport, discovery and persisted-queue paths, run a
+server with JetStream enabled (`nats-server -js`), or point the tests elsewhere:
+
+```sh
+NATS_URL=nats://nats.example:4222 go test -race ./...
+```

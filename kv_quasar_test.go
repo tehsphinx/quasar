@@ -3,14 +3,12 @@ package quasar_test
 import (
 	"context"
 	"fmt"
-	"net"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/matryer/is"
-	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar"
 	"github.com/tehsphinx/quasar/transports"
 )
@@ -94,26 +92,28 @@ func TestKVCacheClusterTCP(t *testing.T) {
 
 	asrtMain := is.New(t)
 
+	ports := freePorts(t, 3)
+
 	cache1, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache1"),
-		quasar.WithTCPTransport(":28233", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28233}),
+		tcpTransport(ports[0]),
 		quasar.WithServers([]raft.Server{
-			{ID: "cache1", Address: "localhost:28233"},
-			{ID: "cache2", Address: "localhost:28234"},
-			{ID: "cache3", Address: "localhost:28235"},
+			{ID: "cache1", Address: serverAddr(ports[0])},
+			{ID: "cache2", Address: serverAddr(ports[1])},
+			{ID: "cache3", Address: serverAddr(ports[2])},
 		}),
 	)
 	asrtMain.NoErr(err)
 
 	cache2, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache2"),
-		quasar.WithTCPTransport(":28234", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28234}),
+		tcpTransport(ports[1]),
 	)
 	asrtMain.NoErr(err)
 
 	cache3, err := quasar.NewKVCache(ctxMain,
 		quasar.WithLocalID("cache3"),
-		quasar.WithTCPTransport(":28235", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 28235}),
+		tcpTransport(ports[2]),
 	)
 	asrtMain.NoErr(err)
 
@@ -183,12 +183,9 @@ func TestKVCacheClusterNATS(t *testing.T) {
 
 	asrtMain := is.New(t)
 
-	nc1, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc2, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
-	nc3, err := nats.Connect("localhost:4222")
-	asrtMain.NoErr(err)
+	nc1 := connectNATS(t)
+	nc2 := connectNATS(t)
+	nc3 := connectNATS(t)
 
 	transport1, err := transports.NewNATSTransport(ctxMain, nc1, t.Name(), "cache1")
 	asrtMain.NoErr(err)
