@@ -254,3 +254,65 @@ func TestLocalHardResetDeduplicatesConcurrentResets(t *testing.T) {
 		t.Fatalf("expected exactly 1 FSM reset for %d concurrent identical hard resets, got %d", concurrent, got)
 	}
 }
+
+// resetProbeFSM records the state of the raft instance that was live at the
+// time Reset ran.
+type resetProbeFSM struct {
+	stubFSM
+
+	raftState    func() raft.RaftState
+	probed       bool
+	stateAtReset raft.RaftState
+}
+
+func (s *resetProbeFSM) Reset() error {
+	// Only the first reset: the rebuild paths reset once, but a later
+	// reset must not overwrite what the first one observed.
+	if !s.probed {
+		s.probed = true
+		s.stateAtReset = s.raftState()
+	}
+	return s.stubFSM.Reset()
+}
+
+// TestFollowerHardResetAwaitsOldRaftShutdown is the RT-14147 regression test.
+//
+// reinitRaftAdoptingInstance used to wipe the FSM and swap the stores while the
+// old raft's run/runFSM/runSnapshots goroutines were still running: a batch
+// applied by the old runFSM landed in the freshly wiped FSM, and its deferred
+// uidApplied overwrote lastApplied = 0 with a stale high index, so WaitFor
+// returned early — stale reads until the new raft caught up. The teardown must
+// be awaited (via the shutdown future, which is only safe because raft holds a
+// transport whose Close() is hidden — see hideClose) before the FSM is touched.
+//
+// Pre-fix the FSM observes a live raft; post-fix it observes raft.Shutdown.
+func TestFollowerHardResetAwaitsOldRaftShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fsm := &resetProbeFSM{}
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, fsm,
+		WithLocalID("follower"),
+		WithTransport(tr),
+		WithSuffrage(raft.Nonvoter),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+
+	if c.IsLeader() {
+		t.Fatal("lone nonvoter unexpectedly reports IsLeader() == true")
+	}
+
+	fsm.raftState = c.raft().State
+
+	if err := c.localHardReset("reset-1", "", false); err != nil {
+		t.Fatalf("localHardReset: %v", err)
+	}
+
+	if fsm.stateAtReset != raft.Shutdown {
+		t.Fatalf("expected the old raft shut down before the FSM reset, it was %v", fsm.stateAtReset)
+	}
+}
