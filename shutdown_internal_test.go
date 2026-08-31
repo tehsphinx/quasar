@@ -55,13 +55,12 @@ func TestShutdownClosesTransportOnce(t *testing.T) {
 
 	// Give the consume goroutine time to observe ctx cancellation and take
 	// its own shutdown path. A single shutdown body closes the transport
-	// twice — once explicitly and once via raft.Shutdown().Error() (raft's
-	// shutdownFuture.Error() calls Close on the transport). The once-guard
-	// keeps it at one body (2 closes) instead of two bodies (4).
+	// exactly once: raft holds a wrapper that hides Close() from it, so
+	// shutdownFuture.Error() no longer closes it a second time (RT-14147).
 	time.Sleep(200 * time.Millisecond)
 
-	if got := tr.closes.Load(); got != 2 {
-		t.Fatalf("expected the transport closed by a single shutdown body (2), got %d (shutdown ran more than once)", got)
+	if got := tr.closes.Load(); got != 1 {
+		t.Fatalf("expected the transport closed by a single shutdown body (1), got %d (shutdown ran more than once)", got)
 	}
 }
 

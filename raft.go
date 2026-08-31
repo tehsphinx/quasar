@@ -20,11 +20,47 @@ func newRaft(cfg options, fsm raft.FSM, logStore raft.LogStore, stableStore raft
 	snapshotStore raft.SnapshotStore, transport transports.Transport,
 ) (*raft.Raft, error) {
 	conf := raftConfig(cfg)
-	rft, err := raft.NewRaft(conf, fsm, logStore, stableStore, snapshotStore, transport)
+	rft, err := raft.NewRaft(conf, fsm, logStore, stableStore, snapshotStore, hideClose(transport))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create raft layer: %w", err)
 	}
 	return rft, nil
+}
+
+// hideClose wraps transport so that raft cannot close it, keeping pre-vote
+// support when the transport has it.
+//
+// raft's shutdownFuture.Error() is the only way to join the run / runFSM /
+// runSnapshots goroutines, and it also calls Close() on a transport that
+// satisfies raft.WithClose (raft@v1.7.3 future.go) — InmemTransport.Close
+// disconnects every peer, TCPTransport.Close shuts the listener down for good.
+// The rebuild paths (reinitRaftAdoptingInstance, recoverQuorum) put a new raft
+// on the SAME transport, so they must be able to await the old instance without
+// losing it: hidden from raft, Close() is never called and the wait is safe
+// (RT-14147). The transport is closed by Cache.shutdown instead.
+func hideClose(transport transports.Transport) raft.Transport {
+	// transports.Transport does not declare RequestPreVote, so a wrapper that
+	// only embeds it would silently drop the raft.WithPreVote capability of the
+	// TCP, NATS and Inmem transports and raft would disable pre-vote
+	// (raft@v1.7.3 api.go). Satisfying WithPreVote unconditionally is worse: a
+	// stub that errors is recorded as a denied vote and stalls pre-vote quorum.
+	if preVote, ok := transport.(raft.WithPreVote); ok {
+		return noClosePreVoteTransport{Transport: transport, WithPreVote: preVote}
+	}
+	return noCloseTransport{Transport: transport}
+}
+
+// noCloseTransport is a transport whose Close(), if it has one, is invisible to
+// raft. See hideClose.
+type noCloseTransport struct {
+	transports.Transport
+}
+
+// noClosePreVoteTransport is noCloseTransport for a transport that supports
+// pre-vote. See hideClose.
+type noClosePreVoteTransport struct {
+	transports.Transport
+	raft.WithPreVote
 }
 
 // raftConfig returns the raft.Config to use for this cache, applying the
