@@ -54,6 +54,14 @@ const (
 	// clearing does not cost an extra full window, but not a tight loop.
 	recoveryRetryAfter  = 1 * time.Second
 	observationChanSize = 5
+	// awaitRaftShutdownTimeout bounds the join on the goroutines of the raft
+	// instance a rebuild replaces (see awaitRaftShutdown). runFSM and
+	// runSnapshots sit inside user code — FSM.ApplyCmd, FSM.Snapshot and the
+	// snapshot's Persist — so a write-through FSM stuck on an unavailable
+	// backend would otherwise pin the rebuild, and recoveryMutex with it, for
+	// as long as the backend stays down. Sized well above a healthy snapshot
+	// Persist and well below the minutes such an outage can last.
+	awaitRaftShutdownTimeout = 10 * time.Second
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the
 	// discovery alive-window to expire. Sized for a healthy LAN: long
@@ -94,6 +102,11 @@ var (
 	// what bought another retry until a raft wedge became a cluster-wide
 	// write outage (RT-13906).
 	ErrOverloaded = errors.New("leader overloaded: too many applies in flight")
+
+	// errAwaitRaftShutdown indicates the old raft instance did not finish
+	// shutting down within awaitRaftShutdownTimeout. Nothing has been mutated
+	// when it is returned; the caller aborts the rebuild and retries later.
+	errAwaitRaftShutdown = errors.New("timed out awaiting old raft shutdown")
 
 	// errNoVotersToRecover is returned by recoverQuorum when the current
 	// configuration has no peer voters to drop, so there is nothing for
@@ -738,7 +751,15 @@ func (s *Cache) waitForLeader(ctx context.Context) error {
 	}
 
 	chChange := make(chan raft.Observation, 1)
-	observer := raft.NewObserver(chChange, true, func(o *raft.Observation) bool {
+	// Non-blocking: a blocking observer with a full buffer wedges raft.Shutdown
+	// itself — setState(Shutdown) → setLeader("") → observe() blocks on the
+	// send while holding observersLock read-side, so this waiter's deferred
+	// DeregisterObserver can never take the write lock and drain it. With both
+	// rebuild paths now joining raft's goroutines, that would escalate from a
+	// leaked goroutine to a wedged rebuild holding recoveryMutex. Dropping a
+	// duplicate observation costs nothing: the loop re-checks hasLeader on
+	// every wake and the buffer of 1 always keeps one wake-up pending.
+	observer := raft.NewObserver(chChange, false, func(o *raft.Observation) bool {
 		if _, ok := o.Data.(raft.LeaderObservation); ok {
 			return true
 		}
@@ -1152,14 +1173,22 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	// with a stale high index, making WaitFor return early — stale reads until
 	// the new raft has genuinely caught up (RT-14147). Awaiting is safe because
 	// raft was handed a transport wrapper that hides Close(); see hideClose.
-	if err := s.raft().Shutdown().Error(); err != nil {
+	// Bounded: on expiry nothing below has run yet, so returning leaves the FSM
+	// and the stores untouched for the next reset attempt.
+	if err := awaitRaftShutdown(s.raft(), awaitRaftShutdownTimeout); err != nil {
 		return fmt.Errorf("shutting down raft for reinit: %w", err)
 	}
 
 	// No raft goroutine is left running: the FSM wipe and the store swap below
 	// cannot race an apply or a snapshot.
 	if err := s.fsm.applyReset(full); err != nil {
-		return err
+		// Past the shutdown there is no way back to the old raft, so returning
+		// here would leave the node inert with nothing to retry it (m5).
+		// Rebuild instead and let the leader's heartbeats catch this node up:
+		// stale FSM content the failed clear left behind is content the
+		// leader's snapshot / AppendEntries stream overwrites anyway.
+		s.logger.Error("hard reset: clearing the FSM failed; rebuilding raft anyway",
+			"local-id", s.localID, "full", full, "error", err)
 	}
 	s.fsm.applyRaftReset()
 
@@ -1208,6 +1237,32 @@ func (s *Cache) rebuildRaft() (*raft.Raft, error) {
 		}
 	}
 	return nil, err
+}
+
+// awaitRaftShutdown joins the goroutines of the raft instance a rebuild
+// replaces, bounded by timeout. shutdownFuture.Error() is the only thing that
+// joins run, runFSM and runSnapshots, but the latter two sit inside user FSM
+// code, so a wedged FSM must not pin the rebuild — and recoveryMutex — forever
+// (see awaitRaftShutdownTimeout). Both call sites run this before mutating
+// anything shared, so on expiry the caller can return with every store
+// untouched and be retried later.
+//
+// The join goroutine outlives the timeout; that is harmless, it only waits.
+func awaitRaftShutdown(rft *raft.Raft, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- rft.Shutdown().Error() }()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		// raft@v1.7.3 returns nil unconditionally here; forwarding it is
+		// upgrade insurance, not a live branch.
+		return err
+	case <-timer.C:
+		return errAwaitRaftShutdown
+	}
 }
 
 // runQuorumRecoveryWatch is the long-running goroutine that decides when to
@@ -1517,7 +1572,13 @@ func (s *Cache) recoverQuorum() error {
 	// listener shutdown, either of which would brick the transport the new raft
 	// instance below runs on. Hence hideClose: the transport raft holds does not
 	// satisfy raft.WithClose, which makes the wait safe.
-	if err := rft.Shutdown().Error(); err != nil {
+	//
+	// Bounded, and it matters more here than in reinit: this path runs from the
+	// quorum watcher holding recoveryMutex, and it is needed exactly when the
+	// cluster is already wedged. On expiry every store is still untouched, so
+	// fire() logs and the watcher re-arms — better than an indefinite hold that
+	// also queues a concurrent hard reset or fork adoption behind the mutex.
+	if err := awaitRaftShutdown(rft, awaitRaftShutdownTimeout); err != nil {
 		return fmt.Errorf("shutting down raft for recovery: %w", err)
 	}
 
