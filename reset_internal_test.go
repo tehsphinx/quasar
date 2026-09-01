@@ -316,3 +316,71 @@ func TestFollowerHardResetAwaitsOldRaftShutdown(t *testing.T) {
 		t.Fatalf("expected the old raft shut down before the FSM reset, it was %v", fsm.stateAtReset)
 	}
 }
+
+// TestAwaitRaftShutdownTimesOutOnWedgedFSM covers the bound: shutdownFuture
+// joins runFSM, which sits inside FSM.ApplyCmd — a write-through FSM stuck on
+// an unavailable backend would otherwise pin the rebuild, and recoveryMutex
+// with it, for as long as the FSM stays stuck.
+func TestAwaitRaftShutdownTimesOutOnWedgedFSM(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fsm := newBlockingFSM()
+	c := newLeaderCache(ctx, t, fsm)
+
+	go func() { _, _ = c.store(ctx, "wedge", []byte("me")) }()
+	select {
+	case <-fsm.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FSM.ApplyCmd never ran")
+	}
+
+	err := awaitRaftShutdown(c.raft(), 200*time.Millisecond)
+	close(fsm.release)
+
+	if !errors.Is(err, errAwaitRaftShutdown) {
+		t.Fatalf("expected the join to be bounded, got %v", err)
+	}
+}
+
+// resetFailFSM fails every Reset, i.e. the FSM clear a hard reset performs
+// after the old raft is already down and unrecoverable.
+type resetFailFSM struct {
+	stubFSM
+}
+
+func (s *resetFailFSM) Reset() error {
+	_ = s.stubFSM.Reset()
+	return errors.New("resetFailFSM: reset failed")
+}
+
+// TestFollowerHardResetRebuildsRaftWhenFSMResetFails guards the fall-through:
+// past the awaited shutdown there is no way back to the old raft, so returning
+// on a reset error would leave the node inert with nothing to retry it (m5).
+// It must rebuild instead and let the leader's heartbeats catch it up.
+func TestFollowerHardResetRebuildsRaftWhenFSMResetFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fsm := &resetFailFSM{}
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, fsm,
+		WithLocalID("follower"),
+		WithTransport(tr),
+		WithSuffrage(raft.Nonvoter),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+
+	if err := c.localHardReset("reset-1", "", false); err != nil {
+		t.Fatalf("localHardReset must not surface the reset error, got %v", err)
+	}
+	if fsm.resets.Load() != 1 {
+		t.Fatalf("expected exactly one FSM reset attempt, got %d", fsm.resets.Load())
+	}
+	if state := c.raft().State(); state == raft.Shutdown {
+		t.Fatal("raft was not rebuilt after the failed FSM reset; the node is inert")
+	}
+}
