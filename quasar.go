@@ -784,6 +784,13 @@ func (s *Cache) waitForLeader(ctx context.Context) error {
 				return nil
 			}
 		case <-ctxRaft.Done():
+			if err := s.ctx.Err(); err != nil {
+				// Cache shutdown: this raft is gone and no replacement is
+				// coming, so ctxRaft stays done. Re-observing here would
+				// recurse on every call until the caller's stack blows —
+				// reachable from any Store still in flight at shutdown.
+				return err
+			}
 			return s.waitForLeader(ctx)
 		}
 	}
