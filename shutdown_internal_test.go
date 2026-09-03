@@ -95,3 +95,45 @@ func TestShutdownLeavesNoGoroutines(t *testing.T) {
 
 	goleak.VerifyNone(t, ignore)
 }
+
+// TestWaitForLeaderReturnsAfterShutdown is the regression test for the
+// unbounded recursion in waitForLeader's ctxRaft.Done() branch. That branch
+// exists to re-observe the raft instance a rebuild installs, but after
+// Shutdown no replacement is coming and ctxRaft stays done, so every call
+// recursed immediately into the next one until the goroutine's stack blew
+// (fatal error: stack overflow). Any Store still in flight when a node goes
+// down reaches it — flare's best-effort cache fills and blacklist markers
+// outlive the request that triggered them, so they hit this routinely.
+func TestWaitForLeaderReturnsAfterShutdown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, tr := transports.NewInmemTransport("")
+
+	c, err := NewCache(ctx, &stubFSM{},
+		WithLocalID("solo"),
+		WithTransport(tr),
+		WithBootstrap(true),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	if err := c.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.waitForLeader(ctx) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("waitForLeader after shutdown: want an error, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForLeader did not return after shutdown")
+	}
+}
