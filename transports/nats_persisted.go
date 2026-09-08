@@ -18,8 +18,8 @@ import (
 
 // Default tuning for the persisted-FIFO consumer. Sized to match the
 // gatexcache plan: AckWait * MaxDeliver gives the total redelivery
-// horizon, with MaxAckPending = 1 giving strict in-order delivery at
-// the cost of throughput. Operators can tune AckWait / MaxDeliver per
+// horizon, with MaxAckPending = 1 giving strict in-order delivery
+// within a shard at the cost of that shard's throughput. Operators can tune AckWait / MaxDeliver per
 // call site via WithNATSPersistedQueue options; MaxAckPending is fixed
 // at 1 by design (D4).
 //

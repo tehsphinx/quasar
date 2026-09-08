@@ -125,7 +125,8 @@ func TestPersistedApplyOverlapsAcrossShards(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _ = c.store(ctx, "", []byte("v"), WithShardKey(fmt.Sprintf("key-%d", i)))
+			key := fmt.Sprintf("key-%d", i)
+			_, _ = c.store(ctx, key, []byte("v"), WithShardKey(key))
 		}(i)
 	}
 	defer func() {

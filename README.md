@@ -295,8 +295,8 @@ restart). Two opt-in mechanisms add durability:
   across restarts.
 - **Persisted-FIFO queue (NATS only).** `transports.WithNATSPersistedQueue`
   backs writes with a JetStream WorkQueue stream: a write is published to the
-  stream and the next leader applies it in strict FIFO order, so **a missing
-  leader no longer blocks writes** — the publish lands durably and is applied
+  stream and the next leader applies it in strict FIFO order per shard key
+  (see `WithPersistedShards`), so **a missing leader no longer blocks writes** — the publish lands durably and is applied
   when leadership returns.
 
   ```go
