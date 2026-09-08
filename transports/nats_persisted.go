@@ -297,6 +297,11 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts Pe
 // cluster-wide. With q.shards == 1 this is byte-for-byte the original
 // single-consumer behaviour (durable name and unfiltered subscription
 // unchanged), so existing deployments are unaffected.
+//
+// Items carry their partition (PersistedItem.Shard) so the consumer can apply
+// the shards concurrently; before RT-14337 the cache re-serialised them behind
+// a single apply loop and the parallelism promised here stopped at this
+// channel.
 func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan PersistedItem, error) {
 	q.consumerM.Lock()
 	defer q.consumerM.Unlock()
@@ -420,12 +425,22 @@ func (q *natsPersistedQueue) shardSubject(key string) string {
 }
 
 func (q *natsPersistedQueue) shardOf(key string) int {
-	if q.shards <= 1 || key == "" {
+	return persistedShardOf(key, q.shards)
+}
+
+// persistedShardOf maps a routing key onto one of n FIFO partitions. An empty
+// key — and any key at all when there is only one partition — routes to shard
+// 0.
+//
+// Shared with the in-memory hub (see InmemQueueHub) so a test cluster
+// partitions writes exactly the way the NATS transport does.
+func persistedShardOf(key string, n int) int {
+	if n <= 1 || key == "" {
 		return 0
 	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
-	return int(h.Sum32() % uint32(q.shards))
+	return int(h.Sum32() % uint32(n))
 }
 
 // persistedReplyInbox extracts the publisher's reply-inbox subject from

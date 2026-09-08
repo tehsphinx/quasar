@@ -233,6 +233,7 @@ func (c *natsPersistedConsumer) consume(ctx context.Context, msg jetstream.Msg) 
 	item := &natsPersistedItem{
 		queue:   c.queue,
 		msg:     msg,
+		shard:   c.shard,
 		settled: make(chan struct{}),
 	}
 	c.setInflight(item)

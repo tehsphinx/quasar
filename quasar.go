@@ -545,10 +545,10 @@ func (s *Cache) localLastIndex() uint64 {
 
 // apply is the central dispatcher for cache commands. When the configured
 // transport supports persisted-FIFO mode, Store commands are routed through
-// the queue (every write, leader's own included, so the queue's single
-// in-flight item provides cluster-wide FIFO ordering). Non-Store commands
-// and transports without persisted mode keep the existing leader-local /
-// leader-RPC split.
+// the queue (every write, leader's own included, so the queue's one in-flight
+// item per partition orders the writes that share a shard key). Non-Store
+// commands and transports without persisted mode keep the existing
+// leader-local / leader-RPC split.
 func (s *Cache) apply(ctx context.Context, cmd *pb.Command, opts storeOpts) (*pb.CommandResponse, uint64, error) {
 	if storeCmd := cmd.GetStore(); storeCmd != nil && s.transport.SupportsPersisted() {
 		return s.routePersisted(ctx, storeCmd, opts)

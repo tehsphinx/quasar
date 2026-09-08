@@ -39,10 +39,25 @@ func (g *natsPersistedConsumerGroup) stopContexts() {
 // cancel runs before stopMctx so a puller racing a reconnect observes the
 // cancellation and stops the messages context it just opened itself (see
 // reconnect); stopMctx here unblocks whichever context is currently live.
+//
+// The per-shard drains run concurrently. Each waits up to the consumer's
+// AckWait for its item to be settled by the apply side, so draining them in
+// sequence would cost shards x AckWait in the worst case. In practice the
+// cancellation above makes every puller settle-or-Nack its own item in
+// parallel already, but with one apply worker per shard (RT-14337) all shards
+// can genuinely be mid-apply at once, which is exactly when the sequential
+// version would have been slowest.
 func (g *natsPersistedConsumerGroup) stop() {
 	g.cancel()
+
+	var wg sync.WaitGroup
 	for _, c := range g.consumers {
-		c.stopMctx()
-		c.drainInflight()
+		wg.Add(1)
+		go func(c *natsPersistedConsumer) {
+			defer wg.Done()
+			c.stopMctx()
+			c.drainInflight()
+		}(c)
 	}
+	wg.Wait()
 }

@@ -26,20 +26,19 @@ import (
 type InmemQueueHub struct {
 	m sync.Mutex
 
-	// queue is the in-memory persisted-FIFO buffer. publish() pushes
-	// onto it; the active consumer reads from inflightCh in arrival
-	// order. Bounded enough that producers can fan in faster than
-	// the consumer drains without deadlocking the test cluster.
-	queue []*inmemPersistedItem
+	// shards are the FIFO partitions. A single-shard hub (NewInmemQueueHub) is
+	// the original un-partitioned behaviour; NewShardedInmemQueueHub gives a
+	// test the same routing the NATS transport does, so the cache's per-shard
+	// apply workers can be exercised in-process (RT-14337).
+	shards []*inmemQueueShard
 
 	// activeConsumer holds the transport that currently owns the
 	// consumer. nil when no leader is draining. When set, deliver()
-	// fans the next queued item out via inflightCh; when cleared
-	// (stopConsumer), any in-flight item is requeued at the head so
-	// the next claimant gets it immediately.
+	// fans each shard's next queued item out via inflightCh; when cleared
+	// (stopConsumer), every in-flight item is requeued at its shard's head
+	// so the next claimant gets it immediately.
 	activeConsumer *InmemTransport
 	inflightCh     chan PersistedItem
-	inflightItem   *inmemPersistedItem
 
 	// releaseCh is closed by releaseLocked whenever the current claim
 	// ends, signalling the per-claim watchdog goroutine to exit. Without
@@ -49,12 +48,53 @@ type InmemQueueHub struct {
 	releaseCh chan struct{}
 }
 
-// NewInmemQueueHub constructs an empty hub. Attach it to every Inmem
-// transport in the test cluster (via AttachQueueHub or the
+// inmemQueueShard is one FIFO partition: its own pending queue and its own
+// single in-flight slot. The slot is the in-memory equivalent of the NATS
+// transport's per-shard durable with MaxAckPending = 1 — one unsettled item
+// per partition, independent of every other partition.
+type inmemQueueShard struct {
+	// queue is this partition's pending buffer. publish() pushes onto it; the
+	// active consumer takes the head via inflightCh in arrival order.
+	queue []*inmemPersistedItem
+	// inflight is the item handed to the consumer and not yet settled. While
+	// it is set this partition delivers nothing further.
+	inflight *inmemPersistedItem
+}
+
+// NewInmemQueueHub constructs an empty single-partition hub. Attach it to
+// every Inmem transport in the test cluster (via AttachQueueHub or the
 // ConnectInmemQueueHub helper) before constructing the cache instances
 // so newCache observes SupportsPersisted() == true.
 func NewInmemQueueHub() *InmemQueueHub {
-	return &InmemQueueHub{}
+	return NewShardedInmemQueueHub(1)
+}
+
+// NewShardedInmemQueueHub constructs an empty hub with n FIFO partitions,
+// routing by PersistedStoreOpts.ShardKey with the same hash and modulo the
+// NATS transport uses (see persistedShardOf). Each partition keeps one item in
+// flight independently, so a test can exercise the real
+// publish -> partition -> per-shard apply worker path in-process instead of
+// needing a JetStream server.
+//
+// n < 1 is treated as 1, which is exactly NewInmemQueueHub.
+func NewShardedInmemQueueHub(n int) *InmemQueueHub {
+	if n < 1 {
+		n = 1
+	}
+	shards := make([]*inmemQueueShard, n)
+	for i := range shards {
+		shards[i] = &inmemQueueShard{}
+	}
+	return &InmemQueueHub{shards: shards}
+}
+
+// ensureShardsLocked gives a zero-value hub its single partition, so a hub
+// built as &InmemQueueHub{} still behaves like NewInmemQueueHub(). Called with
+// h.m held.
+func (h *InmemQueueHub) ensureShardsLocked() {
+	if len(h.shards) == 0 {
+		h.shards = []*inmemQueueShard{{}}
+	}
 }
 
 // ConnectInmemQueueHub attaches the given hub to every passed Inmem
@@ -80,10 +120,9 @@ func WithInmemPersistedQueue(hub *InmemQueueHub) func(*InmemTransport) {
 	}
 }
 
-// publish enqueues a Store command and blocks until the active
-// consumer either replies or the context is cancelled.
-// The inmem hub is a single un-sharded queue, so PersistedStoreOpts (ShardKey)
-// carries nothing it needs to act on.
+// publish enqueues a Store command into the partition selected by
+// opts.ShardKey and blocks until the active consumer either replies or the
+// context is cancelled.
 func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error) {
 	item := &inmemPersistedItem{
 		hub:     h,
@@ -94,7 +133,10 @@ func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store, opts Per
 	item.deadline, item.hasDeadline = ctx.Deadline()
 
 	h.m.Lock()
-	h.queue = append(h.queue, item)
+	h.ensureShardsLocked()
+	item.shard = persistedShardOf(opts.ShardKey, len(h.shards))
+	sh := h.shards[item.shard]
+	sh.queue = append(sh.queue, item)
 	h.deliverLocked()
 	h.m.Unlock()
 
@@ -114,16 +156,17 @@ func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store, opts Per
 	}
 }
 
-// cancelPublish removes a still-queued item from the buffer when the
-// publisher's context is cancelled before delivery. If the item is
+// cancelPublish removes a still-queued item from its partition's buffer when
+// the publisher's context is cancelled before delivery. If the item is
 // already in flight, the consumer's reply still lands on its replyCh —
 // but the publisher has stopped listening, so that's a no-op.
 func (h *InmemQueueHub) cancelPublish(item *inmemPersistedItem) {
 	h.m.Lock()
 	defer h.m.Unlock()
-	for i, q := range h.queue {
+	sh := h.shards[item.shard]
+	for i, q := range sh.queue {
 		if q == item {
-			h.queue = append(h.queue[:i], h.queue[i+1:]...)
+			sh.queue = append(sh.queue[:i], sh.queue[i+1:]...)
 			return
 		}
 	}
@@ -143,8 +186,11 @@ func (h *InmemQueueHub) startConsumer(ctx context.Context, t *InmemTransport) (<
 		return h.inflightCh, nil
 	}
 
+	h.ensureShardsLocked()
 	h.activeConsumer = t
-	h.inflightCh = make(chan PersistedItem, 1)
+	// One slot per partition: every shard can have an item in flight at the
+	// same time, and deliverLocked must never have to put one back.
+	h.inflightCh = make(chan PersistedItem, len(h.shards))
 	h.releaseCh = make(chan struct{})
 
 	go func(ch chan PersistedItem, released <-chan struct{}) {
@@ -189,11 +235,13 @@ func (h *InmemQueueHub) releaseLocked(t *InmemTransport) error {
 	if h.activeConsumer != t {
 		return nil
 	}
-	if h.inflightItem != nil {
-		// Put the in-flight item back at the head of the queue so
-		// the next claimant sees it first. Equivalent to a JS NAK.
-		h.queue = append([]*inmemPersistedItem{h.inflightItem}, h.queue...)
-		h.inflightItem = nil
+	// Put every in-flight item back at the head of its own partition so the
+	// next claimant sees it first. Equivalent to a JS NAK per shard.
+	for _, sh := range h.shards {
+		if sh.inflight != nil {
+			sh.queue = append([]*inmemPersistedItem{sh.inflight}, sh.queue...)
+			sh.inflight = nil
+		}
 	}
 	if h.inflightCh != nil {
 		close(h.inflightCh)
@@ -209,51 +257,58 @@ func (h *InmemQueueHub) releaseLocked(t *InmemTransport) error {
 	return nil
 }
 
-// deliverLocked moves the head of the queue into the consumer's inflight
-// slot if both a consumer is active and no item is currently in flight.
-// Called with h.m held.
+// deliverLocked moves each partition's queue head into that partition's
+// inflight slot, for every partition that has a consumer, something queued and
+// nothing in flight. Partitions are independent: one shard holding an
+// unsettled item never delays another shard's delivery. Called with h.m held.
 func (h *InmemQueueHub) deliverLocked() {
-	if h.activeConsumer == nil || h.inflightItem != nil || len(h.queue) == 0 {
+	if h.activeConsumer == nil {
 		return
 	}
-	item := h.queue[0]
-	h.queue = h.queue[1:]
-	h.inflightItem = item
-	// Non-blocking send: inflightCh is buffered with cap 1, so this
-	// always succeeds when inflightItem was nil (deliver is only
-	// reached when the previous item was settled).
-	//
-	// The default branch cannot be reached by a concurrent close: a
-	// select's default does NOT make a send on a closed channel safe —
-	// that would panic. It is safe only because inflightCh is closed and
-	// nil'd together under h.m (releaseLocked), and deliverLocked also
-	// runs under h.m; so whenever we get here inflightCh is non-nil, open,
-	// and (since inflightItem was just nil) empty. The default is kept as
-	// a defensive no-op for the otherwise-impossible empty-buffer miss.
-	select {
-	case h.inflightCh <- item:
-	default:
-		// Item could not be handed off; put it back at the head for the
-		// next claimant.
-		h.queue = append([]*inmemPersistedItem{item}, h.queue...)
-		h.inflightItem = nil
+	for _, sh := range h.shards {
+		if sh.inflight != nil || len(sh.queue) == 0 {
+			continue
+		}
+		item := sh.queue[0]
+		sh.queue = sh.queue[1:]
+		sh.inflight = item
+		// Non-blocking send: inflightCh has one slot per partition and each
+		// partition holds at most one item in flight, so this always succeeds.
+		//
+		// The default branch cannot be reached by a concurrent close: a
+		// select's default does NOT make a send on a closed channel safe —
+		// that would panic. It is safe only because inflightCh is closed and
+		// nil'd together under h.m (releaseLocked), and deliverLocked also
+		// runs under h.m; so whenever we get here inflightCh is non-nil and
+		// open. The default is kept as a defensive no-op for the
+		// otherwise-impossible full-buffer miss.
+		select {
+		case h.inflightCh <- item:
+		default:
+			// Item could not be handed off; put it back at the head of its
+			// partition for the next delivery pass.
+			sh.queue = append([]*inmemPersistedItem{item}, sh.queue...)
+			sh.inflight = nil
+		}
 	}
 }
 
 // settle is called by an inmemPersistedItem when the consumer terminates
-// it (success / error / NAK). The hub uses this hook to clear the
-// inflight slot and deliver the next queued item.
+// it (success / error / NAK). The hub uses this hook to clear that
+// partition's inflight slot and deliver its next queued item.
 func (h *InmemQueueHub) settle(item *inmemPersistedItem, reply inmemPersistedReply, requeue bool) {
 	h.m.Lock()
 	defer h.m.Unlock()
-	if h.inflightItem != item {
+
+	sh := h.shards[item.shard]
+	if sh.inflight != item {
 		return
 	}
-	h.inflightItem = nil
+	sh.inflight = nil
 	if requeue {
-		// NAK path: keep the item, push back to the head, deliver to
-		// the next consumer (often after a leader flip).
-		h.queue = append([]*inmemPersistedItem{item}, h.queue...)
+		// NAK path: keep the item, push back to the head of its partition,
+		// deliver to the next consumer (often after a leader flip).
+		sh.queue = append([]*inmemPersistedItem{item}, sh.queue...)
 	} else {
 		// Success / error path: notify the publisher.
 		select {
@@ -279,6 +334,9 @@ type inmemPersistedItem struct {
 	command *pb.Store
 	replyCh chan inmemPersistedReply
 	retry   bool
+	// shard is the partition publish() routed this item to. Set once, before
+	// the item is queued, and read without the hub lock afterwards.
+	shard int
 	// deadline mirrors the publisher's call deadline; hasDeadline is false
 	// when the publisher had no deadline. Carried so the leader's apply path
 	// can drop a non-retry command picked up after the publisher gave up,
@@ -291,6 +349,10 @@ type inmemPersistedItem struct {
 
 func (i *inmemPersistedItem) Command() *pb.Store {
 	return i.command
+}
+
+func (i *inmemPersistedItem) Shard() int {
+	return i.shard
 }
 
 func (i *inmemPersistedItem) Retry() bool {
