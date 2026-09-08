@@ -298,9 +298,10 @@ func WithNoLeaderTimeout(timeout time.Duration) Option {
 // below it nothing changes.
 //
 // The bound governs leader-local applies: the leader's own writes plus the
-// writes transports forward to it. In persisted-FIFO mode the consumer loop
-// applies queued Stores one at a time, so that path holds at most one apply in
-// flight and a bound above 1 never sheds there.
+// writes transports forward to it. In persisted-FIFO mode the queue is applied
+// by one worker per shard, so that path holds up to one apply in flight per
+// partition — size the bound above the configured shard count or queued writes
+// shed against each other.
 func WithMaxInflightApplies(n int) Option {
 	return func(o *options) {
 		o.maxInflightApplies = n

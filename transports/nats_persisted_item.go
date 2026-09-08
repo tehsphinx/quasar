@@ -15,6 +15,9 @@ type natsPersistedItem struct {
 	queue   *natsPersistedQueue
 	msg     jetstream.Msg
 	command *pb.Store
+	// shard is the index of the per-shard consumer this item was pulled by.
+	// Stamped in natsPersistedConsumer.consume; see PersistedItem.Shard.
+	shard int
 
 	settledM    sync.Mutex
 	settledDone bool
@@ -23,6 +26,10 @@ type natsPersistedItem struct {
 
 func (i *natsPersistedItem) Command() *pb.Store {
 	return i.command
+}
+
+func (i *natsPersistedItem) Shard() int {
+	return i.shard
 }
 
 func (i *natsPersistedItem) Retry() bool {

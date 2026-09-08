@@ -15,9 +15,11 @@ type fakePersistedItem struct {
 	retry       bool
 	deadline    time.Time
 	hasDeadline bool
+	shard       int
 }
 
 func (f fakePersistedItem) Command() *pb.Store                                  { return &pb.Store{} }
+func (f fakePersistedItem) Shard() int                                          { return f.shard }
 func (f fakePersistedItem) Retry() bool                                         { return f.retry }
 func (f fakePersistedItem) Deadline() (time.Time, bool)                         { return f.deadline, f.hasDeadline }
 func (fakePersistedItem) ReplySuccess(context.Context, *pb.StoreResponse) error { return nil }

@@ -75,9 +75,10 @@ type Transport interface {
 	//
 	// When true, the cache routes ALL Store commands (leader's own writes
 	// included) through StorePersisted / StartPersistedConsumer instead of
-	// the synchronous leader-RPC path. The single in-flight item on the
-	// queue provides strict cluster-wide FIFO ordering of writes, and a
-	// missing leader is no longer a write blocker — the publish lands in
+	// the synchronous leader-RPC path. The queue keeps one item in flight per
+	// FIFO partition, which gives strict ordering of the writes that share a
+	// shard key (writes in different partitions are mutually unordered), and
+	// a missing leader is no longer a write blocker — the publish lands in
 	// the persisted store and the next leader's consumer applies it.
 	//
 	// Transports that do not support persisted-FIFO must return false here
@@ -99,11 +100,12 @@ type Transport interface {
 	StorePersisted(ctx context.Context, command *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error)
 
 	// StartPersistedConsumer begins draining the persisted-FIFO stream on
-	// this node and returns a channel of PersistedItem. Called by the
-	// quasar cache when this node becomes leader. Each item must be
-	// terminated by ReplySuccess, ReplyError, or Nack — the queue's
-	// single-in-flight-item invariant blocks the next delivery until
-	// that happens.
+	// this node and returns a channel of PersistedItem, fanning in every
+	// partition. Called by the quasar cache when this node becomes leader.
+	// Each item must be terminated by ReplySuccess, ReplyError, or Nack —
+	// the queue's single-in-flight-item-per-shard invariant blocks that
+	// shard's next delivery until it happens, while other shards keep
+	// delivering.
 	//
 	// Calling StartPersistedConsumer when the transport doesn't support
 	// persisted-FIFO returns ErrPersistedNotSupported.
@@ -119,8 +121,8 @@ type Transport interface {
 // PersistedItem is a single Store command delivered by
 // StartPersistedConsumer. The consumer must terminate every item by
 // calling exactly one of ReplySuccess / ReplyError / Nack — the
-// persisted stream's MaxAckPending = 1 invariant pauses delivery until
-// the in-flight item is settled.
+// persisted stream's per-shard MaxAckPending = 1 invariant pauses that
+// shard's delivery until its in-flight item is settled.
 //
 // Delivery on the persisted path is AT-LEAST-ONCE: redelivery is inherent
 // to the backing queue (AckWait expiry, leadership flips, a Nack racing a
@@ -130,6 +132,20 @@ type Transport interface {
 type PersistedItem interface {
 	// Command returns the underlying Store command.
 	Command() *pb.Store
+
+	// Shard reports the FIFO partition this item was delivered from.
+	//
+	// It is an OPAQUE, transport-defined partition id: a consumer may compare
+	// it for equality and key per-partition work by it, but must not derive a
+	// shard key, a subject or any persisted state from it — it is not stable
+	// across transports, nor across a change of the configured shard count.
+	//
+	// The transport guarantees AT MOST ONE UNSETTLED ITEM PER SHARD: the next
+	// item for a shard is delivered only once the previous one has been
+	// settled. That is what makes it safe to apply the items of different
+	// shards concurrently while the items of one shard stay strictly ordered —
+	// see quasar's per-shard apply workers (RT-14337).
+	Shard() int
 
 	// Retry reports whether the publisher marked this command as eligible
 	// for at-least-once redelivery (PersistedStoreOpts.Retry). The consumer

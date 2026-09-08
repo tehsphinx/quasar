@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -19,8 +20,9 @@ const persistedConsumerRestartDelay = 500 * time.Millisecond
 // supports persisted-FIFO. Every Store call from any node (leader or
 // follower) publishes a single message into the persisted-FIFO stream
 // and waits for the leader's reply on the embedded reply inbox. The
-// queue's MaxAckPending = 1 invariant gives strict cluster-wide FIFO
-// ordering of writes.
+// queue's per-shard MaxAckPending = 1 invariant gives strict FIFO ordering
+// of the writes that share a shard key (opts.shardKey); writes in different
+// partitions are mutually unordered by design.
 //
 // When the caller asked for WithRetry() and the wait for the reply
 // times out (ctx.Err() != nil), we wrap the error as
@@ -162,7 +164,7 @@ func (s *Cache) applyLeadershipState(ctx context.Context) {
 // Idempotent: a second call while a previous consumer is still
 // draining returns the existing channel from the transport, which
 // hashes by transport identity, so we still drive only one
-// applyLoop per leader claim.
+// applyLoop (and therefore one set of shard workers) per leader claim.
 func (s *Cache) startPersistedConsumerOnce(ctx context.Context) {
 	ch, err := s.transport.StartPersistedConsumer(ctx)
 	if err != nil {
@@ -175,20 +177,126 @@ func (s *Cache) startPersistedConsumerOnce(ctx context.Context) {
 }
 
 // runPersistedApplyLoop applies items received from the persisted-FIFO
-// consumer. Exits when the channel is closed (StopPersistedConsumer
-// fired, or the consumer died on its own) or when ctx is done. Each item
-// is settled exactly once via ReplySuccess, ReplyError, or Nack.
+// consumer, with one apply worker per shard. Exits when the channel is closed
+// (StopPersistedConsumer fired, or the consumer died on its own) or when ctx
+// is done. Each item is settled exactly once via ReplySuccess, ReplyError, or
+// Nack.
 func (s *Cache) runPersistedApplyLoop(ctx context.Context, ch <-chan transports.PersistedItem) {
+	if chClosed := s.dispatchPersistedItems(ctx, ch); chClosed {
+		s.restartPersistedConsumerIfLeader(ctx)
+	}
+}
+
+// dispatchPersistedItems routes every item to its shard's apply worker,
+// creating a worker on a shard's first item, and tears all workers down before
+// returning. It reports whether it stopped because the transport closed the
+// item channel, as opposed to ctx being done — that is what decides whether
+// the consumer needs restarting.
+//
+// One worker per shard rather than one per leader claim (RT-14337): the
+// expensive parts of an apply — the leader-side persist hook writing to the
+// database, and the raft commit round trip — are per-partition-independent
+// work, so running them from a single loop capped the whole cluster at one
+// write in flight and left raft's group commit with nothing to batch. Per-key
+// ordering is untouched: a key maps to exactly one shard, and the transport
+// delivers a shard's next item only once the previous one is settled (see
+// transports.PersistedItem.Shard), which the worker does before taking
+// another.
+//
+// This goroutine only routes; it never applies, so a slow shard cannot stall
+// the fan-out. Its send to a worker does not block either, for the same
+// one-unsettled-item-per-shard reason: the worker's single-slot channel is
+// free whenever that shard's next item arrives.
+func (s *Cache) dispatchPersistedItems(ctx context.Context, ch <-chan transports.PersistedItem) bool {
+	workers := make(map[int]chan transports.PersistedItem)
+
+	var wg sync.WaitGroup
+	defer s.stopPersistedWorkers(ctx, workers, &wg)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case item, ok := <-ch:
+			if !ok {
+				return true
+			}
+			if !s.handOffPersistedItem(ctx, workers, &wg, item) {
+				return false
+			}
+		}
+	}
+}
+
+// handOffPersistedItem hands item to its shard's worker, starting that worker
+// if this is the shard's first item. Reports false when ctx ended before the
+// hand-off, in which case the item has been Nacked for the next leader.
+func (s *Cache) handOffPersistedItem(ctx context.Context, workers map[int]chan transports.PersistedItem,
+	wg *sync.WaitGroup, item transports.PersistedItem,
+) bool {
+	shard := item.Shard()
+	worker, ok := workers[shard]
+	if !ok {
+		// Single slot: the transport keeps one unsettled item per shard, so a
+		// second one cannot arrive before the worker has taken the first.
+		worker = make(chan transports.PersistedItem, 1)
+		workers[shard] = worker
+
+		wg.Add(1)
+		go s.runPersistedApplyWorker(ctx, worker, wg)
+	}
+
+	select {
+	case worker <- item:
+		return true
+	case <-ctx.Done():
+		// Only reachable if a transport breaks the one-item-per-shard
+		// guarantee while shutting down. Hand the item back rather than
+		// dropping a write the queue is still holding for us.
+		_ = item.Nack(context.WithoutCancel(ctx))
+		return false
+	}
+}
+
+// runPersistedApplyWorker applies one shard's items, in the order the
+// transport delivered them. Returns when the shard's channel is closed
+// (dispatch is shutting down) or when ctx is done — the latter can leave a
+// queued item unsettled, which stopPersistedWorkers Naks.
+func (s *Cache) runPersistedApplyWorker(ctx context.Context, items <-chan transports.PersistedItem,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case item, ok := <-ch:
+		case item, ok := <-items:
 			if !ok {
-				s.restartPersistedConsumerIfLeader(ctx)
 				return
 			}
 			s.applyPersistedItem(ctx, item)
+		}
+	}
+}
+
+// stopPersistedWorkers ends every shard worker and settles what they did not
+// get to. Closing a worker's channel lets it finish the item it holds and
+// exit; a worker that returned on ctx cancellation instead can leave its
+// queued item behind, and that item is Nacked rather than dropped so the next
+// leader applies it. With N workers the shutdown path has N in-flight items to
+// account for instead of one (RT-13042 M5, generalised).
+func (s *Cache) stopPersistedWorkers(ctx context.Context, workers map[int]chan transports.PersistedItem,
+	wg *sync.WaitGroup,
+) {
+	for _, worker := range workers {
+		close(worker)
+	}
+	wg.Wait()
+
+	for _, worker := range workers {
+		for item := range worker {
+			_ = item.Nack(context.WithoutCancel(ctx))
 		}
 	}
 }
@@ -264,9 +372,9 @@ func (s *Cache) applyPersistedItem(ctx context.Context, item transports.Persiste
 		// instead of being terminated — otherwise a load shed would turn into
 		// a dropped write (RT-13906).
 		//
-		// The consumer loop applies one item at a time, so a bound above 1 does
-		// not shed on this path today; the branch keeps a shed from ever falling
-		// through to the terminate path below if that ever changes.
+		// Reachable since RT-14337: the queue is applied by one worker per
+		// shard, so this path can hold as many applies in flight as there are
+		// partitions and a bound at or below the shard count sheds here.
 		if errors.Is(err, ErrOverloaded) {
 			if item.Retry() {
 				_ = item.NackWithDelay(ctx)
