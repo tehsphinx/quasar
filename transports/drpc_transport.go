@@ -184,7 +184,8 @@ func (s *DRPCTransport) StorePersisted(_ context.Context, _ *pb.Store, _ Persist
 
 // StartPersistedConsumer always returns ErrPersistedNotSupported for the
 // DRPC transport.
-func (s *DRPCTransport) StartPersistedConsumer(_ context.Context) (<-chan PersistedItem, error) {
+func (s *DRPCTransport) StartPersistedConsumer(_ context.Context, _ PersistedApplyFunc,
+) (<-chan struct{}, error) {
 	return nil, ErrPersistedNotSupported
 }
 

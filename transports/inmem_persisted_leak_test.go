@@ -15,17 +15,22 @@ import (
 // through stopConsumer (leaving the start ctx alive) used to leak one
 // goroutine per flip. stopConsumer must wake the watchdog so it exits with
 // the claim.
+//
+// A claim now also starts one apply goroutine per partition (RT-14337), which
+// stopConsumer must retire the same way; this test counts those too.
 func TestInmemQueueHub_StopConsumerDoesNotLeakWatchdog(t *testing.T) {
 	hub := NewInmemQueueHub()
 	_, consumer := NewInmemTransport("")
 	ConnectInmemQueueHub(hub, consumer)
+
+	noopApply := func(context.Context, PersistedItem) {}
 
 	// Long-lived ctx that is never cancelled, so the only thing that can
 	// retire a watchdog is stopConsumer.
 	ctx := context.Background()
 
 	// Warm up one cycle so any one-time goroutines are already running.
-	if _, err := consumer.StartPersistedConsumer(ctx); err != nil {
+	if _, err := consumer.StartPersistedConsumer(ctx, noopApply); err != nil {
 		t.Fatalf("StartPersistedConsumer: %v", err)
 	}
 	if err := consumer.StopPersistedConsumer(); err != nil {
@@ -36,7 +41,7 @@ func TestInmemQueueHub_StopConsumerDoesNotLeakWatchdog(t *testing.T) {
 
 	const flips = 50
 	for n := 0; n < flips; n++ {
-		if _, err := consumer.StartPersistedConsumer(ctx); err != nil {
+		if _, err := consumer.StartPersistedConsumer(ctx, noopApply); err != nil {
 			t.Fatalf("StartPersistedConsumer #%d: %v", n, err)
 		}
 		if err := consumer.StopPersistedConsumer(); err != nil {

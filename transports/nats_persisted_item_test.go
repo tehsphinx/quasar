@@ -90,7 +90,6 @@ func TestNatsPersistedConsumer_StopPrefersSettleOverNack(t *testing.T) {
 	defer cancel()
 	c := &natsPersistedConsumer{
 		queue: item.queue,
-		items: make(chan PersistedItem),
 		mctx:  noopMessagesContext{ctx: pullCtx},
 	}
 	c.setInflight(item)
@@ -134,7 +133,6 @@ func TestNatsPersistedConsumer_StopNacksUnsettledItem(t *testing.T) {
 	defer cancel()
 	c := &natsPersistedConsumer{
 		queue: item.queue,
-		items: make(chan PersistedItem),
 		mctx:  noopMessagesContext{ctx: pullCtx},
 	}
 	c.setInflight(item)

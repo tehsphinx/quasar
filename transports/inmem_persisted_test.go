@@ -27,31 +27,25 @@ func TestInmemQueueHub_PublishConsumeReplySuccess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	ch, err := consumer.StartPersistedConsumer(ctx)
-	asrt.NoErr(err)
-
-	// Run the consumer drain in a goroutine.
-	drainErr := make(chan error, 1)
-	go func() {
-		for item := range ch {
-			if string(item.Command().Key) != "k1" {
-				drainErr <- errors.New("unexpected key")
-				return
-			}
-			if e := item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 42}); e != nil {
-				drainErr <- e
-				return
-			}
+	// The apply func IS the consumer drain: the hub calls it on the item's
+	// own partition goroutine.
+	_, err := consumer.StartPersistedConsumer(ctx, func(ctx context.Context, item PersistedItem) {
+		if string(item.Command().Key) != "k1" {
+			t.Errorf("unexpected key %q", item.Command().Key)
+			_ = item.Nack(ctx)
+			return
 		}
-		drainErr <- nil
-	}()
+		if e := item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 42}); e != nil {
+			t.Errorf("ReplySuccess: %v", e)
+		}
+	})
+	asrt.NoErr(err)
 
 	resp, err := producer.StorePersisted(ctx, &pb.Store{Key: "k1", Data: []byte("v1")}, PersistedStoreOpts{})
 	asrt.NoErr(err)
 	asrt.Equal(resp.Uid, uint64(42))
 
 	asrt.NoErr(consumer.StopPersistedConsumer())
-	asrt.NoErr(<-drainErr)
 }
 
 // TestInmemQueueHub_ReplyError surfaces consumer-side errors to the
@@ -67,15 +61,11 @@ func TestInmemQueueHub_ReplyError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	ch, err := consumer.StartPersistedConsumer(ctx)
-	asrt.NoErr(err)
-
 	applyErr := errors.New("fsm rejected payload")
-	go func() {
-		for item := range ch {
-			_ = item.ReplyError(ctx, applyErr)
-		}
-	}()
+	_, err := consumer.StartPersistedConsumer(ctx, func(ctx context.Context, item PersistedItem) {
+		_ = item.ReplyError(ctx, applyErr)
+	})
+	asrt.NoErr(err)
 
 	_, err = producer.StorePersisted(ctx, &pb.Store{Key: "k1"}, PersistedStoreOpts{})
 	asrt.True(err != nil)
@@ -99,7 +89,8 @@ func TestInmemQueueHub_NackRequeuesToNextConsumer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	chA, err := leaderA.StartPersistedConsumer(ctx)
+	applyA, sinkA := itemSink(1)
+	_, err := leaderA.StartPersistedConsumer(ctx, applyA)
 	asrt.NoErr(err)
 
 	// Publisher fires asynchronously; the publisher is blocked on the
@@ -118,16 +109,17 @@ func TestInmemQueueHub_NackRequeuesToNextConsumer(t *testing.T) {
 
 	// LeaderA receives the item, then steps down before replying. The
 	// hub's stopConsumer requeues the item at the head.
-	item := <-chA
+	item := <-sinkA
 	asrt.Equal(string(item.Command().Key), "kFlip")
 	asrt.NoErr(leaderA.StopPersistedConsumer())
 
 	// LeaderB claims the consumer and receives the requeued item.
-	chB, err := leaderB.StartPersistedConsumer(ctx)
+	applyB, sinkB := itemSink(1)
+	_, err = leaderB.StartPersistedConsumer(ctx, applyB)
 	asrt.NoErr(err)
 
 	select {
-	case item2 := <-chB:
+	case item2 := <-sinkB:
 		asrt.Equal(string(item2.Command().Key), "kFlip")
 		asrt.NoErr(item2.ReplySuccess(ctx, &pb.StoreResponse{Uid: 7}))
 	case <-time.After(2 * time.Second):
@@ -157,23 +149,18 @@ func TestInmemQueueHub_FIFOOrder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	ch, err := consumer.StartPersistedConsumer(ctx)
-	asrt.NoErr(err)
-
 	var (
 		seen   []string
 		seenMu sync.Mutex
-		done   = make(chan struct{})
 	)
-	go func() {
-		defer close(done)
-		for item := range ch {
-			seenMu.Lock()
-			seen = append(seen, string(item.Command().Key))
-			seenMu.Unlock()
-			_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: uint64(len(seen))})
-		}
-	}()
+	_, err := consumer.StartPersistedConsumer(ctx, func(ctx context.Context, item PersistedItem) {
+		seenMu.Lock()
+		seen = append(seen, string(item.Command().Key))
+		uid := uint64(len(seen))
+		seenMu.Unlock()
+		_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: uid})
+	})
+	asrt.NoErr(err)
 
 	const N = 8
 	keys := make([]string, 0, N)
@@ -184,8 +171,9 @@ func TestInmemQueueHub_FIFOOrder(t *testing.T) {
 		asrt.NoErr(err)
 	}
 
+	// Every publish above waited for its own reply, so all N are settled by
+	// the time the claim is released.
 	asrt.NoErr(consumer.StopPersistedConsumer())
-	<-done
 
 	seenMu.Lock()
 	defer seenMu.Unlock()
@@ -216,14 +204,13 @@ func TestInmemQueueHub_PublisherCtxCancelDropsPending(t *testing.T) {
 	// Start the consumer; it must NOT receive the cancelled item.
 	consumeCtx, cancelConsume := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancelConsume()
-	ch, err := consumer.StartPersistedConsumer(consumeCtx)
+	apply, sink := itemSink(1)
+	_, err = consumer.StartPersistedConsumer(consumeCtx, apply)
 	asrt.NoErr(err)
 
 	select {
-	case item, ok := <-ch:
-		if ok {
-			t.Fatalf("unexpected delivery after publisher cancellation: %v", item.Command().Key)
-		}
+	case item := <-sink:
+		t.Fatalf("unexpected delivery after publisher cancellation: %v", item.Command().Key)
 	case <-time.After(200 * time.Millisecond):
 		// Expected: nothing arrives.
 	}
@@ -255,12 +242,12 @@ func TestInmemQueueHub_RetryPublishSurvivesCtxCancel(t *testing.T) {
 	// A consumer claiming afterwards must still receive the retry item.
 	consumeCtx, cancelConsume := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelConsume()
-	ch, err := consumer.StartPersistedConsumer(consumeCtx)
+	apply, sink := itemSink(1)
+	_, err = consumer.StartPersistedConsumer(consumeCtx, apply)
 	asrt.NoErr(err)
 
 	select {
-	case item, ok := <-ch:
-		asrt.True(ok)
+	case item := <-sink:
 		asrt.Equal(string(item.Command().Key), "kept")
 		asrt.True(item.Retry())
 		_, hasDeadline := item.Deadline()

@@ -823,13 +823,15 @@ func (s *NATSTransport) StorePersisted(ctx context.Context, command *pb.Store, o
 	return s.queue.publish(ctx, command, opts)
 }
 
-// StartPersistedConsumer begins draining the persisted-FIFO stream on
-// this node. Called by the cache when this node becomes leader.
-func (s *NATSTransport) StartPersistedConsumer(ctx context.Context) (<-chan PersistedItem, error) {
+// StartPersistedConsumer begins draining the persisted-FIFO stream on this
+// node, applying each shard's items on that shard's own puller goroutine.
+// Called by the cache when this node becomes leader.
+func (s *NATSTransport) StartPersistedConsumer(ctx context.Context, apply PersistedApplyFunc,
+) (<-chan struct{}, error) {
 	if s.queue == nil {
 		return nil, ErrPersistedNotSupported
 	}
-	return s.queue.startConsumer(ctx)
+	return s.queue.startConsumer(ctx, apply)
 }
 
 // StopPersistedConsumer stops the consumer started by

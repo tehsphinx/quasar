@@ -26,12 +26,11 @@ func TestNatsPersistedConsumer_TerminalDeliveryLogged(t *testing.T) {
 	q := &natsPersistedQueue{ackWait: time.Second, maxDeliver: 16, logger: logger}
 
 	pullCtx, cancel := context.WithCancel(context.Background())
-	// Cancel up front so consume returns immediately after the terminal-
-	// delivery check instead of blocking on the items channel.
+	// Cancel up front so consume returns right after the terminal-delivery
+	// check instead of running an apply.
 	cancel()
 	c := &natsPersistedConsumer{
 		queue: q,
-		items: make(chan PersistedItem),
 		mctx:  noopMessagesContext{ctx: pullCtx},
 	}
 
@@ -56,7 +55,6 @@ func TestNatsPersistedConsumer_NonTerminalDeliveryNotLogged(t *testing.T) {
 	cancel()
 	c := &natsPersistedConsumer{
 		queue: q,
-		items: make(chan PersistedItem),
 		mctx:  noopMessagesContext{ctx: pullCtx},
 	}
 

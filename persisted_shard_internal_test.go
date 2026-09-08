@@ -5,13 +5,11 @@ package quasar
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/tehsphinx/quasar/pb/v1"
 	"github.com/tehsphinx/quasar/stores"
 	"github.com/tehsphinx/quasar/transports"
 )
@@ -19,8 +17,8 @@ import (
 // gatingPersistStore is a stores.PersistentStorage that parks inside Store
 // until released, recording the highest number of calls that were inside it at
 // the same time. The persist hook runs on the leader before the raft proposal
-// (see Cache.applyLocal), so it is where the per-shard apply workers'
-// concurrency becomes observable.
+// (see Cache.applyLocal), so it is where the per-shard apply concurrency
+// becomes observable.
 type gatingPersistStore struct {
 	entered chan struct{}
 	release chan struct{}
@@ -75,7 +73,7 @@ func (g *gatingPersistStore) waitEntered(t *testing.T, n int, within time.Durati
 
 // newPersistedLeaderCache boots a lone leader whose transport is backed by a
 // sharded in-memory persisted-FIFO hub, so a write takes the real
-// publish -> partition -> per-shard apply worker path in-process.
+// publish -> partition -> per-partition apply path in-process.
 func newPersistedLeaderCache(ctx context.Context, t *testing.T, shards int, opts ...Option) *Cache {
 	t.Helper()
 
@@ -143,8 +141,8 @@ func TestPersistedApplyOverlapsAcrossShards(t *testing.T) {
 
 // TestPersistedApplyStaysSerialWithinAShard is the ordering half of the same
 // change: everything published under one shard key lands in one partition, and
-// a partition has exactly one apply worker, so its items are never applied
-// concurrently no matter how many are queued.
+// a partition is applied by exactly one goroutine, so its items are never
+// applied concurrently no matter how many are queued.
 func TestPersistedApplyStaysSerialWithinAShard(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -177,101 +175,5 @@ func TestPersistedApplyStaysSerialWithinAShard(t *testing.T) {
 
 	if peak := gate.peak.Load(); peak != 1 {
 		t.Fatalf("same-shard writes overlapped in the persist hook: peak in flight %d, want 1", peak)
-	}
-}
-
-// recordingItem is a transports.PersistedItem that records the order in which
-// the apply path settled it.
-type recordingItem struct {
-	shard int
-	name  string
-
-	mu   *sync.Mutex
-	seen *[]string
-}
-
-func (r *recordingItem) Command() *pb.Store          { return &pb.Store{Key: r.name, Data: []byte(r.name)} }
-func (r *recordingItem) Shard() int                  { return r.shard }
-func (r *recordingItem) Retry() bool                 { return false }
-func (r *recordingItem) Deadline() (time.Time, bool) { return time.Time{}, false }
-
-func (r *recordingItem) record(suffix string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	*r.seen = append(*r.seen, r.name+suffix)
-	return nil
-}
-
-func (r *recordingItem) ReplySuccess(context.Context, *pb.StoreResponse) error { return r.record("") }
-func (r *recordingItem) ReplyError(context.Context, error) error               { return r.record("!err") }
-func (r *recordingItem) Nack(context.Context) error                           { return r.record("!nack") }
-func (r *recordingItem) NackWithDelay(context.Context) error                  { return r.record("!nack") }
-
-var _ transports.PersistedItem = (*recordingItem)(nil)
-
-// TestDispatchPersistedItemsOrdersWithinAShard guards the sequencing the
-// transport relies on: a shard's items are applied one at a time and in
-// delivery order, while a different shard's items run on their own worker.
-// Feeding runPersistedApplyLoop directly keeps the assertion deterministic —
-// the interleaving on the wire is the test's own.
-func TestDispatchPersistedItemsOrdersWithinAShard(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	c := newLeaderCache(ctx, t, &stubFSM{})
-
-	var (
-		mu   sync.Mutex
-		seen []string
-	)
-	ch := make(chan transports.PersistedItem)
-	done := make(chan struct{})
-	go func() {
-		c.runPersistedApplyLoop(ctx, ch)
-		close(done)
-	}()
-
-	const perShard = 6
-	for i := 0; i < perShard; i++ {
-		for shard := 0; shard < 2; shard++ {
-			ch <- &recordingItem{
-				shard: shard,
-				name:  fmt.Sprintf("s%d-%d", shard, i),
-				mu:    &mu,
-				seen:  &seen,
-			}
-		}
-	}
-	close(ch)
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatal("apply loop did not finish after the item channel closed")
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	if len(seen) != perShard*2 {
-		t.Fatalf("settled %d items, want %d: %v", len(seen), perShard*2, seen)
-	}
-	for shard := 0; shard < 2; shard++ {
-		prefix := fmt.Sprintf("s%d-", shard)
-		want := make([]string, 0, perShard)
-		for i := 0; i < perShard; i++ {
-			want = append(want, fmt.Sprintf("%s%d", prefix, i))
-		}
-
-		got := make([]string, 0, perShard)
-		for _, name := range seen {
-			if strings.HasPrefix(name, prefix) {
-				got = append(got, name)
-			}
-		}
-		if strings.Join(got, ",") != strings.Join(want, ",") {
-			t.Fatalf("shard %d applied out of order: got %v, want %v", shard, got, want)
-		}
 	}
 }

@@ -100,25 +100,42 @@ type Transport interface {
 	StorePersisted(ctx context.Context, command *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error)
 
 	// StartPersistedConsumer begins draining the persisted-FIFO stream on
-	// this node and returns a channel of PersistedItem, fanning in every
-	// partition. Called by the quasar cache when this node becomes leader.
-	// Each item must be terminated by ReplySuccess, ReplyError, or Nack —
-	// the queue's single-in-flight-item-per-shard invariant blocks that
-	// shard's next delivery until it happens, while other shards keep
-	// delivering.
+	// this node, calling apply for every item it pulls. Called by the quasar
+	// cache when this node becomes leader.
+	//
+	// The transport calls apply on the goroutine that owns the item's
+	// partition, one partition per goroutine, so the shards apply
+	// concurrently while a shard's own items stay strictly ordered. The
+	// caller therefore needs no dispatcher and no shard bookkeeping of its
+	// own — the transport already knows the partitioning (RT-14337).
+	//
+	// The returned channel is closed when the consumer has stopped, whether
+	// through StopPersistedConsumer or because it died on its own; the caller
+	// uses it to restart the consumer when it is still leader.
 	//
 	// Calling StartPersistedConsumer when the transport doesn't support
 	// persisted-FIFO returns ErrPersistedNotSupported.
-	StartPersistedConsumer(ctx context.Context) (<-chan PersistedItem, error)
+	StartPersistedConsumer(ctx context.Context, apply PersistedApplyFunc) (<-chan struct{}, error)
 
 	// StopPersistedConsumer stops the consumer started by
-	// StartPersistedConsumer. The in-flight item (if any) is Nak'd so the
-	// next consumer (typically the new leader after a leadership flip)
+	// StartPersistedConsumer. Every partition's in-flight item is Nak'd so
+	// the next consumer (typically the new leader after a leadership flip)
 	// picks it up without waiting for the AckWait window to expire.
 	StopPersistedConsumer() error
 }
 
-// PersistedItem is a single Store command delivered by
+// PersistedApplyFunc applies one item pulled from the persisted-FIFO stream
+// and MUST settle it before returning, by calling exactly one of
+// ReplySuccess / ReplyError / Nack / NackWithDelay on it.
+//
+// It runs on the goroutine that pulls the item's partition, so returning is
+// what lets that partition deliver its next item — which is also why a slow
+// apply only ever holds up its own shard. The ctx is the consumer's: when it
+// is done the transport is shutting down, and an apply that cannot complete
+// should Nack so the next leader picks the item up.
+type PersistedApplyFunc func(ctx context.Context, item PersistedItem)
+
+// PersistedItem is a single Store command handed to a PersistedApplyFunc by
 // StartPersistedConsumer. The consumer must terminate every item by
 // calling exactly one of ReplySuccess / ReplyError / Nack — the
 // persisted stream's per-shard MaxAckPending = 1 invariant pauses that
@@ -132,20 +149,6 @@ type Transport interface {
 type PersistedItem interface {
 	// Command returns the underlying Store command.
 	Command() *pb.Store
-
-	// Shard reports the FIFO partition this item was delivered from.
-	//
-	// It is an OPAQUE, transport-defined partition id: a consumer may compare
-	// it for equality and key per-partition work by it, but must not derive a
-	// shard key, a subject or any persisted state from it — it is not stable
-	// across transports, nor across a change of the configured shard count.
-	//
-	// The transport guarantees AT MOST ONE UNSETTLED ITEM PER SHARD: the next
-	// item for a shard is delivered only once the previous one has been
-	// settled. That is what makes it safe to apply the items of different
-	// shards concurrently while the items of one shard stay strictly ordered —
-	// see quasar's per-shard apply workers (RT-14337).
-	Shard() int
 
 	// Retry reports whether the publisher marked this command as eligible
 	// for at-least-once redelivery (PersistedStoreOpts.Retry). The consumer
