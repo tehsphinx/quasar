@@ -14,9 +14,9 @@ type PersistentStorage interface {
 	//
 	// It MUST be safe for concurrent use. The leader applies forwarded writes
 	// from its RPC handlers concurrently, and in persisted-FIFO mode it also
-	// applies the queue with one worker per shard, so several Store calls can
-	// be in flight at once. Calls for keys that share a shard key are still
-	// mutually ordered; calls for different shard keys are not.
+	// applies each queue partition on its own goroutine, so several Store
+	// calls can be in flight at once. Calls for keys that share a shard key
+	// are still mutually ordered; calls for different shard keys are not.
 	//
 	// Returning an error from this function will fail the `Store` process. If the
 	// update of the cache fails after the storage was updated, it is up to the client

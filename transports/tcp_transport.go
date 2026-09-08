@@ -530,7 +530,8 @@ func (s *TCPTransport) StorePersisted(_ context.Context, _ *pb.Store, _ Persiste
 
 // StartPersistedConsumer always returns ErrPersistedNotSupported for the
 // TCP transport.
-func (s *TCPTransport) StartPersistedConsumer(_ context.Context) (<-chan PersistedItem, error) {
+func (s *TCPTransport) StartPersistedConsumer(_ context.Context, _ PersistedApplyFunc,
+) (<-chan struct{}, error) {
 	return nil, ErrPersistedNotSupported
 }
 

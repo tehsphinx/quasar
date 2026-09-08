@@ -286,9 +286,10 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts Pe
 }
 
 // startConsumer creates / opens the per-shard pull consumers and begins
-// draining the queue. Returns a single channel of PersistedItem that fans in
-// every shard; close signals consumer shutdown. Only one consumer group is
-// active per node at a time; concurrent callers reuse the active group.
+// draining the queue, calling apply for every item pulled. Returns a channel
+// that is closed once the consumer has stopped. Only one consumer group is
+// active per node at a time; concurrent callers reuse the active group (and
+// keep the apply func the first caller installed).
 //
 // Sharding (RT-12964): each of the q.shards partitions gets its own durable
 // consumer with MaxAckPending = 1, so writes stay strictly in order WITHIN a
@@ -298,16 +299,18 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts Pe
 // single-consumer behaviour (durable name and unfiltered subscription
 // unchanged), so existing deployments are unaffected.
 //
-// Items carry their partition (PersistedItem.Shard) so the consumer can apply
-// the shards concurrently; before RT-14337 the cache re-serialised them behind
-// a single apply loop and the parallelism promised here stopped at this
-// channel.
-func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan PersistedItem, error) {
+// Each shard's puller applies its own items inline (RT-14337). The puller
+// goroutine had nothing to do while an item was outstanding anyway — it waited
+// for the item to be settled before pulling the next one, because
+// MaxAckPending = 1 means the server would not deliver one — so applying
+// there is what makes the shards apply concurrently, with no fan-in channel to
+// re-serialise them and no second goroutine per shard.
+func (q *natsPersistedQueue) startConsumer(ctx context.Context, apply PersistedApplyFunc) (<-chan struct{}, error) {
 	q.consumerM.Lock()
 	defer q.consumerM.Unlock()
 
 	if q.group != nil {
-		return q.group.items, nil
+		return q.group.done, nil
 	}
 
 	stream, err := q.ensureStream(ctx)
@@ -317,9 +320,9 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan Persiste
 
 	pullCtx, cancel := context.WithCancel(context.Background())
 
-	items := make(chan PersistedItem)
+	done := make(chan struct{})
 	g := &natsPersistedConsumerGroup{
-		items:  items,
+		done:   done,
 		cancel: cancel,
 	}
 
@@ -329,7 +332,7 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan Persiste
 	for i := 0; i < q.shards; i++ {
 		c := &natsPersistedConsumer{
 			queue: q,
-			items: items,
+			apply: apply,
 			shard: i,
 			group: g,
 		}
@@ -343,20 +346,20 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context) (<-chan Persiste
 
 	g.launch(pullCtx)
 
-	// Close the shared items channel once every puller has exited. A shard
-	// that dies spontaneously now rebuilds itself in place and keeps running
-	// (see run), so this only fires on a real stop (leadership loss / ctx
-	// cancel). Closing the channel is what makes the cache's apply loop
-	// observe the stop; the clearGroup belt-and-suspenders restart path
-	// remains for the degenerate case of every puller exiting (RT-13042 M4).
+	// Signal the stop once every puller has exited. A shard that dies
+	// spontaneously rebuilds itself in place and keeps running (see run), so
+	// this only fires on a real stop (leadership loss / ctx cancel). Closing
+	// done is what makes the cache notice the stop; the clearGroup
+	// belt-and-suspenders restart path remains for the degenerate case of
+	// every puller exiting (RT-13042 M4).
 	go func() {
 		g.wg.Wait()
-		close(items)
+		close(done)
 		q.clearGroup(g)
 	}()
 
 	q.group = g
-	return items, nil
+	return done, nil
 }
 
 // stopConsumer cancels the active consumer group and Naks each shard's
@@ -374,7 +377,7 @@ func (q *natsPersistedQueue) stopConsumer() error {
 }
 
 // settleWait is how long a stopping consumer waits for the in-flight item
-// to be settled by the apply loop before falling back to a Nack.
+// to be settled by the apply before falling back to a Nack.
 func (q *natsPersistedQueue) settleWait() time.Duration {
 	if q.ackWait > 0 {
 		return q.ackWait
@@ -388,7 +391,7 @@ func (q *natsPersistedQueue) settleWait() time.Duration {
 // exiting, so on the regular stop path stopConsumer has already cleared the
 // reference and this is a no-op. It remains as a safety net for the degenerate
 // case of every puller exiting without a stopConsumer: the queue must not keep
-// handing the dead group's closed items channel out of startConsumer, or the
+// handing the dead group's closed done channel out of startConsumer, or the
 // death would persist until a leadership flip AND an explicit
 // StopPersistedConsumer (RT-13042 M4).
 func (q *natsPersistedQueue) clearGroup(g *natsPersistedConsumerGroup) {

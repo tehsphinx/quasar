@@ -28,37 +28,48 @@ type InmemQueueHub struct {
 
 	// shards are the FIFO partitions. A single-shard hub (NewInmemQueueHub) is
 	// the original un-partitioned behaviour; NewShardedInmemQueueHub gives a
-	// test the same routing the NATS transport does, so the cache's per-shard
-	// apply workers can be exercised in-process (RT-14337).
+	// test the same routing the NATS transport does, so the per-shard apply
+	// concurrency can be exercised in-process (RT-14337).
 	shards []*inmemQueueShard
 
 	// activeConsumer holds the transport that currently owns the
-	// consumer. nil when no leader is draining. When set, deliver()
-	// fans each shard's next queued item out via inflightCh; when cleared
-	// (stopConsumer), every in-flight item is requeued at its shard's head
-	// so the next claimant gets it immediately.
+	// consumer. nil when no leader is draining. When set, deliverLocked
+	// hands each shard's next queued item to that shard's apply goroutine;
+	// when cleared (stopConsumer), every in-flight item is requeued at its
+	// shard's head so the next claimant gets it immediately.
 	activeConsumer *InmemTransport
-	inflightCh     chan PersistedItem
 
-	// releaseCh is closed by releaseLocked whenever the current claim
-	// ends, signalling the per-claim watchdog goroutine to exit. Without
-	// it a watchdog that started for a claim ended via stopConsumer would
-	// stay blocked on its ctx until that ctx happened to be cancelled,
-	// leaking one goroutine per leadership flip (RT-13042 m21).
+	// releaseCh is closed by releaseLocked whenever the current claim ends. It
+	// is both the per-claim watchdog's exit signal — without it a watchdog for
+	// a claim ended via stopConsumer would stay blocked on its ctx until that
+	// ctx happened to be cancelled, leaking one goroutine per leadership flip
+	// (RT-13042 m21) — and the "consumer stopped" channel startConsumer hands
+	// back to the cache.
 	releaseCh chan struct{}
 }
 
-// inmemQueueShard is one FIFO partition: its own pending queue and its own
-// single in-flight slot. The slot is the in-memory equivalent of the NATS
-// transport's per-shard durable with MaxAckPending = 1 — one unsettled item
-// per partition, independent of every other partition.
+// inmemQueueShard is one FIFO partition: its own pending queue, its own single
+// in-flight slot and, while a consumer is claimed, its own apply goroutine.
+// The slot is the in-memory equivalent of the NATS transport's per-shard
+// durable with MaxAckPending = 1 — one unsettled item per partition,
+// independent of every other partition.
+//
+// The NATS transport gets its per-shard goroutine for free: it already pulls
+// each partition from its own goroutine. The hub is a push source with no
+// pullers of its own, so a claim starts one goroutine per shard here instead
+// (RT-14337).
 type inmemQueueShard struct {
 	// queue is this partition's pending buffer. publish() pushes onto it; the
-	// active consumer takes the head via inflightCh in arrival order.
+	// shard's apply goroutine takes the head via items in arrival order.
 	queue []*inmemPersistedItem
 	// inflight is the item handed to the consumer and not yet settled. While
 	// it is set this partition delivers nothing further.
 	inflight *inmemPersistedItem
+	// items hands this partition's deliveries to its apply goroutine. One
+	// slot: the partition keeps at most one item in flight, so the goroutine
+	// has always taken the previous one before the next is delivered. Created
+	// per claim in startConsumer, closed and nil'd in releaseLocked.
+	items chan PersistedItem
 }
 
 // NewInmemQueueHub constructs an empty single-partition hub. Attach it to
@@ -73,7 +84,7 @@ func NewInmemQueueHub() *InmemQueueHub {
 // routing by PersistedStoreOpts.ShardKey with the same hash and modulo the
 // NATS transport uses (see persistedShardOf). Each partition keeps one item in
 // flight independently, so a test can exercise the real
-// publish -> partition -> per-shard apply worker path in-process instead of
+// publish -> partition -> per-partition apply path in-process instead of
 // needing a JetStream server.
 //
 // n < 1 is treated as 1, which is exactly NewInmemQueueHub.
@@ -172,43 +183,70 @@ func (h *InmemQueueHub) cancelPublish(item *inmemPersistedItem) {
 	}
 }
 
-// startConsumer claims the consumer slot for the given transport. Only
-// one claim is allowed at a time; a second concurrent claim returns an
-// error and the existing consumer keeps running.
-func (h *InmemQueueHub) startConsumer(ctx context.Context, t *InmemTransport) (<-chan PersistedItem, error) {
+// startConsumer claims the consumer slot for the given transport and starts
+// one apply goroutine per partition. Only one claim is allowed at a time; a
+// second concurrent claim returns an error and the existing consumer keeps
+// running. The returned channel is closed when the claim ends.
+func (h *InmemQueueHub) startConsumer(ctx context.Context, t *InmemTransport,
+	apply PersistedApplyFunc,
+) (<-chan struct{}, error) {
 	h.m.Lock()
 	defer h.m.Unlock()
 
 	if h.activeConsumer != nil && h.activeConsumer != t {
 		return nil, errors.New("inmem persisted queue: another consumer is already active")
 	}
-	if h.activeConsumer == t && h.inflightCh != nil {
-		return h.inflightCh, nil
+	if h.activeConsumer == t && h.releaseCh != nil {
+		return h.releaseCh, nil
 	}
 
 	h.ensureShardsLocked()
 	h.activeConsumer = t
-	// One slot per partition: every shard can have an item in flight at the
-	// same time, and deliverLocked must never have to put one back.
-	h.inflightCh = make(chan PersistedItem, len(h.shards))
 	h.releaseCh = make(chan struct{})
 
-	go func(ch chan PersistedItem, released <-chan struct{}) {
+	for _, sh := range h.shards {
+		sh.items = make(chan PersistedItem, 1)
+		go h.runShard(ctx, sh.items, apply, h.releaseCh)
+	}
+
+	go func(released <-chan struct{}) {
 		select {
 		case <-ctx.Done():
 			// Best-effort: if the consumer's ctx is cancelled before
 			// stopConsumer fires, drop the claim so the next leader can
 			// take over without waiting.
-			h.releaseConsumerIfOwner(t, ch)
+			h.releaseConsumerIfOwner(t, released)
 		case <-released:
 			// The claim ended through stopConsumer (or a ctx-cancel for a
 			// different claim that re-claimed in between); nothing to do
 			// but exit so this goroutine does not outlive its claim.
 		}
-	}(h.inflightCh, h.releaseCh)
+	}(h.releaseCh)
 
 	h.deliverLocked()
-	return h.inflightCh, nil
+	return h.releaseCh, nil
+}
+
+// runShard is one partition's apply goroutine: it applies the partition's
+// deliveries one at a time, in arrival order, which is the in-memory
+// counterpart of a NATS shard puller applying inline. Exits when the claim
+// ends or the consumer's ctx is done.
+func (h *InmemQueueHub) runShard(ctx context.Context, items <-chan PersistedItem,
+	apply PersistedApplyFunc, released <-chan struct{},
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-released:
+			return
+		case item, ok := <-items:
+			if !ok {
+				return
+			}
+			apply(ctx, item)
+		}
+	}
 }
 
 // stopConsumer releases the consumer slot. The in-flight item (if any)
@@ -222,10 +260,10 @@ func (h *InmemQueueHub) stopConsumer(t *InmemTransport) error {
 // releaseConsumerIfOwner is the goroutine-safe counterpart for the
 // ctx-cancellation path. The check ensures we don't tear down a
 // consumer that has already been replaced.
-func (h *InmemQueueHub) releaseConsumerIfOwner(t *InmemTransport, ch chan PersistedItem) {
+func (h *InmemQueueHub) releaseConsumerIfOwner(t *InmemTransport, released <-chan struct{}) {
 	h.m.Lock()
 	defer h.m.Unlock()
-	if h.activeConsumer != t || h.inflightCh != ch {
+	if h.activeConsumer != t || h.releaseCh != released {
 		return
 	}
 	_ = h.releaseLocked(t)
@@ -236,16 +274,26 @@ func (h *InmemQueueHub) releaseLocked(t *InmemTransport) error {
 		return nil
 	}
 	// Put every in-flight item back at the head of its own partition so the
-	// next claimant sees it first. Equivalent to a JS NAK per shard.
+	// next claimant sees it first, and end that partition's apply goroutine.
+	// Equivalent to a JS NAK per shard.
 	for _, sh := range h.shards {
 		if sh.inflight != nil {
 			sh.queue = append([]*inmemPersistedItem{sh.inflight}, sh.queue...)
 			sh.inflight = nil
 		}
-	}
-	if h.inflightCh != nil {
-		close(h.inflightCh)
-		h.inflightCh = nil
+		if sh.items != nil {
+			// Drop a delivery the shard's goroutine had not taken yet: it is
+			// the item just requeued above, so it is already back on the
+			// partition for the next claimant. deliverLocked is the only
+			// sender and also runs under h.m, so nothing can arrive between
+			// the drain and the close.
+			select {
+			case <-sh.items:
+			default:
+			}
+			close(sh.items)
+			sh.items = nil
+		}
 	}
 	if h.releaseCh != nil {
 		// Wake the per-claim watchdog so it exits with the claim instead
@@ -258,9 +306,10 @@ func (h *InmemQueueHub) releaseLocked(t *InmemTransport) error {
 }
 
 // deliverLocked moves each partition's queue head into that partition's
-// inflight slot, for every partition that has a consumer, something queued and
-// nothing in flight. Partitions are independent: one shard holding an
-// unsettled item never delays another shard's delivery. Called with h.m held.
+// inflight slot and hands it to that partition's apply goroutine, for every
+// partition that has a consumer, something queued and nothing in flight.
+// Partitions are independent: one shard holding an unsettled item never delays
+// another shard's delivery. Called with h.m held.
 func (h *InmemQueueHub) deliverLocked() {
 	if h.activeConsumer == nil {
 		return
@@ -272,18 +321,19 @@ func (h *InmemQueueHub) deliverLocked() {
 		item := sh.queue[0]
 		sh.queue = sh.queue[1:]
 		sh.inflight = item
-		// Non-blocking send: inflightCh has one slot per partition and each
-		// partition holds at most one item in flight, so this always succeeds.
+		// Non-blocking send: the partition's channel has a single slot and the
+		// partition holds at most one item in flight, so its goroutine has
+		// taken the previous delivery and this always succeeds.
 		//
 		// The default branch cannot be reached by a concurrent close: a
 		// select's default does NOT make a send on a closed channel safe —
-		// that would panic. It is safe only because inflightCh is closed and
-		// nil'd together under h.m (releaseLocked), and deliverLocked also
-		// runs under h.m; so whenever we get here inflightCh is non-nil and
-		// open. The default is kept as a defensive no-op for the
-		// otherwise-impossible full-buffer miss.
+		// that would panic. It is safe only because sh.items is closed and
+		// nil'd under h.m (releaseLocked), and deliverLocked also runs under
+		// h.m; so whenever we get here sh.items is non-nil and open. The
+		// default is kept as a defensive no-op for the otherwise-impossible
+		// full-buffer miss.
 		select {
-		case h.inflightCh <- item:
+		case sh.items <- item:
 		default:
 			// Item could not be handed off; put it back at the head of its
 			// partition for the next delivery pass.
@@ -349,10 +399,6 @@ type inmemPersistedItem struct {
 
 func (i *inmemPersistedItem) Command() *pb.Store {
 	return i.command
-}
-
-func (i *inmemPersistedItem) Shard() int {
-	return i.shard
 }
 
 func (i *inmemPersistedItem) Retry() bool {

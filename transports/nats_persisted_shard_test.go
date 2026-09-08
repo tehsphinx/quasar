@@ -28,13 +28,13 @@ func TestShardRouting_Deterministic(t *testing.T) {
 
 	for _, key := range []string{"", "device:123", "chat:9", "member:42", "device:123"} {
 		s := q.shardOf(key)
-		asrt.True(s >= 0 && s < shards)            // in range
-		asrt.Equal(s, q.shardOf(key))              // deterministic
-		asrt.Equal(q.shardSubject(key),            // publish subject matches shard
+		asrt.True(s >= 0 && s < shards) // in range
+		asrt.Equal(s, q.shardOf(key))   // deterministic
+		asrt.Equal(q.shardSubject(key), // publish subject matches shard
 			fmt.Sprintf("quasar.x.queue.s%d.msg", s))
 	}
 
-	asrt.Equal(q.shardOf(""), 0)                       // empty key → shard 0
+	asrt.Equal(q.shardOf(""), 0) // empty key → shard 0
 	asrt.Equal(q.shardFilter(7), "quasar.x.queue.s7.>")
 	asrt.Equal(q.shardDurable(3), "quasar-cache-consumer-s3")
 }
@@ -80,25 +80,22 @@ func TestNATSPersistedQueue_ShardsDrainIndependently(t *testing.T) {
 		}
 	}
 
-	ch, err := tr.StartPersistedConsumer(ctx)
+	// The apply deliberately never settles the "stuck" shard's item, but
+	// settles everything else — so the free shard can only succeed if its own
+	// puller applies independently of the stuck one, which is now parked on an
+	// unsettled item of its own.
+	freeDone := make(chan struct{})
+	_, err := tr.StartPersistedConsumer(ctx, func(ctx context.Context, item PersistedItem) {
+		if string(item.Command().Key) == keyStuck {
+			return // hold it in flight, never settle
+		}
+		_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 1})
+		if string(item.Command().Key) == keyFree {
+			close(freeDone)
+		}
+	})
 	asrt.NoErr(err)
 	t.Cleanup(func() { _ = tr.StopPersistedConsumer() })
-
-	// The apply loop keeps reading the merged channel. It deliberately never
-	// settles the "stuck" shard's item, but settles everything else — so the
-	// free shard can only succeed if it is not blocked behind the stuck one.
-	freeDone := make(chan struct{})
-	go func() {
-		for item := range ch {
-			if string(item.Command().Key) == keyStuck {
-				continue // hold it in flight, never settle
-			}
-			_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 1})
-			if string(item.Command().Key) == keyFree {
-				close(freeDone)
-			}
-		}
-	}()
 
 	// Publish the stuck write (don't wait for its reply — it never comes).
 	go func() {
@@ -147,15 +144,11 @@ func TestNATSPersistedQueue_ShardCrashDoesNotStopOthers(t *testing.T) {
 		}
 	}
 
-	ch, err := tr.StartPersistedConsumer(ctx)
+	_, err := tr.StartPersistedConsumer(ctx, func(ctx context.Context, item PersistedItem) {
+		_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 1})
+	})
 	asrt.NoErr(err)
 	t.Cleanup(func() { _ = tr.StopPersistedConsumer() })
-
-	go func() {
-		for item := range ch {
-			_ = item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 1})
-		}
-	}()
 
 	// Crash one shard's consumer the way an operator or stream rebuild would.
 	js, err := jetstream.New(tr.conn)

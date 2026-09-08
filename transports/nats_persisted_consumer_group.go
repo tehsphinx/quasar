@@ -5,11 +5,11 @@ import (
 	"sync"
 )
 
-// natsPersistedConsumerGroup owns the shared fan-in items channel and the
-// per-shard pullers. A single context.CancelFunc stops every puller; the
-// WaitGroup gates closing the shared channel until all have exited.
+// natsPersistedConsumerGroup owns the per-shard pullers and the channel that
+// reports the group has stopped. A single context.CancelFunc stops every
+// puller; the WaitGroup gates closing done until all have exited.
 type natsPersistedConsumerGroup struct {
-	items     chan PersistedItem
+	done      chan struct{}
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	consumers []*natsPersistedConsumer
@@ -33,8 +33,8 @@ func (g *natsPersistedConsumerGroup) stopContexts() {
 }
 
 // stop cancels every puller and Naks each shard's in-flight item for prompt
-// handover to the next leader. The shared items channel is closed by the
-// closer goroutine once all pullers have drained.
+// handover to the next leader. The done channel is closed by the closer
+// goroutine once all pullers have exited.
 //
 // cancel runs before stopMctx so a puller racing a reconnect observes the
 // cancellation and stops the messages context it just opened itself (see
@@ -44,9 +44,9 @@ func (g *natsPersistedConsumerGroup) stopContexts() {
 // AckWait for its item to be settled by the apply side, so draining them in
 // sequence would cost shards x AckWait in the worst case. In practice the
 // cancellation above makes every puller settle-or-Nack its own item in
-// parallel already, but with one apply worker per shard (RT-14337) all shards
-// can genuinely be mid-apply at once, which is exactly when the sequential
-// version would have been slowest.
+// parallel already, but now that each puller applies its own items (RT-14337)
+// all shards can genuinely be mid-apply at once, which is exactly when the
+// sequential version would have been slowest.
 func (g *natsPersistedConsumerGroup) stop() {
 	g.cancel()
 

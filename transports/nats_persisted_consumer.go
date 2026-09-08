@@ -12,10 +12,10 @@ import (
 )
 
 // natsPersistedConsumer wraps one shard's JS Messages pull context and the
-// shared outgoing PersistedItem channel.
+// apply func its puller runs each pulled item through.
 type natsPersistedConsumer struct {
 	queue *natsPersistedQueue
-	items chan PersistedItem
+	apply PersistedApplyFunc
 	shard int
 	group *natsPersistedConsumerGroup
 
@@ -114,9 +114,8 @@ func (c *natsPersistedConsumer) stopMctx() {
 // run is one shard's supervisor loop. It pulls until the subscription ends,
 // then decides whether the group is stopping (exit) or this shard died on its
 // own (rebuild just this shard and resume). A spontaneous death no longer
-// tears the whole group down — the sibling shards keep draining and the shared
-// items channel stays open; only this goroutine's shard pauses while it
-// reconnects (RT-12964).
+// tears the whole group down — the sibling shards keep draining and applying;
+// only this goroutine's shard pauses while it reconnects (RT-12964).
 func (c *natsPersistedConsumer) run(ctx context.Context) {
 	defer c.group.wg.Done()
 
@@ -146,11 +145,11 @@ func (c *natsPersistedConsumer) run(ctx context.Context) {
 	}
 }
 
-// pull is one shard's inner puller loop: pull one message, hand it to the
-// shared consumer channel, repeat. With MaxAckPending = 1 JetStream enforces
-// the strict-FIFO single-in-flight invariant per shard; we just keep up the
-// conventional ack/nak protocol. It returns when Next errors (subscription
-// stopped or died) or when consume observes ctx cancellation.
+// pull is one shard's inner puller loop: pull one message, apply it, repeat.
+// With MaxAckPending = 1 JetStream enforces the strict-FIFO single-in-flight
+// invariant per shard; we just keep up the conventional ack/nak protocol. It
+// returns when Next errors (subscription stopped or died) or when consume
+// observes ctx cancellation.
 func (c *natsPersistedConsumer) pull(ctx context.Context) {
 	for {
 		msg, err := c.nextMsg()
@@ -227,13 +226,21 @@ func (c *natsPersistedConsumer) drainInflight() {
 	}
 }
 
-// consume is the puller loop's message handler. It returns true if the
-// consumer should continue, false if it should exit.
+// consume is the puller loop's message handler: it decodes the message and
+// applies it inline, on this shard's own puller goroutine. It returns true if
+// the consumer should continue, false if it should exit.
+//
+// Applying here rather than handing the item to an apply loop is what gives
+// the shards their concurrency (RT-14337): every shard has a puller goroutine
+// of its own, and it had nothing else to do while the item was outstanding —
+// with MaxAckPending = 1 the next Next() cannot return until the item is
+// settled. The apply settles the item before returning, which is exactly the
+// condition for pulling the next one, so ordering within the shard is the
+// loop's own sequencing rather than a property something else has to preserve.
 func (c *natsPersistedConsumer) consume(ctx context.Context, msg jetstream.Msg) bool {
 	item := &natsPersistedItem{
 		queue:   c.queue,
 		msg:     msg,
-		shard:   c.shard,
 		settled: make(chan struct{}),
 	}
 	c.setInflight(item)
@@ -267,36 +274,24 @@ func (c *natsPersistedConsumer) consume(ctx context.Context, msg jetstream.Msg) 
 	}
 	item.command = &protoMsg
 
-	select {
-	case c.items <- item:
-	case <-ctx.Done():
-		// Consumer is going away. Nak the in-flight item so the
-		// next claimant gets it without waiting for AckWait.
+	if ctx.Err() != nil {
+		// Consumer is going away. Nak the item rather than starting an apply
+		// the group is about to tear down, so the next claimant gets it
+		// without waiting for AckWait.
 		_ = item.Nack(context.Background())
 		return false
 	}
-	// Wait for the consumer to settle the item before fetching
-	// the next one. With MaxAckPending = 1 the next Next() call
-	// would block on the server side anyway, but waiting locally
-	// also gives us a deterministic place to observe ctx
-	// cancellation against an unsettled inflight item.
-	select {
-	case <-item.settled:
-	case <-ctx.Done():
-		// The item is with the apply loop and may already be committed to
-		// raft. An immediate Nack here could void that successful apply:
-		// ReplySuccess loses the settle race, the publisher's reply never
-		// goes out, and the next leader applies the same command a second
-		// time. Prefer letting the in-flight apply settle, bounded by
-		// AckWait — past that JetStream redelivers anyway (RT-13042 M5).
-		select {
-		case <-item.settled:
-		case <-time.After(c.queue.settleWait()):
-			_ = item.Nack(context.Background())
-		}
-		return false
-	}
-	return true
+
+	// The apply settles the item before it returns. A cancellation that
+	// arrives mid-apply is NOT Nak'd here: the command may already be
+	// committed to raft, and an immediate Nack would void that successful
+	// apply — ReplySuccess loses the settle race, the publisher's reply never
+	// goes out, and the next leader applies the same command a second time.
+	// stop() instead gives the in-flight apply an AckWait-bounded chance to
+	// settle before Naking it, which is what drainInflight does (RT-13042 M5).
+	c.apply(ctx, item)
+
+	return ctx.Err() == nil
 }
 
 func (c *natsPersistedConsumer) setInflight(item *natsPersistedItem) {

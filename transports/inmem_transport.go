@@ -198,14 +198,16 @@ func (i *InmemTransport) StorePersisted(ctx context.Context, command *pb.Store, 
 	return hub.publish(ctx, command, opts)
 }
 
-// StartPersistedConsumer claims the persisted-FIFO consumer for this
-// node and returns the channel of items the leader should drain.
-func (i *InmemTransport) StartPersistedConsumer(ctx context.Context) (<-chan PersistedItem, error) {
+// StartPersistedConsumer claims the persisted-FIFO consumer for this node,
+// applying each partition's items through apply on that partition's own
+// goroutine. The returned channel is closed when the claim ends.
+func (i *InmemTransport) StartPersistedConsumer(ctx context.Context, apply PersistedApplyFunc,
+) (<-chan struct{}, error) {
 	hub := i.queueHub()
 	if hub == nil {
 		return nil, ErrPersistedNotSupported
 	}
-	return hub.startConsumer(ctx, i)
+	return hub.startConsumer(ctx, i, apply)
 }
 
 // StopPersistedConsumer releases this node's claim on the persisted-FIFO
