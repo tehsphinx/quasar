@@ -67,6 +67,15 @@ func WithRetry() StoreOption {
 // different keys so they drain in parallel and never head-of-line block each
 // other (RT-12964). An empty key (the default) routes to shard 0.
 //
+// EVERY write to the same data MUST use the same shard key — derive it from
+// the data's identity (e.g. "<type>:<primary-key>"), never from the call
+// site. The partition is the unit of ordering and the leader applies one
+// partition per goroutine, so two writes to the same entity published under
+// different shard keys run their persist hooks
+// (stores.PersistentStorage.Store) concurrently and can reach raft in the
+// opposite order, leaving the persistent store and the FSM disagreeing about
+// that entity.
+//
 // Only meaningful when the transport is configured with more than one shard
 // (see WithPersistedShards); ignored otherwise.
 func WithShardKey(key string) StoreOption {
