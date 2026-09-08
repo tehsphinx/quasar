@@ -296,8 +296,9 @@ restart). Two opt-in mechanisms add durability:
 - **Persisted-FIFO queue (NATS only).** `transports.WithNATSPersistedQueue`
   backs writes with a JetStream WorkQueue stream: a write is published to the
   stream and the next leader applies it in strict FIFO order per shard key
-  (see `WithPersistedShards`), so **a missing leader no longer blocks writes** — the publish lands durably and is applied
-  when leadership returns.
+  (see `WithPersistedShards`), so **a missing leader no longer blocks
+  writes** — the publish lands durably and is applied when leadership
+  returns.
 
   ```go
   tr, err := transports.NewNATSTransport(ctx, nc, "my-cache", "node-a",
