@@ -259,9 +259,12 @@ func (s *Cache) applyPersistedItem(ctx context.Context, item transports.Persiste
 		// instead of being terminated — otherwise a load shed would turn into
 		// a dropped write (RT-13906).
 		//
-		// Reachable since RT-14337: each queue partition is applied on its own
-		// goroutine, so this path can hold as many applies in flight as there
-		// are partitions and a bound at or below the shard count sheds here.
+		// Reachable since RT-14337, but only for a bound at or below the shard
+		// count: each queue partition is applied on its own goroutine, so
+		// concurrent applies on this path top out at the shard count, and the
+		// sizing WithMaxInflightApplies asks for leaves the shed unreachable
+		// here. The branch stays so an undersized bound sheds rather than
+		// falling through to the terminate path below.
 		if errors.Is(err, ErrOverloaded) {
 			if item.Retry() {
 				_ = item.NackWithDelay(ctx)

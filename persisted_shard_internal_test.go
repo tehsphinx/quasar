@@ -5,6 +5,7 @@ package quasar
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -74,7 +75,7 @@ func (g *gatingPersistStore) waitEntered(t *testing.T, n int, within time.Durati
 // newPersistedLeaderCache boots a lone leader whose transport is backed by a
 // sharded in-memory persisted-FIFO hub, so a write takes the real
 // publish -> partition -> per-partition apply path in-process.
-func newPersistedLeaderCache(ctx context.Context, t *testing.T, shards int, opts ...Option) *Cache {
+func newPersistedLeaderCache(ctx context.Context, t *testing.T, shards int, fsm FSM, opts ...Option) *Cache {
 	t.Helper()
 
 	_, tr := transports.NewInmemTransport("")
@@ -83,7 +84,7 @@ func newPersistedLeaderCache(ctx context.Context, t *testing.T, shards int, opts
 		t.Fatal("inmem transport is not in persisted-FIFO mode")
 	}
 
-	c, err := NewCache(ctx, &stubFSM{}, append([]Option{
+	c, err := NewCache(ctx, fsm, append([]Option{
 		WithLocalID("solo"),
 		WithTransport(tr),
 		WithBootstrap(true),
@@ -118,7 +119,7 @@ func TestPersistedApplyOverlapsAcrossShards(t *testing.T) {
 	)
 
 	gate := newGatingPersistStore(writes)
-	c := newPersistedLeaderCache(ctx, t, shards, WithPersistentStore(gate))
+	c := newPersistedLeaderCache(ctx, t, shards, &stubFSM{}, WithPersistentStore(gate))
 
 	var wg sync.WaitGroup
 	for i := 0; i < writes; i++ {
@@ -154,7 +155,7 @@ func TestPersistedApplyStaysSerialWithinAShard(t *testing.T) {
 	)
 
 	gate := newGatingPersistStore(writes)
-	c := newPersistedLeaderCache(ctx, t, shards, WithPersistentStore(gate))
+	c := newPersistedLeaderCache(ctx, t, shards, &stubFSM{}, WithPersistentStore(gate))
 
 	var wg sync.WaitGroup
 	for i := 0; i < writes; i++ {
@@ -176,5 +177,148 @@ func TestPersistedApplyStaysSerialWithinAShard(t *testing.T) {
 
 	if peak := gate.peak.Load(); peak != 1 {
 		t.Fatalf("same-shard writes overlapped in the persist hook: peak in flight %d, want 1", peak)
+	}
+}
+
+// orderRecorder is one totally-ordered log of when a payload entered the
+// leader's persist hook and when the FSM applied it. Both sides observe the
+// same bytes: Cache.persist hands stores.PersistentStorage the pb.Store
+// payload and fsmWrapper.store hands FSM.ApplyCmd the same field, so the two
+// events can be matched without the test threading an id of its own.
+type orderRecorder struct {
+	m      sync.Mutex
+	events []string
+
+	inflight atomic.Int64
+	peak     atomic.Int64
+}
+
+func (r *orderRecorder) record(phase, payload string) {
+	r.m.Lock()
+	r.events = append(r.events, phase+" "+payload)
+	r.m.Unlock()
+}
+
+func (r *orderRecorder) snapshot() []string {
+	r.m.Lock()
+	defer r.m.Unlock()
+	return append([]string(nil), r.events...)
+}
+
+// recordingPersistStore is a concurrency-safe stores.PersistentStorage that
+// logs its calls and tracks how many were inside Store at once. The short park
+// is what makes partitions actually overlap in the hook rather than merely
+// being able to.
+type recordingPersistStore struct {
+	rec *orderRecorder
+}
+
+func (s *recordingPersistStore) Store(data stores.StoreData) error {
+	n := s.rec.inflight.Add(1)
+	for {
+		peak := s.rec.peak.Load()
+		if n <= peak || s.rec.peak.CompareAndSwap(peak, n) {
+			break
+		}
+	}
+
+	s.rec.record("persist", string(data.Data()))
+	time.Sleep(time.Millisecond)
+
+	s.rec.inflight.Add(-1)
+	return nil
+}
+
+// recordingFSM logs every applied command into the same log as the persist
+// hook. Everything else is stubFSM's behaviour.
+type recordingFSM struct {
+	stubFSM
+
+	rec *orderRecorder
+}
+
+func (s *recordingFSM) ApplyCmd(cmd []byte) error {
+	s.rec.record("apply", string(cmd))
+	return nil
+}
+
+// TestPersistedPersistAndRaftStayInterleavedPerShardKey is the contract half of
+// stores.PersistentStorage.Store: it MUST be safe for concurrent use, and calls
+// that share a shard key are still mutually ordered.
+//
+// Concurrency is proved by the peak assertion plus -race: several partitions
+// are genuinely inside Store at once, on different goroutines, hitting the
+// leader's persist path together.
+//
+// Ordering is proved per shard key by the event log. Every write is issued
+// from its own goroutine, so within one shard key the writers race each other
+// all the way to the queue; the order they end up in is not defined, but the
+// pairing is. One partition is applied by one goroutine, so its log must read
+// persist X, apply X, persist Y, apply Y — a write's persist hook and its raft
+// apply are never separated by another write's. That strict pairing is the
+// only thing keeping the persistent store and the FSM from disagreeing about
+// an entity, and it is exactly what a shard key that varies per call site
+// throws away: publish the same writes under WithShardKey(payload) instead and
+// they spread over partitions, overlap, and this fails.
+func TestPersistedPersistAndRaftStayInterleavedPerShardKey(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const (
+		shards = 4
+		// More keys than partitions, so several share one and several do not.
+		keys = 8
+		// Concurrent writers per key: enough that a partition applied by more
+		// than one goroutine would interleave rather than pair.
+		perKey = 6
+	)
+
+	rec := &orderRecorder{}
+	c := newPersistedLeaderCache(ctx, t, shards, &recordingFSM{rec: rec},
+		WithPersistentStore(&recordingPersistStore{rec: rec}))
+
+	var wg sync.WaitGroup
+	for k := 0; k < keys; k++ {
+		for i := 0; i < perKey; i++ {
+			wg.Add(1)
+			go func(k, i int) {
+				defer wg.Done()
+				key := fmt.Sprintf("key-%d", k)
+				payload := fmt.Sprintf("%s#%d", key, i)
+				if _, err := c.store(ctx, key, []byte(payload), WithShardKey(key)); err != nil {
+					t.Errorf("store %s: %v", payload, err)
+				}
+			}(k, i)
+		}
+	}
+	wg.Wait()
+
+	if peak := rec.peak.Load(); peak < 2 {
+		t.Fatalf("persist hooks never overlapped: peak in flight %d — the ordering assertions below would be vacuous", peak)
+	}
+
+	events := rec.snapshot()
+	for k := 0; k < keys; k++ {
+		key := fmt.Sprintf("key-%d", k)
+
+		var got []string
+		for _, e := range events {
+			if strings.Contains(e, " "+key+"#") {
+				got = append(got, e)
+			}
+		}
+
+		if len(got) != 2*perKey {
+			t.Errorf("%s: recorded %d events, want %d: %v", key, len(got), 2*perKey, got)
+			continue
+		}
+		for i := 0; i < len(got); i += 2 {
+			persisted, ok := strings.CutPrefix(got[i], "persist ")
+			if !ok || got[i+1] != "apply "+persisted {
+				t.Errorf("%s: two writes to one shard key overlapped — %q is not followed by its own apply\nfull: %v",
+					key, got[i], got)
+				break
+			}
+		}
 	}
 }

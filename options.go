@@ -298,10 +298,13 @@ func WithNoLeaderTimeout(timeout time.Duration) Option {
 // below it nothing changes.
 //
 // The bound governs leader-local applies: the leader's own writes plus the
-// writes transports forward to it. In persisted-FIFO mode each queue partition
-// is applied on its own goroutine, so that path holds up to one apply in
-// flight per partition — size the bound above the configured shard count or
-// queued writes shed against each other.
+// writes transports forward to it. In persisted-FIFO mode every write routes
+// through the queue and each partition is applied on its own goroutine, so
+// concurrent Store applies there top out at the configured shard count. Size
+// the bound above that count or queued writes shed against each other — which
+// also means that on a persisted-FIFO transport a correctly sized bound is
+// unreachable by construction, and the shed remains what it was designed as:
+// a guard for the transports that forward writes to the leader directly.
 func WithMaxInflightApplies(n int) Option {
 	return func(o *options) {
 		o.maxInflightApplies = n
