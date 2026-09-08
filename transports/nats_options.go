@@ -127,7 +127,11 @@ func WithPersistedReplicas(n int) PersistedQueueOption {
 // independent shards drain in parallel — a stalled or repeatedly-redelivered
 // write only blocks its own shard instead of every subsequent write
 // cluster-wide (RT-12964). Publishers select a shard via a per-write routing
-// key (see WithShardKey); writes with no key go to shard 0.
+// key (see WithShardKey); writes with no key go to shard 0. Every write to
+// the same data must carry the same routing key — with more than one shard
+// the leader applies the partitions concurrently, so a key that varies by
+// call site rather than by data identity lets two writes to one entity race
+// each other.
 //
 // Defaults to 1 (a single global FIFO — the original behaviour). Values < 1
 // are treated as 1.
