@@ -428,11 +428,21 @@ func (i *inmemPersistedItem) NackWithDelay(_ context.Context) error {
 	return i.terminate(inmemPersistedReply{}, true)
 }
 
+// terminate settles the item exactly once, reporting a second attempt as
+// ErrAlreadySettled like the NATS item does, so the cache's "nacked despite
+// successful apply" branch (persisted.go) is reachable without a JetStream
+// server.
+//
+// One gap remains on purpose: releaseLocked requeues an item whose apply is
+// still running without marking it settled, so that apply's ReplySuccess
+// settles here and returns nil while the hub's settle() no-ops on the
+// inflight guard. Closing it means requeuing a fresh copy rather than the
+// same struct, the way JetStream redelivers.
 func (i *inmemPersistedItem) terminate(reply inmemPersistedReply, requeue bool) error {
 	i.m.Lock()
 	if i.settled {
 		i.m.Unlock()
-		return errors.New("inmem persisted item already settled")
+		return ErrAlreadySettled
 	}
 	i.settled = true
 	i.m.Unlock()

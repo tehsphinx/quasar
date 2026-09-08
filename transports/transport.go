@@ -113,6 +113,13 @@ type Transport interface {
 	// through StopPersistedConsumer or because it died on its own; the caller
 	// uses it to restart the consumer when it is still leader.
 	//
+	// The consumer's lifetime is tied to StopPersistedConsumer, not to ctx: a
+	// transport may keep pulling and applying after ctx is done, and must not
+	// abandon an item mid-apply because of it (a command already committed to
+	// raft still has to be settled). ctx bounds the start-up work and is
+	// passed on to apply, so treat a ctx-cancel as a shutdown signal to
+	// finish on, and StopPersistedConsumer as the one that ends the claim.
+	//
 	// Calling StartPersistedConsumer when the transport doesn't support
 	// persisted-FIFO returns ErrPersistedNotSupported.
 	StartPersistedConsumer(ctx context.Context, apply PersistedApplyFunc) (<-chan struct{}, error)

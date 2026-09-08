@@ -160,10 +160,12 @@ func WithPersistedStreamManaged(managed bool) PersistedQueueOption {
 //
 // When enabled, every cache write (leader's own writes included)
 // publishes a Store command into the stream and waits for the leader's
-// reply via a NATS request-reply inbox. The leader claims the pull
-// consumer with MaxAckPending = 1, so writes are applied in strict
-// FIFO order. A missing leader is no longer a write blocker — the
-// publish lands in the stream and the next leader applies it.
+// reply via a NATS request-reply inbox. The leader claims one pull
+// consumer per shard (see WithPersistedShards), each with
+// MaxAckPending = 1, so writes are applied in strict FIFO order per
+// shard key — shards apply concurrently. A missing leader is no longer
+// a write blocker — the publish lands in the stream and the next
+// leader applies it.
 //
 // Use only with NATS connections backed by a JetStream-enabled server.
 func WithNATSPersistedQueue(streamName string, opts ...PersistedQueueOption) NATSOption {

@@ -18,6 +18,12 @@ type PersistentStorage interface {
 	// calls can be in flight at once. Calls for keys that share a shard key
 	// are still mutually ordered; calls for different shard keys are not.
 	//
+	// UPGRADE NOTE (RT-14337): in persisted-FIFO mode this is a change, not a
+	// restatement. Every Store — the leader's own and every forwarded one —
+	// used to reach this hook from the single goroutine draining the queue,
+	// so a store that was safe only for serial use worked by accident. It no
+	// longer does: concurrency there is now the configured shard count.
+	//
 	// Returning an error from this function will fail the `Store` process. If the
 	// update of the cache fails after the storage was updated, it is up to the client
 	// code to deal with the discrepancy between persistent store and cache.
