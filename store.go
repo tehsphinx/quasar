@@ -49,8 +49,9 @@ func (s *store) StoreLog(log *raft.Log) error {
 // the wrapped store, the shim raft itself uses for LogCache. Embedding
 // raft.LogStore promotes only that interface's method set, so without this
 // raft's `logs.(MonotonicLogStore)` assertion fails whatever the wrapped store
-// says — and a store that cannot represent a gap, such as stores.LogRing, would
-// silently keep getting one from the snapshot-install and user-restore paths.
+// says, and the wrapper decides the snapshot-install and user-restore paths on
+// its own. stores.LogRing reports false and has its reasons (RT-14463); the
+// forward is what lets it.
 func (s *store) IsMonotonic() bool {
 	if monotonic, ok := s.LogStore.(raft.MonotonicLogStore); ok {
 		return monotonic.IsMonotonic()

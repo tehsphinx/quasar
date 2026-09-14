@@ -271,9 +271,10 @@ func TestLogRing_StoreBelowFirstIndexRejected(t *testing.T) {
 	}
 }
 
-// TestLogRing_ForwardGapReseeds documents the unreachable-by-raft case: with
-// IsMonotonic raft never leaves a hole, and if it ever did the ring restarts at
-// the new index rather than failing every following append.
+// TestLogRing_ForwardGapReseeds covers the hole raft leaves on the first append
+// after a snapshot restore: the ring restarts at the new index rather than
+// failing every following append. This is what lets the ring report
+// IsMonotonic false.
 func TestLogRing_ForwardGapReseeds(t *testing.T) {
 	ring := NewLogRing()
 	storeRange(t, ring, 1, 10)
@@ -319,9 +320,43 @@ func TestLogRing_TruncatedEntriesReleased(t *testing.T) {
 }
 
 func TestLogRing_IsMonotonic(t *testing.T) {
-	if !NewLogRing().IsMonotonic() {
-		t.Error("IsMonotonic: got false; a ring cannot represent the gap raft leaves otherwise")
+	if NewLogRing().IsMonotonic() {
+		t.Error("IsMonotonic: got true; raft then wipes the log on snapshot install " +
+			"without lowering its lastLog, and an ahead-of-snapshot follower panics (RT-14463)")
 	}
+}
+
+// TestLogRing_SnapshotCompactionKeepsEntriesAboveTheSnapshot is the RT-14463
+// regression test. A follower whose log ran ahead of the snapshot it is told to
+// install must still be able to serve the entries above the snapshot index:
+// raft's processLogs reads from lastApplied+1 on the next AppendEntries that
+// advances the commit index, and treats a miss there as a panic.
+//
+// Because the ring is not monotonic, raft compacts rather than wipes —
+// compactLogsWithTrailing deletes [FirstIndex, min(snapIdx, last-TrailingLogs)]
+// and explicitly leaves everything above the snapshot alone. The indices below
+// are the prod-c shape (log to 4979232, snapshot at 4786134, TrailingLogs
+// 500000) scaled down to keep the test cheap.
+func TestLogRing_SnapshotCompactionKeepsEntriesAboveTheSnapshot(t *testing.T) {
+	const (
+		first    = uint64(1)
+		last     = uint64(1000)
+		snapshot = uint64(800)
+		trailing = uint64(100)
+	)
+
+	ring := NewLogRing()
+	storeRange(t, ring, first, last)
+
+	if err := ring.DeleteRange(first, min(snapshot, last-trailing)); err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+
+	var log raft.Log
+	if err := ring.GetLog(snapshot+1, &log); err != nil {
+		t.Errorf("GetLog(%d): %v; raft reads from here after installing the snapshot", snapshot+1, err)
+	}
+	assertReadable(t, ring, snapshot+1, last)
 }
 
 // TestLogRing_AgainstInmemStore runs the three truncation shapes raft actually
