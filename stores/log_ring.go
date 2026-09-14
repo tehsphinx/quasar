@@ -55,21 +55,26 @@ type LogRing struct {
 	first uint64     // raft index of buf[head]; 0 when empty
 }
 
-// IsMonotonic implements the raft.MonotonicLogStore interface.
+// IsMonotonic implements the raft.MonotonicLogStore interface, and deliberately
+// reports false. Do not flip it back without reading RT-14463.
 //
-// A ring buffer cannot represent a hole, and raft only ever produces one for a
-// store that does not declare itself monotonic: on InstallSnapshot and on a user
-// snapshot restore it would keep TrailingLogs entries below the snapshot index
-// and then move its last index up to that snapshot, leaving the range between
-// the two unstored. Declaring monotonic makes raft clear the log on both paths
-// instead, dropping exactly the pre-snapshot entries no follower can be caught
-// up from anyway.
+// Declaring monotonic makes raft clear the whole log on InstallSnapshot and on a
+// user snapshot restore instead of compacting it, which drops exactly the
+// pre-snapshot entries no follower can be caught up from and spares the ring the
+// hole raft leaves otherwise. It also crashes the process. raft's
+// installSnapshot moves lastApplied and lastSnapshot to the snapshot's index but
+// never lowers lastLog, so on the monotonic path it wipes the store while still
+// believing it holds every entry up to the pre-wipe lastLog. A follower whose log
+// was ahead of the incoming snapshot then matches the leader's PrevLogEntry
+// against that stale index, and the first AppendEntries to advance the commit
+// index sends processLogs reading from lastApplied+1 into the wiped range, where
+// a GetLog miss is a panic by design.
 //
-// Any wrapper between raft and this store has to forward this method: a wrapper
-// embedding raft.LogStore as an interface does not satisfy
-// raft.MonotonicLogStore on its own, and raft's type assertion failing puts the
-// gap-producing path back with no error to show for it.
-func (s *LogRing) IsMonotonic() bool { return true }
+// Compacting keeps everything above the snapshot index, which is the range raft
+// goes on believing it has. The hole this declaration used to avoid is handled in
+// the store method below instead: a forward gap restarts the ring at the new
+// index rather than failing every following append.
+func (s *LogRing) IsMonotonic() bool { return false }
 
 // FirstIndex implements the raft.LogStore interface.
 func (s *LogRing) FirstIndex() (uint64, error) {
@@ -108,9 +113,9 @@ func (s *LogRing) StoreLog(log *raft.Log) error {
 	return s.StoreLogs([]*raft.Log{log})
 }
 
-// StoreLogs stores multiple log entries. They are expected to continue where the
-// stored range ends, which is what raft does on every path once the store
-// declares itself monotonic (see IsMonotonic).
+// StoreLogs stores multiple log entries. They normally continue where the stored
+// range ends; the one path that skips ahead is the first append after a snapshot
+// restore, which the store method handles by restarting the ring (see IsMonotonic).
 func (s *LogRing) StoreLogs(logs []*raft.Log) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -126,10 +131,10 @@ func (s *LogRing) StoreLogs(logs []*raft.Log) error {
 // DeleteRange implements the raft.LogStore interface.
 //
 // raft truncates the log at the head (compaction after a snapshot), at the tail
-// (clearing a follower's conflicting suffix) or in full (removeOldLogs,
-// RecoverCluster) and never in the middle, so every case it needs is a pointer
-// move rather than work proportional to the range. An interior range would
-// leave a hole this store cannot represent and is refused.
+// (clearing a follower's conflicting suffix) or in full (RecoverCluster), and
+// never in the middle, so every case it needs is a pointer move rather than work
+// proportional to the range. An interior range would leave a hole this store
+// cannot represent and is refused.
 //
 // Truncated slots are deliberately left as they are instead of being zeroed:
 // zeroing is a memclr over the range, which is what would put the range length
@@ -178,10 +183,11 @@ func (s *LogRing) store(log *raft.Log) error {
 		s.buf[s.pos(log.Index)] = *log
 		return nil
 	case log.Index > s.lastIndex()+1:
-		// A gap is unreachable while raft honours IsMonotonic. Restarting the
-		// ring at the new index drops the same entries raft's removeOldLogs
-		// would have dropped, which keeps replication going rather than
-		// failing every subsequent append.
+		// The live gap is the first append after a snapshot restore, where raft
+		// resumes above whatever the compaction left behind. Restarting the ring
+		// at the new index drops the same entries removeOldLogs would have
+		// dropped, which keeps replication going rather than failing every
+		// subsequent append.
 		s.reset()
 		s.first = log.Index
 	}
