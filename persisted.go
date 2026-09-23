@@ -206,28 +206,28 @@ func (s *Cache) startPersistedConsumerOnce(ctx context.Context) error {
 
 // watchPersistedConsumer waits for the transport's consumer to stop and
 // restarts it if this node is still leader. The stop is expected on leadership
-// loss (StopPersistedConsumer), where restartPersistedConsumerIfLeader sees a
+// loss (StopPersistedConsumer), where requestPersistedRestartIfLeader sees a
 // non-leader and does nothing; the case it exists for is a consumer that died
 // on its own while this node stayed leader (RT-13042 M4).
 func (s *Cache) watchPersistedConsumer(ctx context.Context, stopped <-chan struct{}) {
 	select {
 	case <-ctx.Done():
 	case <-stopped:
-		s.restartPersistedConsumerIfLeader(ctx)
+		s.requestPersistedRestartIfLeader(ctx)
 	}
 }
 
-// restartPersistedConsumerIfLeader restarts the persisted consumer after it
-// stopped underneath a node that is still leader. A stop normally means
-// StopPersistedConsumer ran on leadership loss — but the consumer can also die
-// spontaneously (JetStream consumer deleted server-side, unrecoverable JS
-// error). In that case this node stays leader, so no leadership observation
-// will ever restart the consumer, and every persisted write cluster-wide
-// stalls until a leadership flip (RT-13042 M4). The brief delay keeps a
-// consumer that dies instantly on start from hot-looping. The restart itself
+// requestPersistedRestartIfLeader asks the leadership watcher to restart the
+// persisted consumer after it stopped underneath a node that is still leader.
+// A stop normally means StopPersistedConsumer ran on leadership loss — but the
+// consumer can also die spontaneously (JetStream consumer deleted server-side,
+// unrecoverable JS error). In that case this node stays leader, so no
+// leadership observation will ever restart the consumer, and every persisted
+// write cluster-wide stalls until a leadership flip (RT-13042 M4). The brief
+// delay keeps a consumer that dies instantly on start from hot-looping. The restart itself
 // runs on the leadership watcher, so a restart that fails is retried like any
 // other failed start (RT-14526).
-func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
+func (s *Cache) requestPersistedRestartIfLeader(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
@@ -237,7 +237,7 @@ func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
 	if !s.IsLeader() {
 		return
 	}
-	s.logger.Warn("persisted consumer stopped while still leader; restarting it")
+	s.logger.Warn("persisted consumer stopped while still leader; requesting restart")
 	select {
 	case s.persistedRestart <- struct{}{}:
 	default: // a restart is already pending
