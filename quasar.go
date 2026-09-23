@@ -149,6 +149,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, inject func(*FSMInjector), c
 		newRaftFn: newRaft,
 	}
 	c.applySem = inflight.NewApply(c.logger, cfg.cacheName, cfg.maxInflightApplies)
+	c.persistedRestart = make(chan struct{}, 1)
 	fsm.hasLeader = c.hasLeader
 	inject(&FSMInjector{cache: c})
 
@@ -446,6 +447,10 @@ type Cache struct {
 	// applySem bounds how many Store applies are in flight on the leader.
 	// Unbounded unless the embedder sets WithMaxInflightApplies (RT-13906).
 	applySem *inflight.Sem
+
+	// persistedRestart asks the leadership watcher to start the persisted
+	// consumer again after it stopped under a node that is still leader.
+	persistedRestart chan struct{}
 
 	// quorumProbe* cache the last quorumProbeReachable result so a burst
 	// of leaderless requests doesn't re-fan-out one LatestUID RPC per

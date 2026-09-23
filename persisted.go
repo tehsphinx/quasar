@@ -11,9 +11,15 @@ import (
 	"github.com/tehsphinx/quasar/transports"
 )
 
-// persistedConsumerRestartDelay throttles restarting a persisted consumer
-// whose item channel closed while this node is still leader (RT-13042 M4).
-const persistedConsumerRestartDelay = 500 * time.Millisecond
+const (
+	// persistedConsumerRestartDelay throttles restarting a persisted consumer
+	// whose item channel closed while this node is still leader (RT-13042 M4),
+	// and is the first delay before retrying a failed start (RT-14526).
+	persistedConsumerRestartDelay = 500 * time.Millisecond
+	// persistedConsumerStartMaxDelay caps the backoff between retries of a
+	// failed start, matching the shard reconnect backoff.
+	persistedConsumerStartMaxDelay = 5 * time.Second
+)
 
 // routePersisted is the write path used when the configured transport
 // supports persisted-FIFO. Every Store call from any node (leader or
@@ -130,9 +136,25 @@ func (s *Cache) watchLeadershipOnRaft(ctx, ctxRaft context.Context, rft *raft.Ra
 	rft.RegisterObserver(observer)
 	defer rft.DeregisterObserver(observer)
 
+	// A start that fails while this node stays leader is retried from here with
+	// backoff: raft emits no further observation, so nothing else would retry
+	// it and the queue would go undrained for the rest of the term (RT-14526).
+	var retry <-chan time.Time
+	delay := persistedConsumerRestartDelay
+	apply := func() {
+		retry = nil
+		if err := s.applyLeadershipState(ctx); err != nil {
+			s.logger.Error("failed to start persisted consumer; retrying", "error", err, "in", delay)
+			retry = time.After(delay)
+			delay = min(2*delay, persistedConsumerStartMaxDelay)
+			return
+		}
+		delay = persistedConsumerRestartDelay
+	}
+
 	// Seed with the current leadership state; raft only emits
 	// LeaderObservation on changes.
-	s.applyLeadershipState(ctx)
+	apply()
 
 	for {
 		select {
@@ -143,19 +165,24 @@ func (s *Cache) watchLeadershipOnRaft(ctx, ctxRaft context.Context, rft *raft.Ra
 			_ = s.transport.StopPersistedConsumer()
 			return
 		case <-chObs:
-			s.applyLeadershipState(ctx)
+			apply()
+		case <-s.persistedRestart:
+			apply()
+		case <-retry:
+			apply()
 		}
 	}
 }
 
 // applyLeadershipState is the decision point that starts the persisted
-// consumer when we become leader and stops it when we lose it.
-func (s *Cache) applyLeadershipState(ctx context.Context) {
+// consumer when we become leader and stops it when we lose it. It returns
+// the start error, if any, so the caller can retry it.
+func (s *Cache) applyLeadershipState(ctx context.Context) error {
 	if s.IsLeader() {
-		s.startPersistedConsumerOnce(ctx)
-		return
+		return s.startPersistedConsumerOnce(ctx)
 	}
 	_ = s.transport.StopPersistedConsumer()
+	return nil
 }
 
 // startPersistedConsumerOnce hands the local apply path to the transport's
@@ -164,16 +191,17 @@ func (s *Cache) applyLeadershipState(ctx context.Context) {
 // a second call while a previous consumer is still running returns the
 // existing consumer's stop channel, so the transport keeps one consumer per
 // leader claim and a duplicate watcher can only ever trigger a redundant
-// (idempotent) restart.
-func (s *Cache) startPersistedConsumerOnce(ctx context.Context) {
+// (idempotent) restart. A transport without persisted-FIFO is not an error.
+func (s *Cache) startPersistedConsumerOnce(ctx context.Context) error {
 	stopped, err := s.transport.StartPersistedConsumer(ctx, s.applyPersistedItem)
 	if err != nil {
-		if !errors.Is(err, transports.ErrPersistedNotSupported) {
-			s.logger.Error("failed to start persisted consumer", "error", err)
+		if errors.Is(err, transports.ErrPersistedNotSupported) {
+			return nil
 		}
-		return
+		return err
 	}
 	go s.watchPersistedConsumer(ctx, stopped)
+	return nil
 }
 
 // watchPersistedConsumer waits for the transport's consumer to stop and
@@ -196,7 +224,9 @@ func (s *Cache) watchPersistedConsumer(ctx context.Context, stopped <-chan struc
 // error). In that case this node stays leader, so no leadership observation
 // will ever restart the consumer, and every persisted write cluster-wide
 // stalls until a leadership flip (RT-13042 M4). The brief delay keeps a
-// consumer that dies instantly on start from hot-looping.
+// consumer that dies instantly on start from hot-looping. The restart itself
+// runs on the leadership watcher, so a restart that fails is retried like any
+// other failed start (RT-14526).
 func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
 	select {
 	case <-ctx.Done():
@@ -208,7 +238,10 @@ func (s *Cache) restartPersistedConsumerIfLeader(ctx context.Context) {
 		return
 	}
 	s.logger.Warn("persisted consumer stopped while still leader; restarting it")
-	s.startPersistedConsumerOnce(ctx)
+	select {
+	case s.persistedRestart <- struct{}{}:
+	default: // a restart is already pending
+	}
 }
 
 // applyPersistedItem runs the standard leader-local apply path for the queued
