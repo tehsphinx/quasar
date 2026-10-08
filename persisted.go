@@ -144,6 +144,11 @@ func (s *Cache) watchLeadershipOnRaft(ctx, ctxRaft context.Context, rft *raft.Ra
 	apply := func() {
 		retry = nil
 		if err := s.applyLeadershipState(ctx, ctxRaft); err != nil {
+			if ctxRaft.Err() != nil {
+				// This raft was replaced or the cache is shutting down: the
+				// loop below returns and the next watcher starts afresh.
+				return
+			}
 			s.logger.Error("failed to start persisted consumer; retrying", "error", err, "in", delay)
 			retry = time.After(delay)
 			delay = min(2*delay, persistedConsumerStartMaxDelay)
@@ -199,8 +204,8 @@ func (s *Cache) applyLeadershipState(ctx, ctxRaft context.Context) error {
 // while the barrier is still queued for its FSM never answers it, so an
 // unbounded wait would park the leadership watcher for good.
 //
-// ponytail: an unanswered barrier leaks its waiting goroutine; that needs a
-// raft shutdown racing a barrier, so it stays rare.
+// An unanswered barrier leaks its waiting goroutine. That takes a raft
+// shutdown racing a barrier, so it stays rare.
 func awaitBarrier(ctxRaft context.Context, rft *raft.Raft) error {
 	ctx, cancel := context.WithTimeout(ctxRaft, applyTimeout)
 	defer cancel()
