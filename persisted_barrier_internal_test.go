@@ -4,12 +4,13 @@ package quasar
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/tehsphinx/quasar/transports"
 )
@@ -137,12 +138,16 @@ func eventually(ctx context.Context, cond func() bool) bool {
 // only the enqueue, and a raft shut down while the barrier is still queued for
 // its FSM never answers it. The barrier wait must end with the raft instance
 // instead, or the leadership watcher never re-registers on the rebuilt raft.
+// A watcher leaving its raft must not log that wait as a failed start either.
 func TestPersistedConsumerBarrierWaitEndsWithTheRaft(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
+	out := &syncBuffer{}
+	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Error})
+
 	fsm := newBlockingFSM()
-	c := newLeaderCache(ctx, t, fsm)
+	c := newLeaderCache(ctx, t, fsm, WithHclogLogger(logger))
 	defer close(fsm.release)
 
 	// Park the FSM so the barrier queues behind the write and is never answered.
@@ -155,19 +160,23 @@ func TestPersistedConsumerBarrierWaitEndsWithTheRaft(t *testing.T) {
 		t.Fatal("write never reached the FSM")
 	}
 
+	rft, _ := c.getRaftWithCtx()
 	ctxRaft, cancelRaft := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	go func() { done <- c.applyLeadershipState(ctx, ctxRaft) }()
+	done := make(chan struct{})
+	go func() {
+		c.watchLeadershipOnRaft(ctx, ctxRaft, rft)
+		close(done)
+	}()
 
 	time.Sleep(100 * time.Millisecond)
 	cancelRaft()
 
 	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("barrier wait ended with %v, want context.Canceled", err)
-		}
+	case <-done:
 	case <-time.After(applyTimeout / 2):
 		t.Fatal("barrier wait outlived its raft")
+	}
+	if strings.Contains(out.String(), "failed to start persisted consumer") {
+		t.Fatalf("watcher logged a failed start for the raft it left:\n%s", out.String())
 	}
 }
