@@ -184,41 +184,19 @@ func (s *Cache) watchLeadershipOnRaft(ctx, ctxRaft context.Context, rft *raft.Ra
 // the start error, if any, so the caller can retry it.
 //
 // raft reports leadership before the new leader's FSM has applied the
-// previous leader's committed tail. The consumer's apply path persists
-// before it proposes, and a persister may read the FSM's state, so a raft
-// barrier holds the start until that tail is applied (RT-14687). A failed
-// barrier is retried like a failed start.
+// previous leader's committed tail. persist() waits for that tail on every
+// apply path (RT-14687); waiting here as well keeps the consumer from pulling
+// items it could not apply yet, and marks the term so its applies skip the
+// wait. A failed wait is retried like a failed start.
 func (s *Cache) applyLeadershipState(ctx, ctxRaft context.Context) error {
 	if s.IsLeader() {
-		if err := awaitBarrier(ctxRaft, s.raft()); err != nil {
+		if err := s.awaitAppliedTail(ctxRaft, s.raft()); err != nil {
 			return fmt.Errorf("barrier: %w", err)
 		}
 		return s.startPersistedConsumerOnce(ctx)
 	}
 	_ = s.transport.StopPersistedConsumer()
 	return nil
-}
-
-// awaitBarrier waits for a raft barrier, bounded by applyTimeout and by
-// ctxRaft. Barrier's timeout bounds only the enqueue, and a raft shut down
-// while the barrier is still queued for its FSM never answers it, so an
-// unbounded wait would park the leadership watcher for good.
-//
-// An unanswered barrier leaks its waiting goroutine. That takes a raft
-// shutdown racing a barrier, so it stays rare.
-func awaitBarrier(ctxRaft context.Context, rft *raft.Raft) error {
-	ctx, cancel := context.WithTimeout(ctxRaft, applyTimeout)
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- rft.Barrier(applyTimeout).Error() }()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // startPersistedConsumerOnce hands the local apply path to the transport's
