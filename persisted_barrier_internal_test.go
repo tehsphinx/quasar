@@ -4,6 +4,7 @@ package quasar
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -130,4 +131,43 @@ func eventually(ctx context.Context, cond func() bool) bool {
 		}
 	}
 	return true
+}
+
+// TestPersistedConsumerBarrierWaitEndsWithTheRaft: Barrier's timeout bounds
+// only the enqueue, and a raft shut down while the barrier is still queued for
+// its FSM never answers it. The barrier wait must end with the raft instance
+// instead, or the leadership watcher never re-registers on the rebuilt raft.
+func TestPersistedConsumerBarrierWaitEndsWithTheRaft(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	fsm := newBlockingFSM()
+	c := newLeaderCache(ctx, t, fsm)
+	defer close(fsm.release)
+
+	// Park the FSM so the barrier queues behind the write and is never answered.
+	go func() {
+		_, _ = c.store(ctx, "key", []byte("parked"))
+	}()
+	select {
+	case <-fsm.entered:
+	case <-ctx.Done():
+		t.Fatal("write never reached the FSM")
+	}
+
+	ctxRaft, cancelRaft := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- c.applyLeadershipState(ctx, ctxRaft) }()
+
+	time.Sleep(100 * time.Millisecond)
+	cancelRaft()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("barrier wait ended with %v, want context.Canceled", err)
+		}
+	case <-time.After(applyTimeout / 2):
+		t.Fatal("barrier wait outlived its raft")
+	}
 }
