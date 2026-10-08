@@ -177,8 +177,17 @@ func (s *Cache) watchLeadershipOnRaft(ctx, ctxRaft context.Context, rft *raft.Ra
 // applyLeadershipState is the decision point that starts the persisted
 // consumer when we become leader and stops it when we lose it. It returns
 // the start error, if any, so the caller can retry it.
+//
+// raft reports leadership before the new leader's FSM has applied the
+// previous leader's committed tail. The consumer's apply path persists
+// before it proposes, and a persister may read the FSM's state, so a raft
+// barrier holds the start until that tail is applied (RT-14687). A failed
+// barrier is retried like a failed start.
 func (s *Cache) applyLeadershipState(ctx context.Context) error {
 	if s.IsLeader() {
+		if err := s.raft().Barrier(applyTimeout).Error(); err != nil {
+			return fmt.Errorf("barrier: %w", err)
+		}
 		return s.startPersistedConsumerOnce(ctx)
 	}
 	_ = s.transport.StopPersistedConsumer()
