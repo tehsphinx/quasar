@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -448,6 +449,10 @@ type Cache struct {
 	// Unbounded unless the embedder sets WithMaxInflightApplies (RT-13906).
 	applySem *inflight.Sem
 
+	// tailApplied is the leadership term whose committed tail this node's FSM
+	// is known to have applied (see awaitAppliedTail).
+	tailApplied atomic.Pointer[raftTerm]
+
 	// persistedRestart asks the leadership watcher to start the persisted
 	// consumer again after it stopped under a node that is still leader.
 	persistedRestart chan struct{}
@@ -581,7 +586,8 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 		defer s.applySem.Release()
 	}
 
-	cmd, err := s.persist(cmd)
+	rft, ctxRaft := s.getRaftWithCtx()
+	cmd, err := s.persist(ctxRaft, rft, cmd)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -591,8 +597,8 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 		return nil, 0, fmt.Errorf("failed to marshal command: %w", err)
 	}
 
-	fut := s.raft().Apply(bts, getTimeout(ctx, applyTimeout))
-	if r := fut.Error(); r != nil {
+	fut := rft.Apply(bts, getTimeout(ctx, applyTimeout))
+	if r := awaitFuture(ctxRaft, fut); r != nil {
 		return nil, 0, fmt.Errorf("applying failed with: %w", r)
 	}
 
@@ -606,7 +612,58 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 	return resp.resp, index, nil
 }
 
-func (s *Cache) persist(cmd *pb.Command) (*pb.Command, error) {
+// awaitFuture waits for fut, a log future of the raft instance ctxRaft belongs
+// to, and gives up with raft.ErrRaftShutdown once that instance is gone. The
+// timeout raft takes for Apply and Barrier bounds only the enqueue, and raft
+// never answers a log future still queued for its FSM when it shuts down: log
+// futures carry no shutdown channel, and runFSM returns without draining. A
+// wait on fut alone would outlive a raft replaced by recoverQuorum or a reset
+// for good (RT-14687).
+//
+// An unanswered future leaks its waiting goroutine. That takes a raft
+// shutdown racing an apply, so it stays rare.
+func awaitFuture(ctxRaft context.Context, fut raft.Future) error {
+	done := make(chan error, 1)
+	go func() { done <- fut.Error() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctxRaft.Done():
+		return raft.ErrRaftShutdown
+	}
+}
+
+// raftTerm is one leadership term of one raft instance. The instance belongs
+// to it because a rebuilt raft can count its terms from the start again.
+type raftTerm struct {
+	rft  *raft.Raft
+	term uint64
+}
+
+// awaitAppliedTail returns once this node's FSM has applied every entry
+// committed before its current term. raft reports leadership before the new
+// leader has applied the previous leader's committed tail, and persist() runs
+// before the entry is proposed, so a persister that reads the FSM's state could
+// otherwise merge onto a record missing writes the old leader had already
+// committed and replied for (RT-14687). A raft barrier per term covers it:
+// fsmWrapper.Apply is synchronous, so an applied barrier means an applied tail.
+//
+// Callers racing into a new term each issue a barrier; the term marker stops
+// that once the first one returns.
+func (s *Cache) awaitAppliedTail(ctxRaft context.Context, rft *raft.Raft) error {
+	cur := raftTerm{rft: rft, term: rft.CurrentTerm()}
+	if p := s.tailApplied.Load(); p != nil && *p == cur {
+		return nil
+	}
+	if err := awaitFuture(ctxRaft, rft.Barrier(applyTimeout)); err != nil {
+		return err
+	}
+	s.tailApplied.Store(&cur)
+	return nil
+}
+
+func (s *Cache) persist(ctxRaft context.Context, rft *raft.Raft, cmd *pb.Command) (*pb.Command, error) {
 	if s.pStore == nil {
 		return cmd, nil
 	}
@@ -614,6 +671,10 @@ func (s *Cache) persist(cmd *pb.Command) (*pb.Command, error) {
 	c := cmd.GetStore()
 	if c == nil {
 		return cmd, nil
+	}
+
+	if err := s.awaitAppliedTail(ctxRaft, rft); err != nil {
+		return cmd, fmt.Errorf("barrier: %w", err)
 	}
 
 	pData := stores.NewPersistData(c.Data)
