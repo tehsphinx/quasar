@@ -203,6 +203,51 @@ func TestPersistOnShutDownRaftRefused(t *testing.T) {
 	}
 }
 
+// TestPersistRefusedAfterStepDownDuringBarrier: raft answers a barrier with
+// ErrLeadershipLost only while it is uncommitted. One that committed and is
+// queued for a slow FSM is answered with success once the FSM applies it, even
+// if the node stepped down meanwhile. persist() must still refuse to run on
+// that node (RT-14687).
+func TestPersistRefusedAfterStepDownDuringBarrier(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	persists := &countingPersistStore{}
+	c := newParkedTailCluster(ctx, t, false, WithPersistentStore(persists))
+	c.transferToFollower(ctx, t)
+
+	before := persists.calls.Load()
+	stored := make(chan error, 1)
+	go func() {
+		_, err := c.caches[c.follower].store(ctx, "key", []byte("next"))
+		stored <- err
+	}()
+
+	// Let the barrier commit through the other voters and queue for the parked FSM.
+	time.Sleep(300 * time.Millisecond)
+
+	srv := c.servers[c.leader]
+	if err := c.caches[c.follower].raft().LeadershipTransferToServer(srv.ID, srv.Address).Error(); err != nil {
+		t.Fatalf("transfer back: %v", err)
+	}
+	if !eventually(ctx, func() bool { return !c.caches[c.follower].IsLeader() }) {
+		t.Fatal("never stepped down")
+	}
+
+	c.release()
+	select {
+	case err := <-stored:
+		if !errors.Is(err, raft.ErrNotLeader) {
+			t.Fatalf("store ended with %v, want raft.ErrNotLeader", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("store never returned")
+	}
+	if got := persists.calls.Load(); got != before {
+		t.Fatalf("persisted after stepping down (%d persists, want %d)", got, before)
+	}
+}
+
 // TestPersistSkippedOnceDeadlinePassedDuringBarrier: the barrier wait ignores
 // the caller's ctx, so a Store whose deadline passes during it must neither
 // persist nor apply once the tail is applied (RT-12964, RT-14687).

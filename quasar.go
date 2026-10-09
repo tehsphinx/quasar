@@ -657,21 +657,22 @@ type raftTerm struct {
 // fsmWrapper.Apply is synchronous, so an applied barrier means an applied tail.
 //
 // Callers racing into a new term each issue a barrier; the term marker stops
-// that once the first one returns. A marker hit still checks leadership: a
-// lease-timeout step-down and a raft shut down for a rebuild both keep the
-// term, and a node that knows it is no longer leader must not persist.
+// that once the first one returns. Either way it checks leadership last, since
+// a node that knows it is no longer leader must not persist. A lease-timeout
+// step-down and a raft shut down for a rebuild both keep the term, so the
+// marker still hits. A barrier that committed before a step-down is still
+// answered with success once the FSM has applied it.
 func (s *Cache) awaitAppliedTail(ctxRaft context.Context, rft *raft.Raft) error {
 	cur := raftTerm{ctxRaft: ctxRaft, term: rft.CurrentTerm()}
-	if p := s.tailApplied.Load(); p != nil && *p == cur {
-		if rft.State() != raft.Leader {
-			return raft.ErrNotLeader
+	if p := s.tailApplied.Load(); p == nil || *p != cur {
+		if err := awaitFuture(ctxRaft, rft.Barrier(applyTimeout)); err != nil {
+			return err
 		}
-		return nil
+		s.tailApplied.Store(&cur)
 	}
-	if err := awaitFuture(ctxRaft, rft.Barrier(applyTimeout)); err != nil {
-		return err
+	if rft.State() != raft.Leader {
+		return raft.ErrNotLeader
 	}
-	s.tailApplied.Store(&cur)
 	return nil
 }
 
