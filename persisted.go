@@ -154,7 +154,7 @@ func (s *Cache) watchLeadershipOnRaft(ctx, ctxRaft context.Context, rft *raft.Ra
 			// transfer emits no observation that would retry it.
 			logFn := s.logger.Error
 			if isLeadershipTransitionError(err) {
-				logFn = s.logger.Warn
+				logFn = s.logger.Debug
 			}
 			logFn("failed to start persisted consumer; retrying", "error", err, "in", delay)
 			retry = time.After(delay)

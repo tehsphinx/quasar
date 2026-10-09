@@ -587,7 +587,7 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 	}
 
 	rft, ctxRaft := s.getRaftWithCtx()
-	cmd, err := s.persist(ctxRaft, rft, cmd)
+	cmd, err := s.persist(ctx, ctxRaft, rft, cmd)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -657,10 +657,15 @@ type raftTerm struct {
 // fsmWrapper.Apply is synchronous, so an applied barrier means an applied tail.
 //
 // Callers racing into a new term each issue a barrier; the term marker stops
-// that once the first one returns.
+// that once the first one returns. A marker hit still checks leadership: a
+// lease-timeout step-down and a raft shut down for a rebuild both keep the
+// term, and a node that knows it is no longer leader must not persist.
 func (s *Cache) awaitAppliedTail(ctxRaft context.Context, rft *raft.Raft) error {
 	cur := raftTerm{ctxRaft: ctxRaft, term: rft.CurrentTerm()}
 	if p := s.tailApplied.Load(); p != nil && *p == cur {
+		if rft.State() != raft.Leader {
+			return raft.ErrNotLeader
+		}
 		return nil
 	}
 	if err := awaitFuture(ctxRaft, rft.Barrier(applyTimeout)); err != nil {
@@ -670,7 +675,7 @@ func (s *Cache) awaitAppliedTail(ctxRaft context.Context, rft *raft.Raft) error 
 	return nil
 }
 
-func (s *Cache) persist(ctxRaft context.Context, rft *raft.Raft, cmd *pb.Command) (*pb.Command, error) {
+func (s *Cache) persist(ctx, ctxRaft context.Context, rft *raft.Raft, cmd *pb.Command) (*pb.Command, error) {
 	if s.pStore == nil {
 		return cmd, nil
 	}
@@ -682,6 +687,13 @@ func (s *Cache) persist(ctxRaft context.Context, rft *raft.Raft, cmd *pb.Command
 
 	if err := s.awaitAppliedTail(ctxRaft, rft); err != nil {
 		return cmd, fmt.Errorf("barrier: %w", err)
+	}
+	// The barrier wait ignores ctx. A write whose deadline passed during it
+	// must neither persist nor apply (RT-12964). A cancelled ctx is left to
+	// the apply: the persisted consumer cancels it on stop, and its retry
+	// items must still be Nak'd there, not terminated here.
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return cmd, ctx.Err()
 	}
 
 	pData := stores.NewPersistData(c.Data)
