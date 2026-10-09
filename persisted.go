@@ -143,13 +143,20 @@ func (s *Cache) watchLeadershipOnRaft(ctx, ctxRaft context.Context, rft *raft.Ra
 	delay := persistedConsumerRestartDelay
 	apply := func() {
 		retry = nil
-		if err := s.applyLeadershipState(ctx, ctxRaft); err != nil {
+		if err := s.applyLeadershipState(ctx, ctxRaft, rft); err != nil {
 			if ctxRaft.Err() != nil {
 				// This raft was replaced or the cache is shutting down: the
 				// loop below returns and the next watcher starts afresh.
 				return
 			}
-			s.logger.Error("failed to start persisted consumer; retrying", "error", err, "in", delay)
+			// Leadership moving while the barrier waits is routine on
+			// step-down. It is retried all the same: a failed leadership
+			// transfer emits no observation that would retry it.
+			logFn := s.logger.Error
+			if isLeadershipTransitionError(err) {
+				logFn = s.logger.Warn
+			}
+			logFn("failed to start persisted consumer; retrying", "error", err, "in", delay)
 			retry = time.After(delay)
 			delay = min(2*delay, persistedConsumerStartMaxDelay)
 			return
@@ -187,10 +194,11 @@ func (s *Cache) watchLeadershipOnRaft(ctx, ctxRaft context.Context, rft *raft.Ra
 // previous leader's committed tail. persist() waits for that tail on every
 // apply path (RT-14687); waiting here as well keeps the consumer from pulling
 // items it could not apply yet, and marks the term so its applies skip the
-// wait. A failed wait is retried like a failed start.
-func (s *Cache) applyLeadershipState(ctx, ctxRaft context.Context) error {
-	if s.IsLeader() {
-		if err := s.awaitAppliedTail(ctxRaft, s.raft()); err != nil {
+// wait. A failed wait is retried like a failed start. rft is the watcher's
+// raft instance, the one ctxRaft belongs to.
+func (s *Cache) applyLeadershipState(ctx, ctxRaft context.Context, rft *raft.Raft) error {
+	if rft.State() == raft.Leader {
+		if err := s.awaitAppliedTail(ctxRaft, rft); err != nil {
 			return fmt.Errorf("barrier: %w", err)
 		}
 		return s.startPersistedConsumerOnce(ctx)
