@@ -613,12 +613,16 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 }
 
 // awaitFuture waits for fut, a log future of the raft instance ctxRaft belongs
-// to, and gives up with raft.ErrRaftShutdown once that instance is gone. The
-// timeout raft takes for Apply and Barrier bounds only the enqueue, and raft
-// never answers a log future still queued for its FSM when it shuts down: log
-// futures carry no shutdown channel, and runFSM returns without draining. A
-// wait on fut alone would outlive a raft replaced by recoverQuorum or a reset
-// for good (RT-14687).
+// to, and gives up with raft.ErrRaftShutdown once that instance is replaced or
+// the cache closes. The timeout raft takes for Apply and Barrier bounds only
+// the enqueue, and raft never answers a log future still queued for its FSM
+// when it shuts down: log futures carry no shutdown channel, and runFSM
+// returns without draining. A wait on fut alone would outlive a raft replaced
+// by recoverQuorum or a reset for good (RT-14687).
+//
+// Those paths shut the old raft down before they build its successor, so the
+// wait lasts until the rebuild is done. A failed rebuild replaces nothing and
+// leaves the wait parked, on a node that is inert until restart anyway (m5).
 //
 // An unanswered future leaks its waiting goroutine. That takes a raft
 // shutdown racing an apply, so it stays rare.
@@ -635,10 +639,13 @@ func awaitFuture(ctxRaft context.Context, fut raft.Future) error {
 }
 
 // raftTerm is one leadership term of one raft instance. The instance belongs
-// to it because a rebuilt raft can count its terms from the start again.
+// to it because a rebuilt raft can count its terms from the start again. Its
+// context identifies it: setRaft mints one per instance, and unlike the
+// *raft.Raft it does not keep a replaced instance's log and snapshot stores
+// reachable.
 type raftTerm struct {
-	rft  *raft.Raft
-	term uint64
+	ctxRaft context.Context
+	term    uint64
 }
 
 // awaitAppliedTail returns once this node's FSM has applied every entry
@@ -652,7 +659,7 @@ type raftTerm struct {
 // Callers racing into a new term each issue a barrier; the term marker stops
 // that once the first one returns.
 func (s *Cache) awaitAppliedTail(ctxRaft context.Context, rft *raft.Raft) error {
-	cur := raftTerm{rft: rft, term: rft.CurrentTerm()}
+	cur := raftTerm{ctxRaft: ctxRaft, term: rft.CurrentTerm()}
 	if p := s.tailApplied.Load(); p != nil && *p == cur {
 		return nil
 	}
