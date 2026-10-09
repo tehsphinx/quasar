@@ -96,7 +96,9 @@ func TestPersistedConsumerBarrierWaitEndsWithTheRaft(t *testing.T) {
 	defer cancel()
 
 	out := &syncBuffer{}
-	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Error})
+	// Debug: the wait ends in raft.ErrRaftShutdown, a leadership-transition
+	// error, which the watcher would log at Debug.
+	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Debug})
 
 	fsm := newBlockingFSM()
 	c := newLeaderCache(ctx, t, fsm, WithHclogLogger(logger))
@@ -167,6 +169,72 @@ func TestApplyLocalWaitEndsWithTheRaft(t *testing.T) {
 		}
 	case <-time.After(applyTimeout / 2):
 		t.Fatal("apply wait outlived its raft")
+	}
+}
+
+// TestPersistOnShutDownRaftRefused: the term marker outlives leadership when
+// the term does not move, as on a lease-timeout step-down or a raft shut down
+// for a rebuild before setRaft replaces it. A persisted consumer item still in
+// flight then reaches persist() on a node that knows it is not leader; it must
+// fail before it persists, not at the Apply after it (RT-14687).
+func TestPersistOnShutDownRaftRefused(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	persists := &countingPersistStore{}
+	c := newLeaderCache(ctx, t, &stubFSM{}, WithPersistentStore(persists))
+
+	// The first Store passes the barrier and marks the term.
+	if _, err := c.store(ctx, "key", []byte("first")); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	// Shut the raft down the way a rebuild does: term and ctxRaft stay.
+	if err := c.raft().Shutdown().Error(); err != nil {
+		t.Fatalf("raft shutdown: %v", err)
+	}
+
+	before := persists.calls.Load()
+	_, _, err := c.applyLocal(ctx, cmdStore("key", []byte("late")))
+	if !errors.Is(err, raft.ErrNotLeader) {
+		t.Fatalf("applyLocal ended with %v, want raft.ErrNotLeader", err)
+	}
+	if got := persists.calls.Load(); got != before {
+		t.Fatalf("persisted on a shut-down raft (%d persists, want %d)", got, before)
+	}
+}
+
+// TestPersistSkippedOnceDeadlinePassedDuringBarrier: the barrier wait ignores
+// the caller's ctx, so a Store whose deadline passes during it must neither
+// persist nor apply once the tail is applied (RT-12964, RT-14687).
+func TestPersistSkippedOnceDeadlinePassedDuringBarrier(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	persists := &countingPersistStore{}
+	c := newParkedTailCluster(ctx, t, false, WithPersistentStore(persists))
+	c.transferToFollower(ctx, t)
+
+	before := persists.calls.Load()
+	storeCtx, storeCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer storeCancel()
+	stored := make(chan error, 1)
+	go func() {
+		_, err := c.caches[c.follower].store(storeCtx, "key", []byte("late"))
+		stored <- err
+	}()
+
+	<-storeCtx.Done()
+	c.release()
+	select {
+	case err := <-stored:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("store ended with %v, want context.DeadlineExceeded", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("store never returned once the tail was applied")
+	}
+	if got := persists.calls.Load(); got != before {
+		t.Fatalf("persisted past the deadline (%d persists, want %d)", got, before)
 	}
 }
 

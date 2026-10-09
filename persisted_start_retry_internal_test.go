@@ -104,17 +104,17 @@ func TestPersistedConsumerStartRetryBacksOff(t *testing.T) {
 	}
 }
 
-// TestPersistedConsumerStartLeadershipLossLoggedAsWarning: a start that fails
+// TestPersistedConsumerStartLeadershipLossLoggedAtDebug: a start that fails
 // because leadership moved, the way a barrier answered with ErrLeadershipLost
 // does on step-down, is routine. It is retried like any failed start, since a
 // failed leadership transfer emits no observation that would, but it is logged
-// as a warning, not an error (RT-14687).
-func TestPersistedConsumerStartLeadershipLossLoggedAsWarning(t *testing.T) {
+// at debug, not as an error (RT-14687).
+func TestPersistedConsumerStartLeadershipLossLoggedAtDebug(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	out := &syncBuffer{}
-	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Warn})
+	logger := hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Debug})
 	_, tr := newFailingStartLeaderCache(ctx, t, 1, fmt.Errorf("barrier: %w", raft.ErrLeadershipLost),
 		WithHclogLogger(logger))
 
@@ -123,8 +123,8 @@ func TestPersistedConsumerStartLeadershipLossLoggedAsWarning(t *testing.T) {
 	}
 	for _, line := range strings.Split(out.String(), "\n") {
 		if strings.Contains(line, "failed to start persisted consumer") {
-			if !strings.Contains(line, "[WARN]") {
-				t.Fatalf("leadership loss logged above warning:\n%s", line)
+			if !strings.Contains(line, "[DEBUG]") {
+				t.Fatalf("leadership loss logged above debug:\n%s", line)
 			}
 			return
 		}
