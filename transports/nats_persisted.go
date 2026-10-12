@@ -58,14 +58,6 @@ const (
 	persistedReconnectBackoff    = 250 * time.Millisecond
 	persistedReconnectMaxBackoff = 5 * time.Second
 
-	// persistedPublishTimeout bounds the durable publish of a retry write when
-	// the caller passed no deadline. The publish is deliberately detached from
-	// the caller's cancellation (see publish) so a retry write still reaches the
-	// stream when the caller cancels the reply wait the instant it detects there
-	// is no leader; this is the only backstop that keeps that detached publish
-	// from hanging if JetStream is unavailable.
-	persistedPublishTimeout = 10 * time.Second
-
 	// persistedReplyHeader carries the publisher's reply-inbox subject
 	// across the JetStream hop. We can't use the wire-level Reply field
 	// because JetStream rewrites it to the ack-inbox subject when the
@@ -85,6 +77,14 @@ const (
 	// it late (RT-12964). Absent when the publisher had no deadline.
 	persistedDeadlineHeader = "Quasar-Deadline"
 )
+
+// persistedPublishTimeout bounds the durable publish of a retry write, stream
+// lookup included. The publish is deliberately detached from the caller's
+// cancellation (see publish) so a retry write still reaches the stream when
+// the caller cancels the reply wait the instant it detects there is no leader;
+// this is the only backstop that keeps that detached publish from hanging if
+// JetStream is unavailable. A var so tests can shorten it.
+var persistedPublishTimeout = 10 * time.Second
 
 // natsPersistedQueue is the JetStream-backed persisted-FIFO mode for a
 // NATSTransport. One instance per transport; the underlying JS stream
@@ -227,7 +227,19 @@ func (q *natsPersistedQueue) ensureStream(ctx context.Context) (jetstream.Stream
 // request-reply inbox for the leader's reply. opts.ShardKey selects the FIFO
 // partition (RT-12964).
 func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts PersistedStoreOpts) (*pb.StoreResponse, error) {
-	if _, err := q.ensureStream(ctx); err != nil {
+	// A retry write must reach the durable stream even if the caller cancels the
+	// reply wait the instant it detects there is no leader (quasar's leader
+	// gate): the queued write has to survive for the next leader. Detach the
+	// stream lookup and the publish from the caller's cancellation so only the
+	// reply wait below honors ctx. Non-retry writes keep the old behaviour (a
+	// cancelled publish aborts).
+	pubCtx := ctx
+	if opts.Retry {
+		var cancel context.CancelFunc
+		pubCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), persistedPublishTimeout)
+		defer cancel()
+	}
+	if _, err := q.ensureStream(pubCtx); err != nil {
 		return nil, err
 	}
 
@@ -255,24 +267,14 @@ func (q *natsPersistedQueue) publish(ctx context.Context, cmd *pb.Store, opts Pe
 	}
 	msg.Data = bts
 
-	// A retry write must reach the durable stream even if the caller cancels the
-	// reply wait the instant it detects there is no leader (quasar's leader
-	// gate): the queued write has to survive for the next leader. Detach the
-	// publish from the caller's cancellation so only the reply wait below honors
-	// ctx. Non-retry writes keep the old behaviour (a cancelled publish aborts).
-	pubCtx := ctx
-	if opts.Retry {
-		var cancel context.CancelFunc
-		pubCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), persistedPublishTimeout)
-		defer cancel()
-	}
 	if _, err = q.js.PublishMsg(pubCtx, msg); err != nil {
 		return nil, fmt.Errorf("publish persisted store: %w", err)
 	}
 
+	// From here on the command is in the stream: the PubAck came back.
 	replyMsg, err := sub.NextMsgWithContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrPersistedNoReply, err)
 	}
 
 	var protoResp pb.CommandResponse
