@@ -238,6 +238,7 @@ func TestInmemQueueHub_RetryPublishSurvivesCtxCancel(t *testing.T) {
 	defer cancelPublish()
 	_, err := producer.StorePersisted(publishCtx, &pb.Store{Key: "kept"}, PersistedStoreOpts{Retry: true})
 	asrt.True(errors.Is(err, context.DeadlineExceeded))
+	asrt.True(errors.Is(err, ErrPersistedNoReply)) // queued, only the reply is missing (RT-14885)
 
 	// A consumer claiming afterwards must still receive the retry item.
 	consumeCtx, cancelConsume := context.WithTimeout(context.Background(), 2*time.Second)

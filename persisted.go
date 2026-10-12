@@ -29,12 +29,14 @@ const (
 // of the writes that share a shard key (opts.shardKey); writes in different
 // partitions are mutually unordered by design.
 //
-// When the caller asked for WithRetry() and the wait for the reply
-// times out (ctx.Err() != nil), we wrap the error as
-// ErrRetrying — the publish itself succeeded and the JS-level
-// MaxDeliver × AckWait redelivery budget continues independently.
-// Without WithRetry() we return the underlying error unwrapped, which
-// stays compatible with today's ErrNoLeader-returning callers.
+// When the caller asked for WithRetry() and the publish was acknowledged
+// but the wait for the reply failed (transports.ErrPersistedNoReply), we
+// wrap the error as ErrRetrying: the command is in the stream and the
+// JS-level MaxDeliver × AckWait redelivery budget continues independently.
+// Every failure before the acknowledgement is returned as is, whatever the
+// state of ctx, because nothing was queued (RT-14885). Without WithRetry()
+// we return the underlying error unwrapped, which stays compatible with
+// today's ErrNoLeader-returning callers.
 func (s *Cache) routePersisted(ctx context.Context, storeCmd *pb.Store, opts storeOpts) (*pb.CommandResponse, uint64, error) {
 	pOpts := transports.PersistedStoreOpts{ShardKey: opts.shardKey, Retry: opts.retry}
 
@@ -64,29 +66,12 @@ func (s *Cache) routePersisted(ctx context.Context, storeCmd *pb.Store, opts sto
 		if cause := context.Cause(ctx); !opts.retry && errors.Is(cause, ErrNoLeader) {
 			return nil, 0, cause
 		}
-		if opts.retry && ctxTimedOut(ctx, err) {
+		if opts.retry && errors.Is(err, transports.ErrPersistedNoReply) {
 			return nil, 0, fmt.Errorf("%w: %w", ErrRetrying, err)
 		}
 		return nil, 0, err
 	}
 	return respStore(resp), resp.GetUid(), nil
-}
-
-// ctxTimedOut reports whether err is a wait-timeout / deadline expiry
-// on ctx. Used to distinguish a "publish succeeded, no reply yet" wait
-// timeout from a transport-level publish failure: only the wait timeout
-// becomes ErrRetrying under WithRetry.
-func ctxTimedOut(ctx context.Context, err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
-	}
-	if ctx.Err() != nil {
-		return true
-	}
-	return false
 }
 
 // runPersistedConsumer is the long-lived loop that drives the

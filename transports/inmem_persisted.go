@@ -3,6 +3,7 @@ package transports
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -163,7 +164,7 @@ func (h *InmemQueueHub) publish(ctx context.Context, command *pb.Store, opts Per
 		if !opts.Retry {
 			h.cancelPublish(item)
 		}
-		return nil, ctx.Err()
+		return nil, fmt.Errorf("%w: %w", ErrPersistedNoReply, ctx.Err())
 	}
 }
 

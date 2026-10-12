@@ -85,12 +85,14 @@ var (
 	// ErrWaitFor indicates a timeout occurred while waiting for a UID to be applied.
 	ErrWaitFor = errors.New("timeout waiting for UID to be applied")
 
-	// ErrRetrying indicates that a Store command was successfully
-	// published to the persisted-FIFO transport but the leader's reply
-	// did not arrive within the caller's context deadline. JetStream-level
-	// redelivery (MaxDeliver × AckWait) continues; the next leader will
-	// eventually apply the command. Returned only when the caller asked
-	// for at-least-once semantics with WithRetry().
+	// ErrRetrying indicates that a Store command reached the persisted-FIFO
+	// stream (the publish was acknowledged) but the leader's reply did not
+	// arrive before the caller's context ended. JetStream-level redelivery
+	// (MaxDeliver × AckWait) continues; the next leader applies the command,
+	// or rejects it with an apply error this call does not see. A failure
+	// before the acknowledgement is returned as an error, not as
+	// ErrRetrying (RT-14885). Returned only when the caller asked for
+	// at-least-once semantics with WithRetry().
 	ErrRetrying = errors.New("failed to apply: retrying in background")
 
 	// ErrOverloaded indicates the leader is already at its in-flight apply

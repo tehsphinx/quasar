@@ -36,6 +36,12 @@ var ErrPersistedNotSupported = errors.New("transport does not support persisted 
 // it again (RT-13042 M5).
 var ErrAlreadySettled = errors.New("persisted item already settled")
 
+// ErrPersistedNoReply marks a StorePersisted failure that happened after the
+// command reached the persisted stream: the publish was acknowledged, only the
+// leader's reply is missing. A failure without it means the command is not
+// known to be in the stream (RT-14885).
+var ErrPersistedNoReply = errors.New("persisted store published, no reply")
+
 // PersistedStoreOpts carries per-call routing metadata from the cache to the
 // persisted-FIFO transport. It travels with the published message (NATS
 // header / in-memory item field) so the consuming leader — which may be a
@@ -93,7 +99,9 @@ type Transport interface {
 	// transport, per-call result channel for the Inmem transport).
 	//
 	// Returns when the leader replies, when ctx is done, or when the
-	// transport-level publish fails.
+	// transport-level publish fails. A failed wait for the reply after the
+	// publish was acknowledged wraps ErrPersistedNoReply; every earlier
+	// failure does not.
 	//
 	// opts carries routing (ShardKey) metadata that is published alongside the
 	// command so the consuming leader routes it to the right shard.

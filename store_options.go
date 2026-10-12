@@ -10,9 +10,10 @@ type StoreOption func(*storeOpts)
 type storeOpts struct {
 	// retry asks the cache to treat a reply-timeout on the persisted
 	// path as "queued, JetStream will keep redelivering" rather than
-	// "failed". When true and the reply doesn't arrive within the
-	// caller's timeout, routePersisted returns ErrRetrying
-	// wrapping the underlying cause. When false, the underlying
+	// "failed". When true, the publish was acknowledged and the reply
+	// doesn't arrive within the caller's timeout, routePersisted returns
+	// ErrRetrying wrapping the underlying cause; a failed publish is
+	// returned as is. When false, the underlying
 	// error is returned unwrapped (today's behaviour: ErrNoLeader
 	// or whatever the transport returned).
 	//
@@ -43,12 +44,14 @@ func resolveStoreOpts(opts []StoreOption) storeOpts {
 // failure. Only meaningful when the underlying transport reports
 // SupportsPersisted() == true; ignored otherwise.
 //
-// When the persisted publish succeeds but the leader's reply does not
-// arrive before the caller's context deadline, the cache returns
+// When the persisted publish is acknowledged but the leader's reply does
+// not arrive before the caller's context deadline, the cache returns
 // ErrRetrying (wrapping the deadline error) instead of the
 // underlying transport / leader error. JetStream-level redelivery
 // (MaxDeliver × AckWait) continues independently until either a
 // later leader applies the message or the redelivery budget runs out.
+// A publish that fails or gets no acknowledgement queued nothing and is
+// returned as an error, never as ErrRetrying.
 //
 // The payload must be idempotent: a leader can crash after applying
 // the raft command but before publishing the reply / acking the JS
