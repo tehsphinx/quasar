@@ -34,9 +34,10 @@ const (
 // wrap the error as ErrRetrying: the command is in the stream and the
 // JS-level MaxDeliver × AckWait redelivery budget continues independently.
 // Every failure before the acknowledgement is returned as is, whatever the
-// state of ctx, because nothing was queued (RT-14885). Without WithRetry()
-// we return the underlying error unwrapped, which stays compatible with
-// today's ErrNoLeader-returning callers.
+// state of ctx, because the write is not known to be queued (RT-14885); a
+// write that landed although its PubAck was lost is still applied. Without
+// WithRetry() we return the underlying error unwrapped, which stays
+// compatible with today's ErrNoLeader-returning callers.
 func (s *Cache) routePersisted(ctx context.Context, storeCmd *pb.Store, opts storeOpts) (*pb.CommandResponse, uint64, error) {
 	pOpts := transports.PersistedStoreOpts{ShardKey: opts.shardKey, Retry: opts.retry}
 
@@ -67,11 +68,48 @@ func (s *Cache) routePersisted(ctx context.Context, storeCmd *pb.Store, opts sto
 			return nil, 0, cause
 		}
 		if opts.retry && errors.Is(err, transports.ErrPersistedNoReply) {
-			return nil, 0, fmt.Errorf("%w: %w", ErrRetrying, err)
+			return nil, 0, retryingError{cause: err}
 		}
 		return nil, 0, err
 	}
 	return respStore(resp), resp.GetUid(), nil
+}
+
+// retryingError is the ErrRetrying of a queued write. Unlike
+// fmt.Errorf("%w: %w"), it has a single cause, so Queued can tell it apart
+// from a join that merely contains an ErrRetrying.
+type retryingError struct {
+	cause error
+}
+
+func (e retryingError) Error() string        { return ErrRetrying.Error() + ": " + e.cause.Error() }
+func (e retryingError) Is(target error) bool { return target == ErrRetrying } //nolint:errorlint // sentinel identity
+func (e retryingError) Unwrap() error        { return e.cause }
+
+// Queued reports whether err stands only for writes queued under
+// WithRetry: every branch of its error tree is an ErrRetrying. Use it
+// instead of errors.Is on an error joined from several writes, where
+// errors.Is(err, ErrRetrying) holds as soon as one write was queued, even
+// when another one failed and is not known to be queued (RT-14885). A bare
+// ErrRetrying counts as queued, so a caller's test can stand in for one.
+func Queued(err error) bool {
+	switch e := err.(type) { //nolint:errorlint // walks the tree itself
+	case nil:
+		return false
+	case retryingError:
+		return true
+	case interface{ Unwrap() []error }:
+		errs := e.Unwrap()
+		for _, branch := range errs {
+			if !Queued(branch) {
+				return false
+			}
+		}
+		return len(errs) > 0
+	case interface{ Unwrap() error }:
+		return Queued(e.Unwrap())
+	}
+	return errors.Is(err, ErrRetrying)
 }
 
 // runPersistedConsumer is the long-lived loop that drives the

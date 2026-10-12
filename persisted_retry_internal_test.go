@@ -31,10 +31,10 @@ func (s *stubPersistTransport) StorePersisted(ctx context.Context, _ *pb.Store, 
 
 // TestRoutePersistedRetryingOnlyAfterPubAck is the RT-14885 regression:
 // under WithRetry, only a reply wait that failed after the PubAck is
-// ErrRetrying. A failure before it queued nothing and is an error, even when
-// it arrives after the caller's deadline. Before the fix, cases "publish
-// timeout" and "apply error" came back as ErrRetrying and pgwatcher acked a
-// CDC whose write was lost.
+// ErrRetrying. A failure before it is not known to be queued and is an
+// error, even when it arrives after the caller's deadline. Before the fix,
+// cases "publish timeout" and "apply error" came back as ErrRetrying and
+// pgwatcher acked a CDC whose write was lost.
 func TestRoutePersistedRetryingOnlyAfterPubAck(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -80,8 +80,44 @@ func TestRoutePersistedRetryingOnlyAfterPubAck(t *testing.T) {
 			if got := errors.Is(err, ErrRetrying); got != tc.want {
 				t.Fatalf("errors.Is(%v, ErrRetrying) = %v, want %v", err, got, tc.want)
 			}
+			if got := Queued(err); got != tc.want {
+				t.Fatalf("Queued(%v) = %v, want %v", err, got, tc.want)
+			}
 			if !errors.Is(err, tc.err) {
 				t.Fatalf("error %v does not wrap the transport error %v", err, tc.err)
+			}
+		})
+	}
+}
+
+// TestQueued: a join of several writes' errors is queued only when every
+// write was queued. errors.Is(join, ErrRetrying) holds as soon as one was,
+// so pgwatcher acked a CDC whose other write was lost (RT-14885).
+func TestQueued(t *testing.T) {
+	t.Parallel()
+
+	queued := retryingError{cause: fmt.Errorf("%w: %w", transports.ErrPersistedNoReply, context.DeadlineExceeded)}
+	lost := fmt.Errorf("publish persisted store: %w", context.DeadlineExceeded)
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"queued", queued, true},
+		{"wrapped queued", fmt.Errorf("update circle: %w", queued), true},
+		{"bare sentinel", ErrRetrying, true},
+		{"failed", lost, false},
+		{"single-branch join", errors.Join(queued), true},
+		{"all queued", errors.Join(queued, fmt.Errorf("update member: %w", queued)), true},
+		{"queued and failed", errors.Join(queued, lost), false},
+		{"nested join with a failure", errors.Join(queued, errors.Join(queued, lost)), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := Queued(tc.err); got != tc.want {
+				t.Fatalf("Queued(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
