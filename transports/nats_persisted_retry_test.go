@@ -20,7 +20,7 @@ import (
 // failure before the PubAck must come back without it.
 
 // TestNATSPersistedQueue_RetryNoPubAckIsNotNoReply: a retry publish that gets
-// no PubAck within the publish timeout queued nothing.
+// no PubAck within the publish timeout is not known to be queued.
 func TestNATSPersistedQueue_RetryNoPubAckIsNotNoReply(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

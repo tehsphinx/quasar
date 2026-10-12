@@ -50,8 +50,9 @@ func resolveStoreOpts(opts []StoreOption) storeOpts {
 // underlying transport / leader error. JetStream-level redelivery
 // (MaxDeliver × AckWait) continues independently until either a
 // later leader applies the message or the redelivery budget runs out.
-// A publish that fails or gets no acknowledgement queued nothing and is
-// returned as an error, never as ErrRetrying.
+// A publish that fails or gets no acknowledgement is not known to be queued
+// and is returned as an error, never as ErrRetrying. Queued tells whether an
+// error, possibly joined from several writes, means only queued writes.
 //
 // The payload must be idempotent: a leader can crash after applying
 // the raft command but before publishing the reply / acking the JS

@@ -92,7 +92,8 @@ var (
 	// or rejects it with an apply error this call does not see. A failure
 	// before the acknowledgement is returned as an error, not as
 	// ErrRetrying (RT-14885). Returned only when the caller asked for
-	// at-least-once semantics with WithRetry().
+	// at-least-once semantics with WithRetry(). Check an error joined from
+	// several writes with Queued, not errors.Is.
 	ErrRetrying = errors.New("failed to apply: retrying in background")
 
 	// ErrOverloaded indicates the leader is already at its in-flight apply
