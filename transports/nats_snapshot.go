@@ -158,7 +158,19 @@ func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(*nats.Ms
 
 		chResp, rpc := buildConsumeMsg(&protoMsg, pipeReader)
 
-		s.chConsume <- rpc
+		respSubj := chanSubj + ".resp"
+		// msg is already answered with the stream subject; the sender waits on
+		// respSubj, so a shutdown error goes there (RT-14146).
+		select {
+		case s.chConsume <- rpc:
+		case <-ctx.Done():
+			_ = pipeReader.CloseWithError(raft.ErrTransportShutdown)
+			// Best effort: the transport's connections are closing.
+			if b, r := proto.Marshal(&pb.CommandResponse{Error: raft.ErrTransportShutdown.Error()}); r == nil {
+				_ = s.connBulk.Publish(respSubj, b)
+			}
+			return
+		}
 
 		bts, err = s.awaitResponse(ctx, chResp, func(i interface{}) *pb.CommandResponse {
 			resp, _ := i.(*raft.InstallSnapshotResponse)
@@ -171,7 +183,6 @@ func (s *NATSTransport) handleInstallSnapshot(ctx context.Context) func(*nats.Ms
 			return
 		}
 
-		respSubj := chanSubj + ".resp"
 		if r := s.connBulk.Publish(respSubj, bts); r != nil {
 			s.logger.Error("failed to send response", "error", r)
 		}
