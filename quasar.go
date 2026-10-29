@@ -55,14 +55,6 @@ const (
 	// clearing does not cost an extra full window, but not a tight loop.
 	recoveryRetryAfter  = 1 * time.Second
 	observationChanSize = 5
-	// awaitRaftShutdownTimeout bounds the join on the goroutines of the raft
-	// instance a rebuild replaces (see awaitRaftShutdown). runFSM and
-	// runSnapshots sit inside user code — FSM.ApplyCmd, FSM.Snapshot and the
-	// snapshot's Persist — so a write-through FSM stuck on an unavailable
-	// backend would otherwise pin the rebuild, and recoveryMutex with it, for
-	// as long as the backend stays down. Sized well above a healthy snapshot
-	// Persist and well below the minutes such an outage can last.
-	awaitRaftShutdownTimeout = 10 * time.Second
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the
 	// discovery alive-window to expire. Sized for a healthy LAN: long
@@ -77,6 +69,16 @@ const (
 	// recovers without an accompanying raft observation.
 	quorumProbeCacheTTL = 4 * time.Second
 )
+
+// awaitRaftShutdownTimeout bounds the join on the goroutines of the raft
+// instance a rebuild replaces (see awaitRaftShutdown). runFSM and
+// runSnapshots sit inside user code — FSM.ApplyCmd, FSM.Snapshot and the
+// snapshot's Persist — so a write-through FSM stuck on an unavailable
+// backend would otherwise pin the rebuild, and recoveryMutex with it, for
+// as long as the backend stays down. Sized well above a healthy snapshot
+// Persist and well below the minutes such an outage can last. A variable so
+// tests can shorten it.
+var awaitRaftShutdownTimeout = 10 * time.Second
 
 var (
 	// ErrNoLeader defines an error returned if there is no leader.
@@ -216,7 +218,7 @@ func newCache(ctx context.Context, fsm *fsmWrapper, inject func(*FSMInjector), c
 // existing cluster, the restarter can avoid bootstrapping entirely and join
 // cleanly via the leader's replication.
 func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports.Transport) error {
-	rft := s.raft()
+	rft, ctxRaft := s.getRaftWithCtx()
 	if rft == nil {
 		return errors.New("raft not set (yet)")
 	}
@@ -244,7 +246,7 @@ func (s *Cache) bootstrap(ctx context.Context, cfg options, transport transports
 			// fallback that bootstraps a single-voter cluster if no real leader
 			// forms. Runs only when a fallback window is configured.
 			if cfg.bootstrapFallback > 0 {
-				go s.runBootstrapFallback(ctx, cfg.bootstrapFallback, transport)
+				go s.runBootstrapFallback(ctxRaft, rft, cfg.bootstrapFallback, transport)
 			}
 			return nil
 		default:
@@ -314,7 +316,22 @@ func (s *Cache) bootstrapCluster(rft *raft.Raft, configuration raft.Configuratio
 // advertising NumVotersInConfig>=2 while every voter is down). The fresh
 // single-voter leader then converges the stale peers via the Option I
 // instance-ID admission gate on their next ping.
-func (s *Cache) runBootstrapFallback(ctx context.Context, after time.Duration, transport transports.Transport) {
+//
+// It is also armed after a history reset (reinitRaftAdoptingInstance), which
+// leaves a voter just as configless. Several voters reset at once would all
+// get here together and fork competing clusters, so a voter waits one extra
+// window per alive lower-ID voter that is not in an established cluster
+// either: the lowest goes first, the rest see its leader pings and wait to be
+// admitted, and one that never acts (an older quasar mid-rollout) costs one
+// window (RT-15590). The extra wait extends the leader-ping staleness window
+// rather than following it: voters reset together age out the same last
+// leader ping at the same instant, so a turn counted from their own wait start
+// would mostly overlap the lower voter's and leave it no time to win its
+// election and ping.
+//
+// rft is the instance the fallback guards; it ends when that instance is
+// replaced, and never bootstraps another one.
+func (s *Cache) runBootstrapFallback(ctx context.Context, rft *raft.Raft, after time.Duration, transport transports.Transport) {
 	timer := time.NewTimer(after)
 	defer timer.Stop()
 
@@ -329,13 +346,15 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, after time.Duration, t
 	// liveness window) before forking a single-voter cluster. A live leader
 	// keeps pinging, so this loop keeps waiting and never competes with it.
 	window := s.aliveCutoff()
+	waitStart := time.Now()
 	ticker := time.NewTicker(bootstrapFallbackPoll)
 	defer ticker.Stop()
 	for {
-		if s.hasLeader() || !s.hasEmptyConfig() {
+		if s.raft() != rft || s.hasLeader() || !s.hasEmptyConfig() {
 			return
 		}
-		if !s.discovery.observedLeaderPing(window) {
+		turn := time.Duration(s.discovery.lowerFormingVoters(window)) * window
+		if !s.discovery.observedLeaderPing(window+turn) && time.Since(waitStart) >= turn {
 			break
 		}
 		select {
@@ -345,12 +364,15 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, after time.Duration, t
 		}
 	}
 
-	rft := s.raft()
-	if rft == nil {
+	// Rebuilds swap the raft under recoveryMutex: holding it keeps a reset from
+	// landing between the check and the bootstrap.
+	s.recoveryMutex.Lock()
+	defer s.recoveryMutex.Unlock()
+	if s.raft() != rft || !s.hasEmptyConfig() {
 		return
 	}
 
-	s.logger.Warn("bootstrap fallback: skipped bootstrap on an established-cluster ping but no leader formed and the leader ping went stale; bootstrapping single-voter cluster to break the wedge",
+	s.logger.Warn("bootstrap fallback: no configuration, no leader formed and the leader ping went stale; bootstrapping single-voter cluster to break the wedge",
 		"local-id", s.localID,
 		"local-address", transport.LocalAddr(),
 		"fallback-wait", after,
@@ -435,6 +457,13 @@ type Cache struct {
 		snapshotStore raft.SnapshotStore, transport transports.Transport) (*raft.Raft, error)
 
 	recoveryMutex sync.Mutex
+
+	// raftExit is the join on the raft instance a rebuild shut down (see
+	// awaitRaftShutdown), and rebuildPending records that a rebuild of that
+	// instance timed out on the join and is queued behind it (see
+	// rebuildAfterExit). Both are guarded by recoveryMutex.
+	raftExit       *raftExit
+	rebuildPending bool
 
 	// hardReset* remember the resetID of the most recent HardReset fan-out so
 	// a retry after a partial failure reuses it instead of minting a fresh
@@ -1269,9 +1298,12 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	// with a stale high index, making WaitFor return early — stale reads until
 	// the new raft has genuinely caught up (RT-14147). Awaiting is safe because
 	// raft was handed a transport wrapper that hides Close(); see hideClose.
-	// Bounded: on expiry nothing below has run yet, so returning leaves the FSM
-	// and the stores untouched for the next reset attempt.
-	if err := awaitRaftShutdown(s.raft(), awaitRaftShutdownTimeout); err != nil {
+	// Bounded: on expiry nothing below has run yet, and the reinit is redone
+	// once the old raft has exited.
+	if exit, err := s.awaitRaftShutdown(s.raft(), awaitRaftShutdownTimeout); err != nil {
+		s.rebuildAfterExit(exit, func() error {
+			return s.reinitRaftAdoptingInstance(adoptInstanceID, full)
+		})
 		return fmt.Errorf("shutting down raft for reinit: %w", err)
 	}
 
@@ -1299,6 +1331,15 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	}
 	s.setRaft(rft)
 	s.discovery.run(s.ctx, rft)
+
+	// The fresh raft has an empty configuration and cannot campaign. A live
+	// leader replicates one back, but when every voter was reset (or the only
+	// configured one is gone) nobody would: arm the same fallback a startup
+	// that skipped its bootstrap gets (RT-15590).
+	if s.cfg.discovery != nil && s.suffrage == raft.Voter && s.cfg.bootstrapFallback > 0 {
+		_, ctxRaft := s.getRaftWithCtx()
+		go s.runBootstrapFallback(ctxRaft, rft, s.cfg.bootstrapFallback, s.transport)
+	}
 	return nil
 }
 
@@ -1335,30 +1376,88 @@ func (s *Cache) rebuildRaft() (*raft.Raft, error) {
 	return nil, err
 }
 
+// raftExit is the join on one raft instance's goroutines: done closes once
+// they have all exited, err is the shutdown future's result.
+type raftExit struct {
+	rft  *raft.Raft
+	done chan struct{}
+	err  error
+}
+
 // awaitRaftShutdown joins the goroutines of the raft instance a rebuild
 // replaces, bounded by timeout. shutdownFuture.Error() is the only thing that
 // joins run, runFSM and runSnapshots, but the latter two sit inside user FSM
 // code, so a wedged FSM must not pin the rebuild — and recoveryMutex — forever
 // (see awaitRaftShutdownTimeout). Both call sites run this before mutating
-// anything shared, so on expiry the caller can return with every store
-// untouched and be retried later.
+// anything shared, so on expiry nothing is touched yet; the caller hands the
+// rebuild to rebuildAfterExit with the returned join.
 //
-// The join goroutine outlives the timeout; that is harmless, it only waits.
-func awaitRaftShutdown(rft *raft.Raft, timeout time.Duration) error {
-	done := make(chan error, 1)
-	go func() { done <- rft.Shutdown().Error() }()
+// The join is kept per instance: raft returns an empty future from every
+// Shutdown() after the first, so a retry that called it again would not wait
+// at all and could rebuild on top of goroutines still running (RT-15590).
+// Callers hold recoveryMutex.
+func (s *Cache) awaitRaftShutdown(rft *raft.Raft, timeout time.Duration) (*raftExit, error) {
+	if s.raftExit == nil || s.raftExit.rft != rft {
+		exit := &raftExit{rft: rft, done: make(chan struct{})}
+		go func() {
+			exit.err = rft.Shutdown().Error()
+			close(exit.done)
+		}()
+		s.raftExit = exit
+		s.rebuildPending = false
+	}
+	exit := s.raftExit
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
-	case err := <-done:
+	case <-exit.done:
 		// raft@v1.7.3 returns nil unconditionally here; forwarding it is
 		// upgrade insurance, not a live branch.
-		return err
+		return exit, exit.err
 	case <-timer.C:
-		return errAwaitRaftShutdown
+		return exit, errAwaitRaftShutdown
 	}
+}
+
+// rebuildAfterExit runs redo once the raft instance behind exit has exited,
+// for a rebuild that timed out awaiting it. That instance is already shut
+// down, so without this the node would sit on a dead raft: the quorum watcher
+// only retries while shouldRecoverQuorum agrees, which a peer still pinging
+// can keep it from doing, and a hard reset is deduplicated by its resetID
+// (RT-15590). redo runs under recoveryMutex and is dropped when another
+// rebuild replaced the instance first. One redo per instance. Callers hold
+// recoveryMutex.
+//
+// ponytail: an FSM that never returns keeps the node down, as before; the
+// warning below is what shows it.
+func (s *Cache) rebuildAfterExit(exit *raftExit, redo func() error) {
+	if s.rebuildPending {
+		return
+	}
+	s.rebuildPending = true
+	s.logger.Warn("raft rebuild pending: the old raft has not exited yet; rebuilding once it has",
+		"local-id", s.localID)
+
+	go func() {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-exit.done:
+		}
+
+		s.recoveryMutex.Lock()
+		defer s.recoveryMutex.Unlock()
+
+		if s.raft() != exit.rft {
+			return
+		}
+		if err := redo(); err != nil {
+			s.logger.Error("raft rebuild after the old raft exited failed",
+				"local-id", s.localID, "error", err)
+		}
+	}()
 }
 
 // runQuorumRecoveryWatch is the long-running goroutine that decides when to
@@ -1595,12 +1694,18 @@ func recoveryLoop(ctx, ctxRaft context.Context, chObs <-chan raft.Observation, h
 //     discovery is treated as new (because forgetServer cleared its
 //     bookkeeping) and is re-added through the standard AddVoter path,
 //     which rebuilds replication state cleanly.
-//
-//nolint:funlen // single linear procedure; splitting hurts readability.
 func (s *Cache) recoverQuorum() error {
 	s.recoveryMutex.Lock()
 	defer s.recoveryMutex.Unlock()
 
+	return s.recoverQuorumLocked()
+}
+
+// recoverQuorumLocked is recoverQuorum without taking recoveryMutex, so
+// rebuildAfterExit can redo it under the lock it already holds.
+//
+//nolint:funlen // single linear procedure; splitting hurts readability.
+func (s *Cache) recoverQuorumLocked() error {
 	rft := s.raft()
 	if rft == nil {
 		return errors.New("raft not set (yet)")
@@ -1671,10 +1776,13 @@ func (s *Cache) recoverQuorum() error {
 	//
 	// Bounded, and it matters more here than in reinit: this path runs from the
 	// quorum watcher holding recoveryMutex, and it is needed exactly when the
-	// cluster is already wedged. On expiry every store is still untouched, so
-	// fire() logs and the watcher re-arms — better than an indefinite hold that
-	// also queues a concurrent hard reset or fork adoption behind the mutex.
-	if err := awaitRaftShutdown(rft, awaitRaftShutdownTimeout); err != nil {
+	// cluster is already wedged. On expiry every store is still untouched and
+	// the recovery is redone once the old raft has exited — better than an
+	// indefinite hold that also queues a concurrent hard reset or fork adoption
+	// behind the mutex. It is redone without asking shouldRecoverQuorum again:
+	// the raft that question was about is already shut down (RT-15590).
+	if exit, err := s.awaitRaftShutdown(rft, awaitRaftShutdownTimeout); err != nil {
+		s.rebuildAfterExit(exit, s.recoverQuorumLocked)
 		return fmt.Errorf("shutting down raft for recovery: %w", err)
 	}
 

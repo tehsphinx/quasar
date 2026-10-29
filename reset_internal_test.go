@@ -321,25 +321,45 @@ func TestFollowerHardResetAwaitsOldRaftShutdown(t *testing.T) {
 // joins runFSM, which sits inside FSM.ApplyCmd — a write-through FSM stuck on
 // an unavailable backend would otherwise pin the rebuild, and recoveryMutex
 // with it, for as long as the FSM stays stuck.
+//
+// It is also the RT-15590 regression test for the retry: raft returns an empty
+// future from every Shutdown() after the first, so a second wait on the same
+// instance used to return at once while the old goroutines still ran. It must
+// wait for the same exit.
 func TestAwaitRaftShutdownTimesOutOnWedgedFSM(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	fsm := newBlockingFSM()
 	c := newLeaderCache(ctx, t, fsm)
+	wedgeApply(ctx, t, c, fsm)
+
+	rft := c.raft()
+	if _, err := c.awaitRaftShutdown(rft, 200*time.Millisecond); !errors.Is(err, errAwaitRaftShutdown) {
+		close(fsm.release)
+		t.Fatalf("expected the join to be bounded, got %v", err)
+	}
+	if _, err := c.awaitRaftShutdown(rft, 200*time.Millisecond); !errors.Is(err, errAwaitRaftShutdown) {
+		close(fsm.release)
+		t.Fatalf("expected a retry to wait for the same exit, got %v", err)
+	}
+
+	close(fsm.release)
+	if _, err := c.awaitRaftShutdown(rft, 5*time.Second); err != nil {
+		t.Fatalf("expected the join to complete once the FSM returned, got %v", err)
+	}
+}
+
+// wedgeApply parks the raft's FSM goroutine inside a blockingFSM.ApplyCmd, so
+// shutting that raft down cannot complete until fsm.release is closed.
+func wedgeApply(ctx context.Context, t *testing.T, c *Cache, fsm *blockingFSM) {
+	t.Helper()
 
 	go func() { _, _ = c.store(ctx, "wedge", []byte("me")) }()
 	select {
 	case <-fsm.entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("FSM.ApplyCmd never ran")
-	}
-
-	err := awaitRaftShutdown(c.raft(), 200*time.Millisecond)
-	close(fsm.release)
-
-	if !errors.Is(err, errAwaitRaftShutdown) {
-		t.Fatalf("expected the join to be bounded, got %v", err)
 	}
 }
 

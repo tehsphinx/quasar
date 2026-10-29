@@ -52,6 +52,7 @@ func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 		servers:         map[raft.ServerID]raft.Server{},
 		lastSeen:        map[raft.ServerID]time.Time{},
 		instanceIDs:     map[raft.ServerID]string{},
+		forming:         map[raft.ServerID]bool{},
 		peerInClusterCh: make(chan struct{}),
 	}
 }
@@ -99,8 +100,13 @@ type DiscoveryInjector struct {
 	// implementation that does not propagate status) and is treated as a
 	// mismatch — the wipe is a no-op on a genuinely fresh peer.
 	instanceIDs map[raft.ServerID]string
-	appliedM    sync.RWMutex
-	applied     map[raft.ServerID]struct{}
+	// forming holds whether each peer's last ping put it outside an
+	// established cluster (see PeerStatus.inEstablishedCluster): configless,
+	// or a single-voter cluster that has not elected itself yet. The bootstrap
+	// fallback lets lower-ID forming voters go first (RT-15590).
+	forming  map[raft.ServerID]bool
+	appliedM sync.RWMutex
+	applied  map[raft.ServerID]struct{}
 
 	cancelM sync.Mutex
 	cancel  context.CancelFunc
@@ -199,7 +205,7 @@ func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status Peer
 
 	s.cache.noteLeaderInstanceID(srv.ID, status.InstanceID)
 
-	isNew := s.setServerWithInstanceID(srv, status.InstanceID)
+	isNew := s.setServerWithStatus(srv, status)
 	if !isNew {
 		return
 	}
@@ -672,16 +678,24 @@ func (s *DiscoveryInjector) setServer(srv raft.Server) bool {
 	return s.setServerWithInstanceID(srv, "")
 }
 
-// setServerWithInstanceID is setServer plus bookkeeping of the peer's
-// last-pinged raft instance ID, which addServer's admission gate consults
-// (RT-13067). Last ping wins: a peer that wipes (instance ID cleared) or
-// adopts a new instance ID is re-evaluated on its next ping.
+// setServerWithInstanceID is setServerWithStatus for a ping that carries only
+// an instance ID.
 func (s *DiscoveryInjector) setServerWithInstanceID(srv raft.Server, instanceID string) bool {
+	return s.setServerWithStatus(srv, PeerStatus{InstanceID: instanceID})
+}
+
+// setServerWithStatus is setServer plus bookkeeping of the peer's last-pinged
+// raft instance ID, which addServer's admission gate consults (RT-13067), and
+// of whether it is still forming a cluster (RT-15590). Last ping wins: a peer
+// that wipes (instance ID cleared) or adopts a new instance ID is re-evaluated
+// on its next ping.
+func (s *DiscoveryInjector) setServerWithStatus(srv raft.Server, status PeerStatus) bool {
 	s.serversM.Lock()
 	defer s.serversM.Unlock()
 
 	s.lastSeen[srv.ID] = time.Now()
-	s.instanceIDs[srv.ID] = instanceID
+	s.instanceIDs[srv.ID] = status.InstanceID
+	s.forming[srv.ID] = !status.inEstablishedCluster()
 
 	known, ok := s.servers[srv.ID]
 	if ok && known.Address == srv.Address {
@@ -704,6 +718,7 @@ func (s *DiscoveryInjector) deleteServer(id raft.ServerID) {
 	delete(s.servers, id)
 	delete(s.lastSeen, id)
 	delete(s.instanceIDs, id)
+	delete(s.forming, id)
 }
 
 // peerInstanceID returns the raft instance ID the given peer reported on its
@@ -728,6 +743,27 @@ func (s *DiscoveryInjector) isAliveSince(id raft.ServerID, since time.Time) bool
 	return !last.Before(since)
 }
 
+// lowerFormingVoters counts the voter peers with a lower server ID than this
+// node that pinged within window from outside an established cluster: the
+// voters the bootstrap fallback lets go first (RT-15590). A single-voter
+// cluster that has not elected itself yet still counts, so a peer that just
+// bootstrapped keeps its turn until its leader pings arrive.
+func (s *DiscoveryInjector) lowerFormingVoters(window time.Duration) int {
+	local := raft.ServerID(s.cache.localID)
+	since := time.Now().Add(-window)
+
+	s.serversM.RLock()
+	defer s.serversM.RUnlock()
+
+	n := 0
+	for id, srv := range s.servers {
+		if id < local && srv.Suffrage == raft.Voter && s.forming[id] && !s.lastSeen[id].Before(since) {
+			n++
+		}
+	}
+	return n
+}
+
 // forgetServer removes all bookkeeping for the given peer so that a fresh
 // discovery ping from that ID will be treated as a brand-new server. Used by
 // the quorum-recovery path after dropping a missing voter from raft so that,
@@ -738,6 +774,7 @@ func (s *DiscoveryInjector) forgetServer(id raft.ServerID) {
 	delete(s.servers, id)
 	delete(s.lastSeen, id)
 	delete(s.instanceIDs, id)
+	delete(s.forming, id)
 	s.serversM.Unlock()
 
 	s.appliedM.Lock()
