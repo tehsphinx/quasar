@@ -164,12 +164,17 @@ func TestResetReplicatesAndClearsLateJoiner(t *testing.T) {
 		return nil
 	}))
 
-	// A fresh post-reset write is the "caught up" marker: once n3 has it, n3
-	// has replayed past the reset, so the absence of the pre-reset content is
-	// conclusive.
+	// A fresh post-reset write is the "caught up" marker: once a node has it,
+	// it has replayed past the reset, so the absence of the pre-reset content is
+	// conclusive. Wait for every node, not only n3: n2 can lag a moment behind.
 	asrt.NoErr(writeMusician(joinCtx, nodes["v1"].fsm, "dave"))
 	asrt.NoErr(waitForCondition(joinCtx, func() error {
-		return hasAll(nodes["n3"].fsm, "dave")
+		for _, id := range specs {
+			if e := hasAll(nodes[id].fsm, "dave"); e != nil {
+				return fmt.Errorf("%s: %w", id, e)
+			}
+		}
+		return nil
 	}))
 
 	for _, id := range specs {
