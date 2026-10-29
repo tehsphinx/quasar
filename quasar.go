@@ -55,6 +55,14 @@ const (
 	// clearing does not cost an extra full window, but not a tight loop.
 	recoveryRetryAfter  = 1 * time.Second
 	observationChanSize = 5
+	// defaultAwaitRaftShutdownTimeout bounds the join on the goroutines of the
+	// raft instance a rebuild replaces (see awaitRaftShutdown). runFSM and
+	// runSnapshots sit inside user code — FSM.ApplyCmd, FSM.Snapshot and the
+	// snapshot's Persist — so a write-through FSM stuck on an unavailable
+	// backend would otherwise pin the rebuild, and recoveryMutex with it, for
+	// as long as the backend stays down. Sized well above a healthy snapshot
+	// Persist and well below the minutes such an outage can last.
+	defaultAwaitRaftShutdownTimeout = 10 * time.Second
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the
 	// discovery alive-window to expire. Sized for a healthy LAN: long
@@ -69,16 +77,6 @@ const (
 	// recovers without an accompanying raft observation.
 	quorumProbeCacheTTL = 4 * time.Second
 )
-
-// awaitRaftShutdownTimeout bounds the join on the goroutines of the raft
-// instance a rebuild replaces (see awaitRaftShutdown). runFSM and
-// runSnapshots sit inside user code — FSM.ApplyCmd, FSM.Snapshot and the
-// snapshot's Persist — so a write-through FSM stuck on an unavailable
-// backend would otherwise pin the rebuild, and recoveryMutex with it, for
-// as long as the backend stays down. Sized well above a healthy snapshot
-// Persist and well below the minutes such an outage can last. A variable so
-// tests can shorten it.
-var awaitRaftShutdownTimeout = 10 * time.Second
 
 var (
 	// ErrNoLeader defines an error returned if there is no leader.
@@ -110,8 +108,9 @@ var (
 	ErrOverloaded = errors.New("leader overloaded: too many applies in flight")
 
 	// errAwaitRaftShutdown indicates the old raft instance did not finish
-	// shutting down within awaitRaftShutdownTimeout. Nothing has been mutated
-	// when it is returned; the caller aborts the rebuild and retries later.
+	// shutting down within its bound (see defaultAwaitRaftShutdownTimeout).
+	// Nothing has been mutated when it is returned; the rebuild is queued to
+	// run once the old raft has exited (see rebuildAfterExit).
 	errAwaitRaftShutdown = errors.New("timed out awaiting old raft shutdown")
 
 	// errNoVotersToRecover is returned by recoverQuorum when the current
@@ -458,12 +457,9 @@ type Cache struct {
 
 	recoveryMutex sync.Mutex
 
-	// raftExit is the join on the raft instance a rebuild shut down (see
-	// awaitRaftShutdown), and rebuildPending records that a rebuild of that
-	// instance timed out on the join and is queued behind it (see
-	// rebuildAfterExit). Both are guarded by recoveryMutex.
-	raftExit       *raftExit
-	rebuildPending bool
+	// raftExit is the join on the raft instance a rebuild shut down while it
+	// has not completed yet (see awaitRaftShutdown). Guarded by recoveryMutex.
+	raftExit *raftExit
 
 	// hardReset* remember the resetID of the most recent HardReset fan-out so
 	// a retry after a partial failure reuses it instead of minting a fresh
@@ -1300,10 +1296,10 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	// raft was handed a transport wrapper that hides Close(); see hideClose.
 	// Bounded: on expiry nothing below has run yet, and the reinit is redone
 	// once the old raft has exited.
-	if exit, err := s.awaitRaftShutdown(s.raft(), awaitRaftShutdownTimeout); err != nil {
+	if exit, err := s.awaitRaftShutdown(s.raft(), s.cfg.awaitRaftShutdownTimeout); err != nil {
 		s.rebuildAfterExit(exit, func() error {
 			return s.reinitRaftAdoptingInstance(adoptInstanceID, full)
-		})
+		}, true)
 		return fmt.Errorf("shutting down raft for reinit: %w", err)
 	}
 
@@ -1377,25 +1373,27 @@ func (s *Cache) rebuildRaft() (*raft.Raft, error) {
 }
 
 // raftExit is the join on one raft instance's goroutines: done closes once
-// they have all exited, err is the shutdown future's result.
+// they have all exited, err is the shutdown future's result. redo is the
+// rebuild queued behind it (see rebuildAfterExit), guarded by recoveryMutex.
 type raftExit struct {
 	rft  *raft.Raft
 	done chan struct{}
 	err  error
+	redo func() error
 }
 
 // awaitRaftShutdown joins the goroutines of the raft instance a rebuild
 // replaces, bounded by timeout. shutdownFuture.Error() is the only thing that
 // joins run, runFSM and runSnapshots, but the latter two sit inside user FSM
 // code, so a wedged FSM must not pin the rebuild — and recoveryMutex — forever
-// (see awaitRaftShutdownTimeout). Both call sites run this before mutating
-// anything shared, so on expiry nothing is touched yet; the caller hands the
-// rebuild to rebuildAfterExit with the returned join.
+// (see defaultAwaitRaftShutdownTimeout). Both call sites run this before
+// mutating anything shared, so on expiry nothing is touched yet; the caller
+// hands the rebuild to rebuildAfterExit with the returned join.
 //
-// The join is kept per instance: raft returns an empty future from every
-// Shutdown() after the first, so a retry that called it again would not wait
-// at all and could rebuild on top of goroutines still running (RT-15590).
-// Callers hold recoveryMutex.
+// The join is kept per instance until it completes: raft returns an empty
+// future from every Shutdown() after the first, so a retry that called it
+// again would not wait at all and could rebuild on top of goroutines still
+// running (RT-15590). Callers hold recoveryMutex.
 func (s *Cache) awaitRaftShutdown(rft *raft.Raft, timeout time.Duration) (*raftExit, error) {
 	if s.raftExit == nil || s.raftExit.rft != rft {
 		exit := &raftExit{rft: rft, done: make(chan struct{})}
@@ -1404,15 +1402,28 @@ func (s *Cache) awaitRaftShutdown(rft *raft.Raft, timeout time.Duration) (*raftE
 			close(exit.done)
 		}()
 		s.raftExit = exit
-		s.rebuildPending = false
 	}
 	exit := s.raftExit
+
+	if exit.redo != nil {
+		select {
+		case <-exit.done:
+		default:
+			// A rebuild is already queued behind this exit: waiting again would
+			// only hold recoveryMutex, and with it every other rebuild.
+			return exit, errAwaitRaftShutdown
+		}
+	}
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
 	case <-exit.done:
+		// Nothing is left to join, so a later Shutdown() returning at once is
+		// right. Dropping the join keeps the old instance, and its in-memory
+		// log, from staying reachable until the next rebuild.
+		s.raftExit = nil
 		// raft@v1.7.3 returns nil unconditionally here; forwarding it is
 		// upgrade insurance, not a live branch.
 		return exit, exit.err
@@ -1421,22 +1432,31 @@ func (s *Cache) awaitRaftShutdown(rft *raft.Raft, timeout time.Duration) (*raftE
 	}
 }
 
-// rebuildAfterExit runs redo once the raft instance behind exit has exited,
-// for a rebuild that timed out awaiting it. That instance is already shut
-// down, so without this the node would sit on a dead raft: the quorum watcher
-// only retries while shouldRecoverQuorum agrees, which a peer still pinging
-// can keep it from doing, and a hard reset is deduplicated by its resetID
-// (RT-15590). redo runs under recoveryMutex and is dropped when another
-// rebuild replaced the instance first. One redo per instance. Callers hold
-// recoveryMutex.
+// rebuildAfterExit queues redo to run once the raft instance behind exit has
+// exited, for a rebuild that timed out awaiting it. That instance is already
+// shut down, so without this the node would sit on a dead raft: the quorum
+// watcher only retries while shouldRecoverQuorum agrees, which a peer still
+// pinging can keep it from doing, and a hard reset is deduplicated by its
+// resetID (RT-15590). One redo runs per instance, under recoveryMutex, and
+// none when another rebuild replaced the instance first or the cache shut
+// down. Callers hold recoveryMutex.
+//
+// A reset passes replace: it supersedes whatever is queued, because its
+// resetID is already marked and a retry of it would be deduplicated away. A
+// quorum recovery only queues when nothing is: a queued reset rebuilds the
+// raft anyway, and the watcher re-evaluates recovery on the result.
 //
 // ponytail: an FSM that never returns keeps the node down, as before; the
 // warning below is what shows it.
-func (s *Cache) rebuildAfterExit(exit *raftExit, redo func() error) {
-	if s.rebuildPending {
+func (s *Cache) rebuildAfterExit(exit *raftExit, redo func() error, replace bool) {
+	queued := exit.redo != nil
+	if queued && !replace {
 		return
 	}
-	s.rebuildPending = true
+	exit.redo = redo
+	if queued {
+		return
+	}
 	s.logger.Warn("raft rebuild pending: the old raft has not exited yet; rebuilding once it has",
 		"local-id", s.localID)
 
@@ -1450,10 +1470,12 @@ func (s *Cache) rebuildAfterExit(exit *raftExit, redo func() error) {
 		s.recoveryMutex.Lock()
 		defer s.recoveryMutex.Unlock()
 
-		if s.raft() != exit.rft {
+		// Shutdown does not take recoveryMutex: a raft built after it began
+		// would never be shut down.
+		if s.ctx.Err() != nil || s.raft() != exit.rft {
 			return
 		}
-		if err := redo(); err != nil {
+		if err := exit.redo(); err != nil {
 			s.logger.Error("raft rebuild after the old raft exited failed",
 				"local-id", s.localID, "error", err)
 		}
@@ -1780,9 +1802,20 @@ func (s *Cache) recoverQuorumLocked() error {
 	// the recovery is redone once the old raft has exited — better than an
 	// indefinite hold that also queues a concurrent hard reset or fork adoption
 	// behind the mutex. It is redone without asking shouldRecoverQuorum again:
-	// the raft that question was about is already shut down (RT-15590).
-	if exit, err := s.awaitRaftShutdown(rft, awaitRaftShutdownTimeout); err != nil {
-		s.rebuildAfterExit(exit, s.recoverQuorumLocked)
+	// the raft that question was about is already shut down (RT-15590). The
+	// peers may have formed a cluster by then, though: forking a fresh history
+	// next to a live leader would have the two leaders admit, and hard-reset,
+	// each other's members (RT-14149), so with a leader pinging the node
+	// rejoins on fresh stores instead.
+	if exit, err := s.awaitRaftShutdown(rft, s.cfg.awaitRaftShutdownTimeout); err != nil {
+		s.rebuildAfterExit(exit, func() error {
+			if s.discovery.observedLeaderPing(s.aliveCutoff()) {
+				s.logger.Warn("quorum recovery: a leader formed while the old raft was exiting; rejoining instead of forking",
+					"local-id", s.localID)
+				return s.reinitRaftAdoptingInstance("", false)
+			}
+			return s.recoverQuorumLocked()
+		}, false)
 		return fmt.Errorf("shutting down raft for recovery: %w", err)
 	}
 

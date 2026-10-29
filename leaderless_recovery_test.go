@@ -103,10 +103,6 @@ func TestVotersResetIntoEmptyConfigsElectALeader(t *testing.T) {
 	waitFor(t, 30*time.Second, "all three voters in the configuration", func() error {
 		return hasVoters(caches["sitea"], "sitea", "siteb", "sitec")
 	})
-	// A voter that skipped its bootstrap at startup armed the fallback too.
-	// Let its grace run out so it sees the formed cluster and ends, as it long
-	// had in production: only the reset may arm one below.
-	time.Sleep(2 * time.Second)
 
 	// Site C's raft is gone.
 	if err := caches["sitec"].Shutdown(); err != nil {
