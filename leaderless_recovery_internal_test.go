@@ -333,6 +333,38 @@ func TestQueuedResetWinsOverRecovery(t *testing.T) {
 	}
 }
 
+// TestQueuedRebuildWinsOverCallerAfterExit: a rebuild that takes
+// recoveryMutex after the old raft exited, ahead of the queued one, must defer
+// to it. The quorum watcher's retry is such a caller: run in its place, it
+// forked a fresh history and the queued reset was dropped as replaced.
+func TestQueuedRebuildWinsOverCallerAfterExit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	c, fsm := newWedgedRecoverableCache(ctx, t)
+
+	if err := c.ReinitForTest("adopted"); !errors.Is(err, errAwaitRaftShutdown) {
+		close(fsm.release)
+		t.Fatalf("expected the reinit to time out awaiting the wedged raft, got %v", err)
+	}
+
+	// The watcher's retry holds recoveryMutex when the old raft exits.
+	c.recoveryMutex.Lock()
+	exit := c.raftExit
+	close(fsm.release)
+	<-exit.done
+	_, awaitErr := c.awaitRaftShutdown(exit.rft, time.Minute)
+	recoverErr := c.recoverQuorumLocked()
+	c.recoveryMutex.Unlock()
+	if !errors.Is(awaitErr, errAwaitRaftShutdown) || !errors.Is(recoverErr, errAwaitRaftShutdown) {
+		t.Fatalf("expected both to defer to the queued reset, got await %v, recovery %v", awaitErr, recoverErr)
+	}
+
+	waitUntil(t, 10*time.Second, "the queued reset", func() bool {
+		return c.getInstanceID() == "adopted" && c.hasEmptyConfig()
+	})
+}
+
 // TestReinitFinishesAfterOldRaftExits is the reset half of G2: a reinit that
 // timed out awaiting the old raft must rebuild onto fresh stores, adopting the
 // requested instance ID, once the old raft has exited.

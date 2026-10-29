@@ -1406,13 +1406,11 @@ func (s *Cache) awaitRaftShutdown(rft *raft.Raft, timeout time.Duration) (*raftE
 	exit := s.raftExit
 
 	if exit.redo != nil {
-		select {
-		case <-exit.done:
-		default:
-			// A rebuild is already queued behind this exit: waiting again would
-			// only hold recoveryMutex, and with it every other rebuild.
-			return exit, errAwaitRaftShutdown
-		}
+		// A rebuild is already queued behind this exit: waiting again would
+		// only hold recoveryMutex, and with it every other rebuild. Defer to it
+		// even once the instance has exited: a caller that took recoveryMutex
+		// before the queued rebuild must not replace the instance under it.
+		return exit, errAwaitRaftShutdown
 	}
 
 	timer := time.NewTimer(timeout)
@@ -1475,7 +1473,11 @@ func (s *Cache) rebuildAfterExit(exit *raftExit, redo func() error, replace bool
 		if s.ctx.Err() != nil || s.raft() != exit.rft {
 			return
 		}
-		if err := exit.redo(); err != nil {
+		// Taken off the join first, or the redo's own awaitRaftShutdown would
+		// defer to itself.
+		redo := exit.redo
+		exit.redo = nil
+		if err := redo(); err != nil {
 			s.logger.Error("raft rebuild after the old raft exited failed",
 				"local-id", s.localID, "error", err)
 		}
@@ -1548,10 +1550,11 @@ func (s *Cache) watchQuorumOnRaft(ctx, ctxRaft context.Context, rft *raft.Raft, 
 			return false
 		}
 		if err := s.recoverQuorum(); err != nil {
-			// errNoVotersToRecover is a benign no-op (nothing to drop);
-			// anything else is a genuine failure worth logging. In both cases
-			// raft was not swapped (m6).
-			if !errors.Is(err, errNoVotersToRecover) {
+			// errNoVotersToRecover is a benign no-op (nothing to drop), and
+			// errAwaitRaftShutdown means a rebuild is queued, which
+			// rebuildAfterExit warned about once; anything else is a genuine
+			// failure worth logging. In all cases raft was not swapped (m6).
+			if !errors.Is(err, errNoVotersToRecover) && !errors.Is(err, errAwaitRaftShutdown) {
 				s.logger.Error("quorum recovery failed", "error", err)
 			}
 			return false
@@ -1731,6 +1734,12 @@ func (s *Cache) recoverQuorumLocked() error {
 	rft := s.raft()
 	if rft == nil {
 		return errors.New("raft not set (yet)")
+	}
+	// A rebuild is already queued behind this instance's exit (see
+	// rebuildAfterExit). Return before the warning below, or every watcher
+	// retry logs it again for as long as the old raft takes to exit.
+	if exit := s.raftExit; exit != nil && exit.rft == rft && exit.redo != nil {
+		return errAwaitRaftShutdown
 	}
 
 	cfgFut := rft.GetConfiguration()
