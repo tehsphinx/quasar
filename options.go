@@ -39,8 +39,11 @@ type options struct {
 	bootstrapFallback  time.Duration
 	noLeaderTimeout    time.Duration
 	maxInflightApplies int
-	hclogLogger        hclog.Logger
-	slogLogger         *slog.Logger
+	// awaitRaftShutdownTimeout is defaultAwaitRaftShutdownTimeout; only tests
+	// shorten it.
+	awaitRaftShutdownTimeout time.Duration
+	hclogLogger              hclog.Logger
+	slogLogger               *slog.Logger
 
 	kv     stores.KVStore
 	pStore stores.PersistentStorage
@@ -54,6 +57,8 @@ func getOptions(opts []Option) options {
 		noLeaderTimeout:   defaultNoLeaderTimeout,
 		bootstrapWait:     defaultBootstrapWait,
 		bootstrapFallback: defaultBootstrapFallback,
+
+		awaitRaftShutdownTimeout: defaultAwaitRaftShutdownTimeout,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -256,9 +261,10 @@ func WithBootstrapWait(after time.Duration) Option {
 // the fallback never fires and never forks; the real leader re-adds this node
 // within a ping cycle and the fallback aborts.
 //
-// Only effective when a Discovery is configured and a bootstrap was skipped.
-// Defaults to defaultBootstrapFallback (10s); pass a zero value to disable the
-// fallback and keep the pre-fix behavior (a skipped voter waits indefinitely).
+// Only effective on a voter with a Discovery configured, after a bootstrap was
+// skipped or a history reset left the voter configless (RT-15590). Defaults to
+// defaultBootstrapFallback (10s); pass a zero value to disable the fallback and
+// keep the pre-fix behavior (a configless voter waits indefinitely).
 func WithBootstrapFallbackWait(after time.Duration) Option {
 	return func(o *options) {
 		o.bootstrapFallback = after

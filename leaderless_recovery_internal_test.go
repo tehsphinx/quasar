@@ -209,13 +209,27 @@ type blockingSnapFSM struct {
 
 func (blockingSnapFSM) Snapshot() (raft.FSMSnapshot, error) { return snapFSMSnapshot(nil), nil }
 
-// shortenRaftShutdownBound makes rebuilds give up on a wedged old raft quickly.
-func shortenRaftShutdownBound(t *testing.T) {
+// quickRaftShutdown makes rebuilds give up on a wedged old raft quickly.
+func quickRaftShutdown() Option {
+	return func(o *options) { o.awaitRaftShutdownTimeout = 200 * time.Millisecond }
+}
+
+// newWedgedRecoverableCache is a leader whose FSM is wedged inside ApplyCmd
+// and whose configuration lists a second voter, "ghost", for quorum recovery
+// to drop. The change cannot commit without it, but the latest configuration
+// already lists it.
+func newWedgedRecoverableCache(ctx context.Context, t *testing.T) (*Cache, *blockingFSM) {
 	t.Helper()
 
-	prev := awaitRaftShutdownTimeout
-	awaitRaftShutdownTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { awaitRaftShutdownTimeout = prev })
+	fsm := newBlockingFSM()
+	c := newLeaderCache(ctx, t, blockingSnapFSM{fsm}, quickRaftShutdown())
+	wedgeApply(ctx, t, c, fsm)
+
+	_ = c.raft().AddVoter("ghost", "ghost", 0, 0)
+	waitUntil(t, 5*time.Second, "the ghost voter in the configuration", func() bool {
+		return c.raftHasServer("ghost")
+	})
+	return c, fsm
 }
 
 // TestRecoverQuorumFinishesAfterOldRaftExits is the RT-15590 regression test
@@ -224,20 +238,10 @@ func shortenRaftShutdownBound(t *testing.T) {
 // the watcher's retry needed shouldRecoverQuorum to agree again. The recovery
 // must be finished once the old raft has exited.
 func TestRecoverQuorumFinishesAfterOldRaftExits(t *testing.T) {
-	shortenRaftShutdownBound(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	fsm := newBlockingFSM()
-	c := newLeaderCache(ctx, t, blockingSnapFSM{fsm})
-	wedgeApply(ctx, t, c, fsm)
-
-	// A second voter for recovery to drop. The change cannot commit without
-	// it, but the latest configuration already lists it.
-	_ = c.raft().AddVoter("ghost", "ghost", 0, 0)
-	waitUntil(t, 5*time.Second, "the ghost voter in the configuration", func() bool {
-		return c.raftHasServer("ghost")
-	})
+	c, fsm := newWedgedRecoverableCache(ctx, t)
 
 	old := c.raft()
 	if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
@@ -256,16 +260,88 @@ func TestRecoverQuorumFinishesAfterOldRaftExits(t *testing.T) {
 	})
 }
 
+// TestRecoverQuorumRedoRejoinsLiveLeader: a recovery finished after the old
+// raft exited must not fork a fresh history when a leader formed meanwhile;
+// the two leaders would admit, and hard-reset, each other's members
+// (RT-14149). It rejoins on fresh stores, keeping its instance ID.
+func TestRecoverQuorumRedoRejoinsLiveLeader(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	c, fsm := newWedgedRecoverableCache(ctx, t)
+
+	old, instanceID := c.raft(), c.getInstanceID()
+	if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
+		close(fsm.release)
+		t.Fatalf("expected recovery to time out awaiting the wedged raft, got %v", err)
+	}
+
+	// A peer reports a live leader while the old raft is still exiting.
+	c.discovery.sawLeaderPingAt.Store(time.Now().UnixNano())
+	close(fsm.release)
+
+	waitUntil(t, 10*time.Second, "the rejoin on fresh stores", func() bool {
+		return c.raft() != old && c.hasEmptyConfig()
+	})
+	if got := c.getInstanceID(); got != instanceID {
+		t.Fatalf("expected the instance ID %q kept, got %q", instanceID, got)
+	}
+}
+
+// TestQueuedResetWinsOverRecovery: a reset and a quorum recovery that both
+// timed out on the same old raft must leave the reset queued, whichever came
+// first. The reset's resetID is already marked, so a retry of it would be
+// deduplicated away and the reset lost.
+func TestQueuedResetWinsOverRecovery(t *testing.T) {
+	tests := []struct {
+		name       string
+		resetFirst bool
+	}{
+		{name: "reset after recovery"},
+		{name: "reset before recovery", resetFirst: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			c, fsm := newWedgedRecoverableCache(ctx, t)
+
+			reset := func() {
+				if err := c.ReinitForTest("adopted"); !errors.Is(err, errAwaitRaftShutdown) {
+					close(fsm.release)
+					t.Fatalf("expected the reinit to time out awaiting the wedged raft, got %v", err)
+				}
+			}
+			if tt.resetFirst {
+				reset()
+			}
+			if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
+				close(fsm.release)
+				t.Fatalf("expected recovery to time out awaiting the wedged raft, got %v", err)
+			}
+			if !tt.resetFirst {
+				reset()
+			}
+
+			close(fsm.release)
+
+			waitUntil(t, 10*time.Second, "the queued reset", func() bool {
+				return c.getInstanceID() == "adopted" && c.hasEmptyConfig()
+			})
+		})
+	}
+}
+
 // TestReinitFinishesAfterOldRaftExits is the reset half of G2: a reinit that
 // timed out awaiting the old raft must rebuild onto fresh stores, adopting the
 // requested instance ID, once the old raft has exited.
 func TestReinitFinishesAfterOldRaftExits(t *testing.T) {
-	shortenRaftShutdownBound(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	fsm := newBlockingFSM()
-	c := newLeaderCache(ctx, t, fsm)
+	c := newLeaderCache(ctx, t, fsm, quickRaftShutdown())
 	wedgeApply(ctx, t, c, fsm)
 
 	old := c.raft()
@@ -276,6 +352,17 @@ func TestReinitFinishesAfterOldRaftExits(t *testing.T) {
 	if fsm.resets.Load() != 0 {
 		close(fsm.release)
 		t.Fatal("the FSM was reset before the old raft exited")
+	}
+
+	// A retry behind the queued rebuild must not hold recoveryMutex for
+	// another full wait.
+	start := time.Now()
+	c.recoveryMutex.Lock()
+	_, err := c.awaitRaftShutdown(old, time.Minute)
+	c.recoveryMutex.Unlock()
+	if !errors.Is(err, errAwaitRaftShutdown) || time.Since(start) > time.Second {
+		close(fsm.release)
+		t.Fatalf("expected a retry behind a queued rebuild to return at once, got %v after %s", err, time.Since(start))
 	}
 
 	close(fsm.release)
@@ -290,12 +377,11 @@ func TestReinitFinishesAfterOldRaftExits(t *testing.T) {
 // TestRebuildAfterExitSkipsReplacedRaft: a pending rebuild must not run when
 // another rebuild replaced the raft before the old one exited.
 func TestRebuildAfterExitSkipsReplacedRaft(t *testing.T) {
-	shortenRaftShutdownBound(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	fsm := newBlockingFSM()
-	c := newLeaderCache(ctx, t, fsm)
+	c := newLeaderCache(ctx, t, fsm, quickRaftShutdown())
 	wedgeApply(ctx, t, c, fsm)
 
 	if err := c.ReinitForTest("adopted"); !errors.Is(err, errAwaitRaftShutdown) {
