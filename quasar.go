@@ -346,15 +346,19 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, rft *raft.Raft, after 
 	// keeps pinging, so this loop keeps waiting and never competes with it.
 	window := s.aliveCutoff()
 	waitStart := time.Now()
+	// due reports whether the leader ping went stale past this voter's turn.
+	due := func() bool {
+		turn := time.Duration(s.discovery.lowerFormingVoters(window)) * window
+		return !s.discovery.observedLeaderPing(window+turn) && time.Since(waitStart) >= turn
+	}
 	ticker := time.NewTicker(bootstrapFallbackPoll)
 	defer ticker.Stop()
 	for {
 		if s.raft() != rft || s.hasLeader() || !s.hasEmptyConfig() {
 			return
 		}
-		turn := time.Duration(s.discovery.lowerFormingVoters(window)) * window
-		if !s.discovery.observedLeaderPing(window+turn) && time.Since(waitStart) >= turn {
-			break
+		if due() && s.tryFallbackBootstrap(rft, due, after, window, transport) {
+			return
 		}
 		select {
 		case <-ctx.Done():
@@ -362,13 +366,24 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, rft *raft.Raft, after 
 		case <-ticker.C:
 		}
 	}
+}
 
-	// Rebuilds swap the raft under recoveryMutex: holding it keeps a reset from
-	// landing between the check and the bootstrap.
+// tryFallbackBootstrap is runBootstrapFallback's bootstrap of rft. Rebuilds
+// swap the raft under recoveryMutex: holding it keeps a reset from landing
+// between the check and the bootstrap. Taking it can wait out a rebuild that
+// timed out on rft and left it shut down (the queued rebuild arms the next
+// raft's fallback), and a leader can ping meanwhile, so every check runs
+// again. It reports whether the fallback is done; false keeps it waiting, so
+// a leader that pinged and then went away does not leave the voter wedged.
+func (s *Cache) tryFallbackBootstrap(rft *raft.Raft, due func() bool, after, window time.Duration, transport transports.Transport) bool {
 	s.recoveryMutex.Lock()
 	defer s.recoveryMutex.Unlock()
-	if s.raft() != rft || !s.hasEmptyConfig() {
-		return
+
+	if s.raft() != rft || rft.State() == raft.Shutdown || s.hasLeader() || !s.hasEmptyConfig() {
+		return true
+	}
+	if !due() {
+		return false
 	}
 
 	s.logger.Warn("bootstrap fallback: no configuration, no leader formed and the leader ping went stale; bootstrapping single-voter cluster to break the wedge",
@@ -381,6 +396,7 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, rft *raft.Raft, after 
 	s.bootstrapCluster(rft, raft.Configuration{
 		Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
 	})
+	return true
 }
 
 // hasEmptyConfig reports whether the local raft has no servers in its
@@ -1297,9 +1313,11 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	// Bounded: on expiry nothing below has run yet, and the reinit is redone
 	// once the old raft has exited.
 	if exit, err := s.awaitRaftShutdown(s.raft(), s.cfg.awaitRaftShutdownTimeout); err != nil {
-		s.rebuildAfterExit(exit, func() error {
-			return s.reinitRaftAdoptingInstance(adoptInstanceID, full)
-		}, true)
+		if errors.Is(err, errAwaitRaftShutdown) {
+			s.rebuildAfterExit(exit, func() error {
+				return s.reinitRaftAdoptingInstance(adoptInstanceID, full)
+			}, true)
+		}
 		return fmt.Errorf("shutting down raft for reinit: %w", err)
 	}
 
@@ -1814,17 +1832,23 @@ func (s *Cache) recoverQuorumLocked() error {
 	// the raft that question was about is already shut down (RT-15590). The
 	// peers may have formed a cluster by then, though: forking a fresh history
 	// next to a live leader would have the two leaders admit, and hard-reset,
-	// each other's members (RT-14149), so with a leader pinging the node
-	// rejoins on fresh stores instead.
+	// each other's members (RT-14149), so with a leader pinging since the
+	// recovery was queued the node rejoins on fresh stores instead. Only pings
+	// since then count: a leader ping from before quorum was lost can still sit
+	// inside aliveCutoff when pruneAfter is long, and rejoining on it would wipe
+	// the stores the recovery preserves.
 	if exit, err := s.awaitRaftShutdown(rft, s.cfg.awaitRaftShutdownTimeout); err != nil {
-		s.rebuildAfterExit(exit, func() error {
-			if s.discovery.observedLeaderPing(s.aliveCutoff()) {
-				s.logger.Warn("quorum recovery: a leader formed while the old raft was exiting; rejoining instead of forking",
-					"local-id", s.localID)
-				return s.reinitRaftAdoptingInstance("", false)
-			}
-			return s.recoverQuorumLocked()
-		}, false)
+		if errors.Is(err, errAwaitRaftShutdown) {
+			queuedAt := time.Now()
+			s.rebuildAfterExit(exit, func() error {
+				if s.discovery.observedLeaderPing(time.Since(queuedAt)) {
+					s.logger.Warn("quorum recovery: a leader formed while the old raft was exiting; rejoining instead of forking",
+						"local-id", s.localID)
+					return s.reinitRaftAdoptingInstance("", false)
+				}
+				return s.recoverQuorumLocked()
+			}, false)
+		}
 		return fmt.Errorf("shutting down raft for recovery: %w", err)
 	}
 

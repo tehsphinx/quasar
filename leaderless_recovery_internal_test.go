@@ -201,6 +201,89 @@ func TestBootstrapFallbackIgnoresReplacedRaft(t *testing.T) {
 	}
 }
 
+// newConfiglessVoter is a voter that skipped its bootstrap on a stale
+// established-cluster ping and sits configless, its own startup fallback held
+// off. window is its leader-ping window.
+func newConfiglessVoter(ctx context.Context, t *testing.T, window time.Duration) (*Cache, *syncBuffer) {
+	t.Helper()
+
+	out := &syncBuffer{}
+	disc := &announcingDiscovery{
+		peerID: "stale-peer",
+		status: PeerStatus{NumVotersInConfig: 2},
+	}
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, newSnapFSM(),
+		WithLocalID("voter"),
+		WithTransport(tr),
+		WithDiscovery(disc),
+		WithBootstrapFallbackWait(time.Hour),
+		WithNoLeaderTimeout(window),
+		WithHclogLogger(hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Warn})),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+	return c, out
+}
+
+// TestBootstrapFallbackRechecksUnderLock: the fallback takes recoveryMutex
+// before it bootstraps, which can mean waiting out a rebuild. A leader that
+// pinged meanwhile must hold the bootstrap off without ending the fallback,
+// and a raft shut down meanwhile must be neither bootstrapped nor given a
+// fresh instance ID.
+func TestBootstrapFallbackRechecksUnderLock(t *testing.T) {
+	const window = time.Second
+
+	t.Run("a leader pinged meanwhile", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		c, out := newConfiglessVoter(ctx, t, window)
+
+		c.recoveryMutex.Lock()
+		go c.runBootstrapFallback(ctx, c.raft(), 0, c.transport)
+		time.Sleep(200 * time.Millisecond) // the fallback is due and waits for the lock
+		c.discovery.sawLeaderPingAt.Store(time.Now().UnixNano())
+		c.recoveryMutex.Unlock()
+
+		time.Sleep(window / 2)
+		if !c.hasEmptyConfig() || strings.Contains(out.String(), "bootstrap fallback") {
+			t.Fatalf("the fallback bootstrapped despite a fresh leader ping:\n%s", out.String())
+		}
+		// Once that ping is stale, the fallback, still armed, breaks the wedge.
+		waitUntil(t, 5*time.Second, "the fallback bootstrap", c.IsLeader)
+	})
+
+	t.Run("the raft shut down meanwhile", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		c, out := newConfiglessVoter(ctx, t, window)
+		rft, instanceID := c.raft(), c.getInstanceID()
+
+		c.recoveryMutex.Lock()
+		done := make(chan struct{})
+		go func() {
+			c.runBootstrapFallback(ctx, rft, 0, c.transport)
+			close(done)
+		}()
+		time.Sleep(200 * time.Millisecond) // the fallback is due and waits for the lock
+		_ = rft.Shutdown().Error()
+		c.recoveryMutex.Unlock()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the fallback kept waiting on a shut-down raft")
+		}
+		if got := c.getInstanceID(); got != instanceID || strings.Contains(out.String(), "bootstrap fallback") {
+			t.Fatalf("the fallback bootstrapped a shut-down raft (instance ID %q, now %q):\n%s", instanceID, got, out.String())
+		}
+	})
+}
+
 // blockingSnapFSM is a blockingFSM that can snapshot, which
 // raft.RecoverCluster needs.
 type blockingSnapFSM struct {
@@ -286,6 +369,30 @@ func TestRecoverQuorumRedoRejoinsLiveLeader(t *testing.T) {
 	if got := c.getInstanceID(); got != instanceID {
 		t.Fatalf("expected the instance ID %q kept, got %q", instanceID, got)
 	}
+}
+
+// TestRecoverQuorumRedoIgnoresEarlierLeaderPing: only a leader ping since the
+// recovery was queued means a leader formed meanwhile. One from before it,
+// still inside aliveCutoff (8s here), must not turn the recovery into a rejoin
+// that wipes the stores the recovery preserves.
+func TestRecoverQuorumRedoIgnoresEarlierLeaderPing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	c, fsm := newWedgedRecoverableCache(ctx, t)
+
+	// The last leader ping before quorum was lost.
+	c.discovery.sawLeaderPingAt.Store(time.Now().UnixNano())
+	old := c.raft()
+	if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
+		close(fsm.release)
+		t.Fatalf("expected recovery to time out awaiting the wedged raft, got %v", err)
+	}
+	close(fsm.release)
+
+	waitUntil(t, 10*time.Second, "the recovered single-voter leader", func() bool {
+		return c.raft() != old && c.IsLeader() && !c.raftHasServer("ghost")
+	})
 }
 
 // TestQueuedResetWinsOverRecovery: a reset and a quorum recovery that both
