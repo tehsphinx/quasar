@@ -1421,6 +1421,12 @@ const (
 // giving up would leave the node inert — every raft call returns
 // ErrRaftShutdown and nothing else replaces the raft (m5, RT-15590). Every
 // failed attempt is logged about as loudly as a library can manage.
+//
+// A rebuild that can never succeed, such as a recovery whose FSM rejects its
+// own snapshot, holds the node and recoveryMutex until the process restarts,
+// and a hard reset queues behind it. That is deliberate: the only way out
+// would be a rebuild on fresh stores, and on the recovery path this node may
+// hold the only copy of the data.
 func (s *Cache) rebuildRaft(prepare func() error) (*raft.Raft, error) {
 	backoff := rebuildRaftBackoff
 	for attempt := 1; ; attempt++ {
@@ -1807,7 +1813,8 @@ func (s *Cache) recoverQuorum() error {
 	// retried from the snapshot check on until the recovered raft runs (see
 	// rebuildRaft). Repeating RecoverCluster is safe: a snapshot an earlier
 	// attempt wrote replaces the FSM on restore, and the log replayed after it
-	// is the same.
+	// is the same. A snapshot whose Persist failed never replaces the previous
+	// one (see snapshotStore.Create).
 	conf := raftConfig(s.cfg)
 	rftNew, err := s.rebuildRaft(func() error {
 		if snaps, err := s.snapshotStore.List(); err != nil {

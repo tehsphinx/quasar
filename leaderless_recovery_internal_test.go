@@ -3,6 +3,7 @@ package quasar
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -655,6 +656,78 @@ func TestRecoveryRetriedUntilTheRaftRuns(t *testing.T) {
 	defer cancelLead()
 	if !eventually(ctxLead, func() bool { return c.IsLeader() && !c.raftHasServer("ghost") }) {
 		t.Fatal("expected a recovered single-voter leader")
+	}
+}
+
+// failPersistOnceFSM is a snapFSM whose next snapshot, once fail is set,
+// writes half its data and then fails, like a write-through FSM losing its
+// backend mid-Persist.
+type failPersistOnceFSM struct {
+	*snapFSM
+	fail atomic.Bool
+}
+
+func (f *failPersistOnceFSM) Snapshot() (raft.FSMSnapshot, error) {
+	snap, err := f.snapFSM.Snapshot()
+	if err != nil || !f.fail.CompareAndSwap(true, false) {
+		return snap, err
+	}
+	return halfSnapshot(snap.(snapFSMSnapshot)), nil
+}
+
+type halfSnapshot []byte
+
+func (h halfSnapshot) Persist(sink raft.SnapshotSink) error {
+	_, _ = sink.Write(h[:len(h)/2])
+	_ = sink.Cancel()
+	return errors.New("backend unavailable")
+}
+
+func (halfSnapshot) Release() {}
+
+// TestRecoveryRetryAfterAFailedPersist: the in-memory snapshot store made a
+// snapshot its latest before Persist ran, so a Persist that failed inside
+// RecoverCluster left a truncated snapshot as the only one. The retry restored
+// it (RT-15590): this FSM rejected it on every attempt, which held
+// recoveryMutex for good, and one that reads records until EOF kept a prefix.
+// The retry must recover the full state.
+func TestRecoveryRetryAfterAFailedPersist(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	fsm := &failPersistOnceFSM{snapFSM: newSnapFSM()}
+	c := newLeaderCache(ctx, t, fsm)
+	for i := range 10 {
+		if _, err := c.store(ctx, fmt.Sprintf("key-%d", i), []byte(fmt.Sprintf("value-%d", i))); err != nil {
+			t.Fatalf("store: %v", err)
+		}
+	}
+	addGhostVoter(ctx, t, c)
+	fsm.fail.Store(true)
+
+	done := make(chan error, 1)
+	go func() { done <- c.recoverQuorum() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("recoverQuorum: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("recovery kept retrying on the snapshot whose Persist failed")
+	}
+	if fsm.fail.Load() {
+		t.Fatal("precondition: the failing Persist never ran")
+	}
+
+	ctxLead, cancelLead := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelLead()
+	if !eventually(ctxLead, c.IsLeader) {
+		t.Fatal("expected a recovered single-voter leader")
+	}
+	fsm.mu.Lock()
+	defer fsm.mu.Unlock()
+	if got := len(fsm.data); got != 10 {
+		t.Fatalf("expected the recovered FSM to hold all 10 entries, got %d", got)
 	}
 }
 
