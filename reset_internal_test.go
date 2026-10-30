@@ -106,7 +106,9 @@ func TestLocalHardResetSerializesWithRecovery(t *testing.T) {
 // test. After reinitRaftAdoptingInstance wipes the FSM and shuts the old raft
 // down, a failing rebuild used to return immediately, leaving the node inert
 // with no retry and no prominent log. rebuildRaft must retry a bounded number
-// of times and log loudly before giving up.
+// of times and log loudly before giving up. The node must not stay inert
+// either: once the old raft has exited, restartRaft builds it a new raft
+// (RT-15590), and the failed reset stays unrecorded so its retry applies it.
 func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -130,23 +132,38 @@ func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
 		t.Fatal("lone nonvoter unexpectedly reports IsLeader() == true")
 	}
 
+	// The reset's rebuild fails every attempt; the restart after it succeeds.
 	var calls atomic.Int32
 	wantErr := errors.New("rebuild boom")
-	c.newRaftFn = func(options, raft.FSM, raft.LogStore, raft.StableStore,
-		raft.SnapshotStore, transports.Transport,
+	c.newRaftFn = func(cfg options, fsm raft.FSM, logs raft.LogStore, stable raft.StableStore,
+		snaps raft.SnapshotStore, tr transports.Transport,
 	) (*raft.Raft, error) {
-		calls.Add(1)
-		return nil, wantErr
+		if calls.Add(1) <= rebuildRaftAttempts {
+			return nil, wantErr
+		}
+		return newRaft(cfg, fsm, logs, stable, snaps, tr)
 	}
 
+	old := c.raft()
 	if err := c.localHardReset("reset-1", "", false); !errors.Is(err, wantErr) {
 		t.Fatalf("expected the rebuild error to propagate, got %v", err)
 	}
-	if got := calls.Load(); got != rebuildRaftAttempts {
-		t.Fatalf("expected %d rebuild attempts, got %d", rebuildRaftAttempts, got)
+	// Each failed attempt logs before the error propagates; the restart's
+	// attempt does not fail.
+	if got := strings.Count(out.String(), "node is inert"); got != rebuildRaftAttempts {
+		t.Fatalf("expected %d loud rebuild-failure logs, got %d:\n%s", rebuildRaftAttempts, got, out.String())
 	}
-	if !strings.Contains(out.String(), "node is inert") {
-		t.Fatalf("expected a loud rebuild-failure log, got:\n%s", out.String())
+	if got := c.getLastResetID(); got == "reset-1" {
+		t.Fatal("a reset that failed was recorded; its retry would be deduplicated away")
+	}
+
+	ctxWait, cancelWait := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelWait()
+	if !eventually(ctxWait, func() bool {
+		rft := c.raft()
+		return rft != old && rft.State() != raft.Shutdown
+	}) {
+		t.Fatal("the node stayed on the shut-down raft")
 	}
 }
 
@@ -332,28 +349,36 @@ func TestAwaitRaftShutdownTimesOutOnWedgedFSM(t *testing.T) {
 
 	fsm := newBlockingFSM()
 	c := newLeaderCache(ctx, t, fsm)
-	wedgeApply(ctx, t, c, fsm)
+	release := wedgeApply(ctx, t, c, fsm)
 
 	rft := c.raft()
-	if _, err := c.awaitRaftShutdown(rft, 200*time.Millisecond); !errors.Is(err, errAwaitRaftShutdown) {
-		close(fsm.release)
+	c.recoveryMutex.Lock()
+	defer c.recoveryMutex.Unlock()
+
+	if err := c.awaitRaftShutdown(rft, 200*time.Millisecond); !errors.Is(err, errAwaitRaftShutdown) {
 		t.Fatalf("expected the join to be bounded, got %v", err)
 	}
-	if _, err := c.awaitRaftShutdown(rft, 200*time.Millisecond); !errors.Is(err, errAwaitRaftShutdown) {
-		close(fsm.release)
+	if err := c.awaitRaftShutdown(rft, 200*time.Millisecond); !errors.Is(err, errAwaitRaftShutdown) {
 		t.Fatalf("expected a retry to wait for the same exit, got %v", err)
 	}
 
-	close(fsm.release)
-	if _, err := c.awaitRaftShutdown(rft, 5*time.Second); err != nil {
+	release()
+	if err := c.awaitRaftShutdown(rft, 5*time.Second); err != nil {
 		t.Fatalf("expected the join to complete once the FSM returned, got %v", err)
 	}
 }
 
 // wedgeApply parks the raft's FSM goroutine inside a blockingFSM.ApplyCmd, so
-// shutting that raft down cannot complete until fsm.release is closed.
-func wedgeApply(ctx context.Context, t *testing.T, c *Cache, fsm *blockingFSM) {
+// shutting that raft down cannot complete until the returned release runs.
+// Cleanup releases it too, ahead of the cache's Shutdown, which would
+// otherwise wait on the parked FSM goroutine forever when the test fails
+// early. Call it after newLeaderCache: cleanups run last-registered first.
+func wedgeApply(ctx context.Context, t *testing.T, c *Cache, fsm *blockingFSM) (release func()) {
 	t.Helper()
+
+	var once sync.Once
+	release = func() { once.Do(func() { close(fsm.release) }) }
+	t.Cleanup(release)
 
 	go func() { _, _ = c.store(ctx, "wedge", []byte("me")) }()
 	select {
@@ -361,6 +386,7 @@ func wedgeApply(ctx context.Context, t *testing.T, c *Cache, fsm *blockingFSM) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("FSM.ApplyCmd never ran")
 	}
+	return release
 }
 
 // resetFailFSM fails every Reset, i.e. the FSM clear a hard reset performs

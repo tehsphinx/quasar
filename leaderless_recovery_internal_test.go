@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,12 +13,14 @@ import (
 	"github.com/tehsphinx/quasar/transports"
 )
 
-// pingingDiscovery keeps announcing one peer with a fixed status, the way a
-// live peer's discovery pings keep arriving.
+// pingingDiscovery keeps announcing one peer, the way a live peer's discovery
+// pings keep arriving. It pings with the status last set (none while nil), or
+// without any status when plain is set.
 type pingingDiscovery struct {
 	inj    *DiscoveryInjector
 	peer   raft.Server
-	status PeerStatus
+	plain  bool
+	status atomic.Pointer[PeerStatus]
 }
 
 func (d *pingingDiscovery) Inject(inj *DiscoveryInjector) { d.inj = inj }
@@ -27,7 +30,11 @@ func (d *pingingDiscovery) Run(ctx context.Context) error {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			d.inj.ProcessServerWithStatus(d.peer, d.status)
+			if d.plain {
+				d.inj.ProcessServer(d.peer)
+			} else if status := d.status.Load(); status != nil {
+				d.inj.ProcessServerWithStatus(d.peer, *status)
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -38,46 +45,44 @@ func (d *pingingDiscovery) Run(ctx context.Context) error {
 	return nil
 }
 
-// waitUntil polls cond until it holds or the timeout expires.
-func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() bool) {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %s waiting for %s", timeout, what)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// TestLowerFormingVoters is the RT-15590 unit test of the fallback's rank:
-// only alive voter peers with a lower ID whose last ping put them outside an
-// established cluster count.
-func TestLowerFormingVoters(t *testing.T) {
-	d := newDiscoveryInjector(&Cache{localID: "sitec"})
-	voter := func(id string) raft.Server {
-		return raft.Server{ID: raft.ServerID(id), Address: raft.ServerAddress(id), Suffrage: raft.Voter}
+// TestVoterAhead is the RT-15590 unit test of the fallback's order: an alive
+// voter peer outside an established cluster goes first when it has a lower ID
+// or has already bootstrapped.
+func TestVoterAhead(t *testing.T) {
+	voter := func(id raft.ServerID) raft.Server {
+		return raft.Server{ID: id, Address: raft.ServerAddress(id), Suffrage: raft.Voter}
 	}
 
-	d.setServerWithStatus(voter("sitea"), PeerStatus{})                                      // configless: counts
-	d.setServerWithStatus(voter("site1"), PeerStatus{NumVotersInConfig: 1})                  // bootstrapped, not elected: counts
-	d.setServerWithStatus(voter("siteb"), PeerStatus{NumVotersInConfig: 2})                  // established
-	d.setServerWithStatus(voter("site0"), PeerStatus{HasLeader: true})                       // follows a leader
-	d.setServerWithStatus(voter("sited"), PeerStatus{})                                      // higher ID
-	d.setServerWithStatus(raft.Server{ID: "fserver", Suffrage: raft.Nonvoter}, PeerStatus{}) // nonvoter
-	d.setServerWithStatus(voter("site-gone"), PeerStatus{})                                  // stale
-	d.lastSeen["site-gone"] = time.Now().Add(-time.Minute)
-
-	if got := d.lowerFormingVoters(time.Second); got != 2 {
-		t.Fatalf("expected 2 lower forming voters, got %d", got)
+	tests := []struct {
+		name   string
+		peer   raft.Server
+		status PeerStatus
+		stale  bool
+		ahead  bool
+	}{
+		{name: "lower ID, configless", peer: voter("sitea"), ahead: true},
+		{name: "lower ID, bootstrapped", peer: voter("sitea"), status: PeerStatus{NumVotersInConfig: 1}, ahead: true},
+		{name: "higher ID, bootstrapped", peer: voter("sited"), status: PeerStatus{NumVotersInConfig: 1}, ahead: true},
+		{name: "higher ID, configless", peer: voter("sited")},
+		{name: "lower ID, multi-voter configuration", peer: voter("sitea"), status: PeerStatus{NumVotersInConfig: 2}},
+		{name: "lower ID, following a leader", peer: voter("sitea"), status: PeerStatus{HasLeader: true}},
+		{name: "lower ID, leading", peer: voter("sitea"), status: PeerStatus{HasLeader: true, NumVotersInConfig: 1}},
+		{name: "lower ID, stale", peer: voter("sitea"), stale: true},
+		{name: "lower ID, nonvoter", peer: raft.Server{ID: "fserver", Suffrage: raft.Nonvoter}},
+		{name: "self, bootstrapped", peer: voter("sitec"), status: PeerStatus{NumVotersInConfig: 1}},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newDiscoveryInjector(&Cache{localID: "sitec"})
+			d.setServerWithStatus(tt.peer, tt.status)
+			if tt.stale {
+				d.lastSeen[tt.peer.ID] = time.Now().Add(-time.Minute)
+			}
 
-	// Both have since elected themselves: they no longer count.
-	d.setServerWithStatus(voter("sitea"), PeerStatus{HasLeader: true, NumVotersInConfig: 1})
-	d.setServerWithStatus(voter("site1"), PeerStatus{HasLeader: true, NumVotersInConfig: 1})
-	if got := d.lowerFormingVoters(time.Second); got != 0 {
-		t.Fatalf("expected 0 lower forming voters once both lead, got %d", got)
+			if got := d.voterAhead(time.Second); got != tt.ahead {
+				t.Fatalf("expected voterAhead %v, got %v", tt.ahead, got)
+			}
+		})
 	}
 }
 
@@ -85,43 +90,50 @@ func TestLowerFormingVoters(t *testing.T) {
 // voter whose raft was rebuilt by a history reset has an empty configuration
 // and cannot campaign. Pre-fix nothing ever bootstrapped it again (Sites A and
 // B logged "no known peers, aborting election" for 38 minutes); the reset must
-// arm the bootstrap fallback, which waits one extra window behind a lower-ID
-// voter that is configless too, and not behind one in an established cluster.
+// arm the bootstrap fallback. The fallback holds off for as long as a
+// lower-ID voter pings configless too, and is not armed at all for a
+// discovery that never reports status: it could not tell a live leader.
 func TestBootstrapFallbackAfterReset(t *testing.T) {
-	// Wide enough that a single-voter election after the bootstrap (raft's
-	// heartbeat timeout, 1-2s here) fits under it: one extra window or none
-	// must stay tellable apart.
-	const window = 4 * time.Second
+	const window = time.Second
+
+	voter := func(id raft.ServerID) raft.Server {
+		return raft.Server{ID: id, Address: raft.ServerAddress(id), Suffrage: raft.Voter}
+	}
 
 	tests := []struct {
 		name       string
+		peer       raft.Server
+		plain      bool
 		peerStatus PeerStatus
-		minWait    time.Duration
-		maxWait    time.Duration
+		// heldOff is whether the fallback must wait while the peer pings.
+		heldOff bool
 	}{
 		{
 			name:       "behind a configless lower-ID voter",
+			peer:       voter("sitea"),
 			peerStatus: PeerStatus{InstanceID: "hist-a"},
-			minWait:    window,
-			maxWait:    window + 3*time.Second,
+			heldOff:    true,
 		},
 		{
-			name:       "not behind a configured lower-ID voter",
+			name:       "not behind a lower-ID voter in an established cluster",
+			peer:       voter("sitea"),
 			peerStatus: PeerStatus{NumVotersInConfig: 2, InstanceID: "hist-a"},
-			minWait:    0,
-			maxWait:    window - time.Second,
+		},
+		{
+			// A higher ID, so only the missing status holds the fallback off.
+			name:    "discovery without status",
+			peer:    voter("sited"),
+			plain:   true,
+			heldOff: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
 			out := &syncBuffer{}
-			disc := &pingingDiscovery{
-				peer:   raft.Server{ID: "sitea", Address: "sitea", Suffrage: raft.Voter},
-				status: tt.peerStatus,
-			}
+			disc := &pingingDiscovery{peer: tt.peer, plain: tt.plain}
 			_, tr := transports.NewInmemTransport("")
 			c, err := NewCache(ctx, newSnapFSM(),
 				WithLocalID("siteb"),
@@ -140,7 +152,17 @@ func TestBootstrapFallbackAfterReset(t *testing.T) {
 				t.Fatalf("WaitReady: %v", err)
 			}
 
-			start := time.Now()
+			if !tt.plain {
+				// sitea was in an established cluster before it was reset.
+				disc.status.Store(&PeerStatus{NumVotersInConfig: 2})
+				select {
+				case <-c.discovery.PeerInCluster():
+				case <-ctx.Done():
+					t.Fatal("the established-cluster ping never arrived")
+				}
+				disc.status.Store(&tt.peerStatus)
+			}
+
 			if err := c.ReinitForTest("hist-c"); err != nil {
 				t.Fatalf("reinit: %v", err)
 			}
@@ -148,10 +170,24 @@ func TestBootstrapFallbackAfterReset(t *testing.T) {
 				t.Fatal("expected an empty configuration right after the reset")
 			}
 
-			waitUntil(t, tt.maxWait+time.Second, "the reset voter to lead again", c.IsLeader)
-			elapsed := time.Since(start)
-			if elapsed < tt.minWait || elapsed > tt.maxWait {
-				t.Fatalf("expected leadership between %s and %s after the reset, got %s", tt.minWait, tt.maxWait, elapsed)
+			if tt.heldOff {
+				ctxHold, cancelHold := context.WithTimeout(ctx, 3*window)
+				defer cancelHold()
+				if eventually(ctxHold, func() bool { return !c.hasEmptyConfig() }) {
+					t.Fatalf("the fallback bootstrapped while it had to hold off:\n%s", out.String())
+				}
+				if tt.plain {
+					return
+				}
+				// sitea goes away without bootstrapping: once its pings age
+				// out, nobody is ahead any more.
+				disc.status.Store(nil)
+			}
+
+			ctxLead, cancelLead := context.WithTimeout(ctx, window+5*time.Second)
+			defer cancelLead()
+			if !eventually(ctxLead, c.IsLeader) {
+				t.Fatalf("the reset voter never led again:\n%s", out.String())
 			}
 			if !strings.Contains(out.String(), "bootstrap fallback") {
 				t.Fatalf("expected a bootstrap-fallback log, got:\n%s", out.String())
@@ -253,7 +289,11 @@ func TestBootstrapFallbackRechecksUnderLock(t *testing.T) {
 			t.Fatalf("the fallback bootstrapped despite a fresh leader ping:\n%s", out.String())
 		}
 		// Once that ping is stale, the fallback, still armed, breaks the wedge.
-		waitUntil(t, 5*time.Second, "the fallback bootstrap", c.IsLeader)
+		ctxLead, cancelLead := context.WithTimeout(ctx, 5*time.Second)
+		defer cancelLead()
+		if !eventually(ctxLead, c.IsLeader) {
+			t.Fatalf("the fallback never bootstrapped:\n%s", out.String())
+		}
 	})
 
 	t.Run("the raft shut down meanwhile", func(t *testing.T) {
@@ -284,6 +324,54 @@ func TestBootstrapFallbackRechecksUnderLock(t *testing.T) {
 	})
 }
 
+// TestBootstrapFallbackOutlivesALeaderThatWentAway: raft learns a leader from
+// its first AppendEntries, before any configuration arrives, and that RPC also
+// raises its term, after which raft refuses to bootstrap it. A leader that
+// reached a configless voter and went away must neither end the fallback nor
+// leave the voter unable to bootstrap (RT-15590).
+func TestBootstrapFallbackOutlivesALeaderThatWentAway(t *testing.T) {
+	const window = time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	c, out := newConfiglessVoter(ctx, t, window)
+	voterTr, ok := c.transport.(*transports.InmemTransport)
+	if !ok {
+		t.Fatalf("unexpected transport %T", c.transport)
+	}
+
+	// One AppendEntries from a leader the voter has no log in common with:
+	// rejected, but the leader and its term are taken.
+	leaderAddr, leaderTr := transports.NewInmemTransport("")
+	leaderTr.Connect(voterTr.LocalAddr(), voterTr)
+	req := &raft.AppendEntriesRequest{
+		RPCHeader: raft.RPCHeader{
+			ProtocolVersion: raft.ProtocolVersionMax,
+			ID:              []byte("gone-leader"),
+			Addr:            leaderTr.EncodePeer("gone-leader", leaderAddr),
+		},
+		Term:         7,
+		PrevLogEntry: 5,
+		PrevLogTerm:  7,
+	}
+	var resp raft.AppendEntriesResponse
+	if err := leaderTr.AppendEntries("voter", voterTr.LocalAddr(), req, &resp); err != nil {
+		t.Fatalf("AppendEntries: %v", err)
+	}
+	if !c.hasLeader() || !c.hasEmptyConfig() {
+		t.Fatal("precondition: expected a known leader and an empty configuration")
+	}
+
+	go c.runBootstrapFallback(ctx, c.raft(), 0, c.transport)
+
+	ctxLead, cancelLead := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelLead()
+	if !eventually(ctxLead, c.IsLeader) {
+		t.Fatalf("the voter never bootstrapped after the leader went away:\n%s", out.String())
+	}
+}
+
 // blockingSnapFSM is a blockingFSM that can snapshot, which
 // raft.RecoverCluster needs.
 type blockingSnapFSM struct {
@@ -297,234 +385,130 @@ func quickRaftShutdown() Option {
 	return func(o *options) { o.awaitRaftShutdownTimeout = 200 * time.Millisecond }
 }
 
-// newWedgedRecoverableCache is a leader whose FSM is wedged inside ApplyCmd
-// and whose configuration lists a second voter, "ghost", for quorum recovery
-// to drop. The change cannot commit without it, but the latest configuration
-// already lists it.
-func newWedgedRecoverableCache(ctx context.Context, t *testing.T) (*Cache, *blockingFSM) {
+// newWedgedRecoverableCache is a node whose FSM is wedged inside ApplyCmd and
+// whose configuration lists a second voter, "ghost", for quorum recovery to
+// drop. The change cannot commit without it, but the latest configuration
+// already lists it, and the node, unable to reach it, steps down.
+func newWedgedRecoverableCache(ctx context.Context, t *testing.T) (*Cache, *blockingFSM, func()) {
 	t.Helper()
 
 	fsm := newBlockingFSM()
 	c := newLeaderCache(ctx, t, blockingSnapFSM{fsm}, quickRaftShutdown())
-	wedgeApply(ctx, t, c, fsm)
+	release := wedgeApply(ctx, t, c, fsm)
 
 	_ = c.raft().AddVoter("ghost", "ghost", 0, 0)
-	waitUntil(t, 5*time.Second, "the ghost voter in the configuration", func() bool {
-		return c.raftHasServer("ghost")
-	})
-	return c, fsm
+	ctxWait, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if !eventually(ctxWait, func() bool { return c.raftHasServer("ghost") && !c.IsLeader() }) {
+		t.Fatal("expected the ghost voter in the configuration and the node stepped down")
+	}
+	return c, fsm, release
 }
 
-// TestRecoverQuorumFinishesAfterOldRaftExits is the RT-15590 regression test
-// for G2 on Site C: quorum recovery timed out awaiting the old raft, which was
-// already shut down, and the node sat on the dead raft for 32 minutes because
-// the watcher's retry needed shouldRecoverQuorum to agree again. The recovery
-// must be finished once the old raft has exited.
-func TestRecoverQuorumFinishesAfterOldRaftExits(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+// awaitRestart waits until the raft old was replaced by a live one.
+func awaitRestart(ctx context.Context, t *testing.T, c *Cache, old *raft.Raft) {
+	t.Helper()
+
+	ctxWait, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-
-	c, fsm := newWedgedRecoverableCache(ctx, t)
-
-	old := c.raft()
-	if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
-		close(fsm.release)
-		t.Fatalf("expected recovery to time out awaiting the wedged raft, got %v", err)
+	if !eventually(ctxWait, func() bool {
+		rft := c.raft()
+		return rft != old && rft.State() != raft.Shutdown
+	}) {
+		t.Fatal("the node stayed on the shut-down raft")
 	}
-	if old.State() != raft.Shutdown {
-		close(fsm.release)
-		t.Fatalf("expected the old raft shut down, it is %v", old.State())
-	}
-
-	close(fsm.release)
-
-	waitUntil(t, 10*time.Second, "the recovered single-voter leader", func() bool {
-		return c.raft() != old && c.IsLeader() && !c.raftHasServer("ghost")
-	})
 }
 
-// TestRecoverQuorumRedoRejoinsLiveLeader: a recovery finished after the old
-// raft exited must not fork a fresh history when a leader formed meanwhile;
-// the two leaders would admit, and hard-reset, each other's members
-// (RT-14149). It rejoins on fresh stores, keeping its instance ID.
-func TestRecoverQuorumRedoRejoinsLiveLeader(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+// TestRecoveryTimeoutRestartsRaft is the RT-15590 regression test for G2 on
+// Site C: quorum recovery timed out awaiting the old raft, which was already
+// shut down, and the node sat on the dead raft for 32 minutes because the
+// watcher's retry needed shouldRecoverQuorum to agree again. Once the old raft
+// has exited the node must run a live raft on its untouched stores, on which
+// recovery can be decided again.
+func TestRecoveryTimeoutRestartsRaft(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	c, fsm := newWedgedRecoverableCache(ctx, t)
+	c, _, release := newWedgedRecoverableCache(ctx, t)
 
 	old, instanceID := c.raft(), c.getInstanceID()
 	if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
-		close(fsm.release)
 		t.Fatalf("expected recovery to time out awaiting the wedged raft, got %v", err)
 	}
+	if old.State() != raft.Shutdown {
+		t.Fatalf("expected the old raft shut down, it is %v", old.State())
+	}
 
-	// A peer reports a live leader while the old raft is still exiting.
-	c.discovery.sawLeaderPingAt.Store(time.Now().UnixNano())
-	close(fsm.release)
-
-	waitUntil(t, 10*time.Second, "the rejoin on fresh stores", func() bool {
-		return c.raft() != old && c.hasEmptyConfig()
-	})
+	release()
+	awaitRestart(ctx, t, c, old)
+	if !c.raftHasServer("ghost") {
+		t.Fatal("the restart lost the configuration the recovery had not changed")
+	}
 	if got := c.getInstanceID(); got != instanceID {
-		t.Fatalf("expected the instance ID %q kept, got %q", instanceID, got)
+		t.Fatalf("the restart changed the instance ID from %q to %q", instanceID, got)
+	}
+
+	if err := c.recoverQuorum(); err != nil {
+		t.Fatalf("recovery on the restarted raft: %v", err)
+	}
+	ctxLead, cancelLead := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelLead()
+	if !eventually(ctxLead, func() bool { return c.IsLeader() && !c.raftHasServer("ghost") }) {
+		t.Fatal("expected a recovered single-voter leader")
 	}
 }
 
-// TestRecoverQuorumRedoIgnoresEarlierLeaderPing: only a leader ping since the
-// recovery was queued means a leader formed meanwhile. One from before it,
-// still inside aliveCutoff (8s here), must not turn the recovery into a rejoin
-// that wipes the stores the recovery preserves.
-func TestRecoverQuorumRedoIgnoresEarlierLeaderPing(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+// TestHardResetRetryAppliesAfterTimeout is the reset half of G2: a hard reset
+// that timed out awaiting the old raft must leave the node on its old history
+// and must not be recorded, so the initiator's retry, once the old raft has
+// exited, applies it. Recorded, the retry was deduplicated away and the leader
+// went on to add a node that never reset.
+func TestHardResetRetryAppliesAfterTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	c, fsm := newWedgedRecoverableCache(ctx, t)
+	c, fsm, release := newWedgedRecoverableCache(ctx, t)
 
-	// The last leader ping before quorum was lost.
-	c.discovery.sawLeaderPingAt.Store(time.Now().UnixNano())
-	old := c.raft()
-	if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
-		close(fsm.release)
-		t.Fatalf("expected recovery to time out awaiting the wedged raft, got %v", err)
+	old, instanceID := c.raft(), c.getInstanceID()
+	if err := c.localHardReset("reset-1", "initiator-hist", false); !errors.Is(err, errAwaitRaftShutdown) {
+		t.Fatalf("expected the reset to time out awaiting the wedged raft, got %v", err)
 	}
-	close(fsm.release)
-
-	waitUntil(t, 10*time.Second, "the recovered single-voter leader", func() bool {
-		return c.raft() != old && c.IsLeader() && !c.raftHasServer("ghost")
-	})
-}
-
-// TestQueuedResetWinsOverRecovery: a reset and a quorum recovery that both
-// timed out on the same old raft must leave the reset queued, whichever came
-// first. The reset's resetID is already marked, so a retry of it would be
-// deduplicated away and the reset lost.
-func TestQueuedResetWinsOverRecovery(t *testing.T) {
-	tests := []struct {
-		name       string
-		resetFirst bool
-	}{
-		{name: "reset after recovery"},
-		{name: "reset before recovery", resetFirst: true},
+	if got := c.getLastResetID(); got == "reset-1" {
+		t.Fatal("the reset was recorded although it was not applied")
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
+	if got := c.getInstanceID(); got != instanceID || fsm.resets.Load() != 0 {
+		t.Fatalf("the reset changed the node before the old raft exited (instance ID %q, FSM resets %d)", got, fsm.resets.Load())
+	}
 
-			c, fsm := newWedgedRecoverableCache(ctx, t)
+	release()
+	awaitRestart(ctx, t, c, old)
+	if got := c.getInstanceID(); got != instanceID {
+		t.Fatalf("the restart changed the instance ID from %q to %q", instanceID, got)
+	}
 
-			reset := func() {
-				if err := c.ReinitForTest("adopted"); !errors.Is(err, errAwaitRaftShutdown) {
-					close(fsm.release)
-					t.Fatalf("expected the reinit to time out awaiting the wedged raft, got %v", err)
-				}
-			}
-			if tt.resetFirst {
-				reset()
-			}
-			if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
-				close(fsm.release)
-				t.Fatalf("expected recovery to time out awaiting the wedged raft, got %v", err)
-			}
-			if !tt.resetFirst {
-				reset()
-			}
-
-			close(fsm.release)
-
-			waitUntil(t, 10*time.Second, "the queued reset", func() bool {
-				return c.getInstanceID() == "adopted" && c.hasEmptyConfig()
-			})
-		})
+	if err := c.localHardReset("reset-1", "initiator-hist", false); err != nil {
+		t.Fatalf("retried reset: %v", err)
+	}
+	if got := c.getInstanceID(); got != "initiator-hist" || fsm.resets.Load() != 1 || !c.hasEmptyConfig() {
+		t.Fatalf("expected the retry applied (instance ID %q, FSM resets %d, empty configuration %v)",
+			got, fsm.resets.Load(), c.hasEmptyConfig())
+	}
+	if got := c.getLastResetID(); got != "reset-1" {
+		t.Fatalf("expected the applied reset recorded, got %q", got)
 	}
 }
 
-// TestQueuedRebuildWinsOverCallerAfterExit: a rebuild that takes
-// recoveryMutex after the old raft exited, ahead of the queued one, must defer
-// to it. The quorum watcher's retry is such a caller: run in its place, it
-// forked a fresh history and the queued reset was dropped as replaced.
-func TestQueuedRebuildWinsOverCallerAfterExit(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	c, fsm := newWedgedRecoverableCache(ctx, t)
-
-	if err := c.ReinitForTest("adopted"); !errors.Is(err, errAwaitRaftShutdown) {
-		close(fsm.release)
-		t.Fatalf("expected the reinit to time out awaiting the wedged raft, got %v", err)
-	}
-
-	// The watcher's retry holds recoveryMutex when the old raft exits.
-	c.recoveryMutex.Lock()
-	exit := c.raftExit
-	close(fsm.release)
-	<-exit.done
-	_, awaitErr := c.awaitRaftShutdown(exit.rft, time.Minute)
-	recoverErr := c.recoverQuorumLocked()
-	c.recoveryMutex.Unlock()
-	if !errors.Is(awaitErr, errAwaitRaftShutdown) || !errors.Is(recoverErr, errAwaitRaftShutdown) {
-		t.Fatalf("expected both to defer to the queued reset, got await %v, recovery %v", awaitErr, recoverErr)
-	}
-
-	waitUntil(t, 10*time.Second, "the queued reset", func() bool {
-		return c.getInstanceID() == "adopted" && c.hasEmptyConfig()
-	})
-}
-
-// TestReinitFinishesAfterOldRaftExits is the reset half of G2: a reinit that
-// timed out awaiting the old raft must rebuild onto fresh stores, adopting the
-// requested instance ID, once the old raft has exited.
-func TestReinitFinishesAfterOldRaftExits(t *testing.T) {
+// TestRestartRaftSkipsReplacedRaft: the restart after a timed-out rebuild must
+// not run when another rebuild replaced the raft before the old one exited.
+func TestRestartRaftSkipsReplacedRaft(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	fsm := newBlockingFSM()
 	c := newLeaderCache(ctx, t, fsm, quickRaftShutdown())
-	wedgeApply(ctx, t, c, fsm)
-
-	old := c.raft()
-	if err := c.ReinitForTest("adopted"); !errors.Is(err, errAwaitRaftShutdown) {
-		close(fsm.release)
-		t.Fatalf("expected the reinit to time out awaiting the wedged raft, got %v", err)
-	}
-	if fsm.resets.Load() != 0 {
-		close(fsm.release)
-		t.Fatal("the FSM was reset before the old raft exited")
-	}
-
-	// A retry behind the queued rebuild must not hold recoveryMutex for
-	// another full wait.
-	start := time.Now()
-	c.recoveryMutex.Lock()
-	_, err := c.awaitRaftShutdown(old, time.Minute)
-	c.recoveryMutex.Unlock()
-	if !errors.Is(err, errAwaitRaftShutdown) || time.Since(start) > time.Second {
-		close(fsm.release)
-		t.Fatalf("expected a retry behind a queued rebuild to return at once, got %v after %s", err, time.Since(start))
-	}
-
-	close(fsm.release)
-
-	waitUntil(t, 10*time.Second, "the reinit to complete", func() bool {
-		rft := c.raft()
-		return rft != old && rft.State() != raft.Shutdown &&
-			c.getInstanceID() == "adopted" && fsm.resets.Load() == 1
-	})
-}
-
-// TestRebuildAfterExitSkipsReplacedRaft: a pending rebuild must not run when
-// another rebuild replaced the raft before the old one exited.
-func TestRebuildAfterExitSkipsReplacedRaft(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	fsm := newBlockingFSM()
-	c := newLeaderCache(ctx, t, fsm, quickRaftShutdown())
-	wedgeApply(ctx, t, c, fsm)
+	release := wedgeApply(ctx, t, c, fsm)
 
 	if err := c.ReinitForTest("adopted"); !errors.Is(err, errAwaitRaftShutdown) {
-		close(fsm.release)
 		t.Fatalf("expected the reinit to time out awaiting the wedged raft, got %v", err)
 	}
 
@@ -532,21 +516,20 @@ func TestRebuildAfterExitSkipsReplacedRaft(t *testing.T) {
 	c.newStores()
 	other, err := newRaft(c.cfg, c.fsm, c.logStore, c.stableStore, c.snapshotStore, tr)
 	if err != nil {
-		close(fsm.release)
 		t.Fatalf("newRaft: %v", err)
 	}
 	c.recoveryMutex.Lock()
 	c.setRaft(other)
 	c.recoveryMutex.Unlock()
 
-	close(fsm.release)
+	release()
 	time.Sleep(500 * time.Millisecond)
 
 	if c.raft() != other {
-		t.Fatal("the pending rebuild replaced a raft it was not queued for")
+		t.Fatal("the restart replaced a raft it was not for")
 	}
 	if fsm.resets.Load() != 0 {
-		t.Fatalf("the pending rebuild reset the FSM %d times", fsm.resets.Load())
+		t.Fatalf("the FSM was reset %d times", fsm.resets.Load())
 	}
 }
 
