@@ -51,7 +51,6 @@ func newDiscoveryInjector(c *Cache) *DiscoveryInjector {
 		applied:         map[raft.ServerID]struct{}{},
 		servers:         map[raft.ServerID]raft.Server{},
 		lastSeen:        map[raft.ServerID]time.Time{},
-		instanceIDs:     map[raft.ServerID]string{},
 		status:          map[raft.ServerID]PeerStatus{},
 		peerInClusterCh: make(chan struct{}),
 	}
@@ -92,16 +91,14 @@ type DiscoveryInjector struct {
 	serversM sync.RWMutex
 	servers  map[raft.ServerID]raft.Server
 	lastSeen map[raft.ServerID]time.Time
-	// instanceIDs holds each peer's last-pinged raft instance ID (RT-13067).
-	// addServer's admission gate compares it against the local instance ID: a
-	// peer that does not provably follow this node's consensus history is
+	// status holds each peer's last-pinged raft status. addServer's admission
+	// gate compares its instance ID against the local one (RT-13067): a peer
+	// that does not provably follow this node's consensus history is
 	// hard-reset before being added to the configuration. Empty means the peer
 	// never reported one (fresh node, freshly wiped node, or a discovery
 	// implementation that does not propagate status) and is treated as a
-	// mismatch — the wipe is a no-op on a genuinely fresh peer.
-	instanceIDs map[raft.ServerID]string
-	// status holds each peer's last-pinged raft status, which the bootstrap
-	// fallback reads to let a voter ahead go first (see voterAhead).
+	// mismatch — the wipe is a no-op on a genuinely fresh peer. The bootstrap
+	// fallback reads it to let a voter ahead go first (see voterAhead).
 	status   map[raft.ServerID]PeerStatus
 	appliedM sync.RWMutex
 	applied  map[raft.ServerID]struct{}
@@ -673,25 +670,18 @@ func (s *DiscoveryInjector) removeApplied(srvID raft.ServerID) {
 }
 
 func (s *DiscoveryInjector) setServer(srv raft.Server) bool {
-	return s.setServerWithInstanceID(srv, "")
-}
-
-// setServerWithInstanceID is setServerWithStatus for a ping that carries only
-// an instance ID.
-func (s *DiscoveryInjector) setServerWithInstanceID(srv raft.Server, instanceID string) bool {
-	return s.setServerWithStatus(srv, PeerStatus{InstanceID: instanceID})
+	return s.setServerWithStatus(srv, PeerStatus{})
 }
 
 // setServerWithStatus is setServer plus bookkeeping of the peer's last-pinged
-// raft instance ID, which addServer's admission gate consults (RT-13067), and
-// of its raft status (RT-15590). Last ping wins: a peer that wipes (instance ID
-// cleared) or adopts a new instance ID is re-evaluated on its next ping.
+// raft status, whose instance ID addServer's admission gate consults
+// (RT-13067). Last ping wins: a peer that wipes (instance ID cleared) or
+// adopts a new instance ID is re-evaluated on its next ping.
 func (s *DiscoveryInjector) setServerWithStatus(srv raft.Server, status PeerStatus) bool {
 	s.serversM.Lock()
 	defer s.serversM.Unlock()
 
 	s.lastSeen[srv.ID] = time.Now()
-	s.instanceIDs[srv.ID] = status.InstanceID
 	s.status[srv.ID] = status
 
 	known, ok := s.servers[srv.ID]
@@ -714,7 +704,6 @@ func (s *DiscoveryInjector) deleteServer(id raft.ServerID) {
 
 	delete(s.servers, id)
 	delete(s.lastSeen, id)
-	delete(s.instanceIDs, id)
 	delete(s.status, id)
 }
 
@@ -724,7 +713,7 @@ func (s *DiscoveryInjector) peerInstanceID(id raft.ServerID) string {
 	s.serversM.RLock()
 	defer s.serversM.RUnlock()
 
-	return s.instanceIDs[id]
+	return s.status[id].InstanceID
 }
 
 // isAliveSince reports whether the given peer has pinged discovery on or
@@ -776,7 +765,6 @@ func (s *DiscoveryInjector) forgetServer(id raft.ServerID) {
 	s.serversM.Lock()
 	delete(s.servers, id)
 	delete(s.lastSeen, id)
-	delete(s.instanceIDs, id)
 	delete(s.status, id)
 	s.serversM.Unlock()
 

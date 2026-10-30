@@ -433,7 +433,7 @@ func TestAdmissionWipeKeyedToCurrentIncarnation(t *testing.T) {
 	// the gate. The wipe key must be the leader's instance ID — keying on the
 	// stale lastResetID gets deduped by the peer and skips the wipe.
 	peerSrv := raft.Server{ID: "peer", Address: peerAddr, Suffrage: raft.Nonvoter}
-	leader.discovery.setServerWithInstanceID(peerSrv, "forked-instance")
+	leader.discovery.setServerWithStatus(peerSrv, PeerStatus{InstanceID: "forked-instance"})
 	if err := leader.discovery.addServer(peerSrv); err != nil {
 		t.Fatalf("addServer(peer): %v", err)
 	}
@@ -494,7 +494,7 @@ func TestAddMissingServersSweepEndsExile(t *testing.T) {
 	// configuration. The leader's own instance ID skips the admission wipe —
 	// the ghost has no live process to answer a hard-reset RPC.
 	ghost := raft.Server{ID: "ghost", Address: "ghost-addr", Suffrage: raft.Nonvoter}
-	c.discovery.setServerWithInstanceID(ghost, c.getInstanceID())
+	c.discovery.setServerWithStatus(ghost, PeerStatus{InstanceID: c.getInstanceID()})
 
 	srvs, err := c.GetServerList()
 	if err != nil {
