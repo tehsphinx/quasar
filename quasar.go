@@ -326,13 +326,14 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, rft *raft.Raft, after 
 	// liveness window) before forking a single-voter cluster. A live leader
 	// keeps pinging, so this loop keeps waiting and never competes with it.
 	window := s.aliveCutoff()
+	due := s.fallbackDue(rft, after, window)
 	ticker := time.NewTicker(bootstrapFallbackPoll)
 	defer ticker.Stop()
 	for {
 		if s.raft() != rft || !s.hasEmptyConfig() {
 			return
 		}
-		if s.fallbackDue(window) && s.tryFallbackBootstrap(rft, after, window, transport) {
+		if due() && s.tryFallbackBootstrap(rft, due, after, window, transport) {
 			return
 		}
 		select {
@@ -343,11 +344,46 @@ func (s *Cache) runBootstrapFallback(ctx context.Context, rft *raft.Raft, after 
 	}
 }
 
-// fallbackDue reports whether the bootstrap fallback may bootstrap now: no
-// leader is known locally or pinged within window, and no other voter is
-// ahead of this one.
-func (s *Cache) fallbackDue(window time.Duration) bool {
-	return !s.hasLeader() && !s.discovery.observedLeaderPing(window) && !s.discovery.voterAhead(window)
+// fallbackDue returns the bootstrap fallback's check whether it may bootstrap
+// rft now. The fallback calls it on every poll and once more under
+// recoveryMutex, always from its own goroutine. It holds the bootstrap off
+// while:
+//   - a leader is known locally or pinged within window;
+//   - rft's term rose within window; a term found raised on the first check
+//     counts as raised then. Only a leader's or a candidate's RPC raises the
+//     term of a configless raft, and such a raft grants every vote: a
+//     candidate still campaigning can win with this voter's vote, and a
+//     bootstrap now would fork a competing cluster (RT-15590). One that went
+//     away stops raising it;
+//   - another voter is ahead of this one (see DiscoveryInjector.voterAhead),
+//     for at most 2*(after+window) once nothing else holds the bootstrap off.
+//     A voter ahead that bootstraps does so within its own after+window, and
+//     one that pings but never does (its fallback off, an older quasar, a
+//     shut-down raft, or one no longer in its own configuration) must not
+//     hold this one off for good.
+func (s *Cache) fallbackDue(rft *raft.Raft, after, window time.Duration) func() bool {
+	var (
+		term                     uint64
+		termRaisedAt, aheadSince time.Time
+	)
+	return func() bool {
+		now := time.Now()
+		if t := rft.CurrentTerm(); t != term {
+			term, termRaisedAt = t, now
+		}
+		if s.hasLeader() || s.discovery.observedLeaderPing(window) || now.Sub(termRaisedAt) <= window {
+			aheadSince = time.Time{}
+			return false
+		}
+		if !s.discovery.voterAhead(window) {
+			aheadSince = time.Time{}
+			return true
+		}
+		if aheadSince.IsZero() {
+			aheadSince = now
+		}
+		return now.Sub(aheadSince) > 2*(after+window)
+	}
 }
 
 // tryFallbackBootstrap is runBootstrapFallback's bootstrap of rft. Rebuilds
@@ -355,15 +391,36 @@ func (s *Cache) fallbackDue(window time.Duration) bool {
 // between the check and the bootstrap. Taking it can wait out a rebuild, and
 // a leader can ping meanwhile, so every check runs again. It reports whether
 // the fallback is done; false keeps it waiting.
-func (s *Cache) tryFallbackBootstrap(rft *raft.Raft, after, window time.Duration, transport transports.Transport) bool {
+func (s *Cache) tryFallbackBootstrap(rft *raft.Raft, due func() bool, after, window time.Duration, transport transports.Transport) bool {
 	s.recoveryMutex.Lock()
 	defer s.recoveryMutex.Unlock()
 
-	if s.raft() != rft || rft.State() == raft.Shutdown || !s.hasEmptyConfig() {
+	if s.raft() != rft || !s.hasEmptyConfig() {
 		return true
 	}
-	if !s.fallbackDue(window) {
+	if !due() {
 		return false
+	}
+
+	// BootstrapCluster refuses a raft with state, and a configless one has some
+	// once a leader's or candidate's RPC raised its term: a leader that reached
+	// this voter and went away before the configuration did would leave it
+	// unable to bootstrap (RT-15590). Its stores hold nothing else, so it is
+	// replaced by a raft on fresh ones, whose own fallback (see installRaft)
+	// bootstraps it.
+	if hasState, err := raft.HasExistingState(s.logStore, s.stableStore, s.snapshotStore); err != nil || hasState {
+		s.logger.Warn("bootstrap fallback: no configuration but raft state left by a leader or candidate that went away; restarting raft on fresh stores",
+			"local-id", s.localID)
+		// See reinitRaftAdoptingInstance (RT-13010).
+		s.transport.SetHeartbeatHandler(nil)
+		if err := awaitRaftShutdown(s.ctx, rft); err != nil {
+			return true
+		}
+		s.newStores()
+		if fresh, err := s.rebuildRaft(nil); err == nil {
+			s.installRaft(fresh)
+		}
+		return true
 	}
 
 	s.logger.Warn("bootstrap fallback: no configuration, no leader formed and the leader ping went stale; bootstrapping single-voter cluster to break the wedge",
@@ -372,29 +429,14 @@ func (s *Cache) tryFallbackBootstrap(rft *raft.Raft, after, window time.Duration
 		"fallback-wait", after,
 		"leader-ping-window", window,
 	)
-	// BootstrapCluster refuses a raft with state, and a configless one has some
-	// once a leader's or candidate's RPC raised its term: a leader that reached
-	// this voter and went away before the configuration did would leave it
-	// unable to bootstrap (RT-15590). Its stores hold nothing else, so start a
-	// raft on fresh ones instead.
-	if hasState, err := raft.HasExistingState(s.logStore, s.stableStore, s.snapshotStore); err != nil || hasState {
-		// See reinitRaftAdoptingInstance (RT-13010).
-		s.transport.SetHeartbeatHandler(nil)
-		if err := awaitRaftShutdown(s.ctx, rft); err != nil {
-			return true
-		}
-		s.newStores()
-		fresh, err := s.rebuildRaft(nil)
-		if err != nil {
-			return true
-		}
-		s.installRaft(fresh)
-		rft = fresh
-	}
-	s.setInstanceID(uuid.NewString())
 	s.bootstrapCluster(rft, raft.Configuration{
 		Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
 	})
+	if s.hasEmptyConfig() {
+		// bootstrapCluster logged why; the next poll tries again.
+		return false
+	}
+	s.setInstanceID(uuid.NewString())
 	return true
 }
 

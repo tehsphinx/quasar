@@ -90,9 +90,10 @@ func TestVoterAhead(t *testing.T) {
 // voter whose raft was rebuilt by a history reset has an empty configuration
 // and cannot campaign. Pre-fix nothing ever bootstrapped it again (Sites A and
 // B logged "no known peers, aborting election" for 38 minutes); the reset must
-// arm the bootstrap fallback. The fallback holds off for as long as a
-// lower-ID voter pings configless too, and is not armed at all for a
-// discovery that never reports status: it could not tell a live leader.
+// arm the bootstrap fallback. The fallback holds off while a voter ahead pings,
+// until that voter goes away or has had long enough to bootstrap, and is not
+// armed at all for a discovery that never reports status: it could not tell a
+// live leader.
 func TestBootstrapFallbackAfterReset(t *testing.T) {
 	const window = time.Second
 
@@ -107,12 +108,31 @@ func TestBootstrapFallbackAfterReset(t *testing.T) {
 		peerStatus PeerStatus
 		// heldOff is whether the fallback must wait while the peer pings.
 		heldOff bool
+		// keepsPinging leaves the peer pinging once the hold was checked: it
+		// never bootstraps and never goes away.
+		keepsPinging bool
 	}{
 		{
 			name:       "behind a configless lower-ID voter",
 			peer:       voter("sitea"),
 			peerStatus: PeerStatus{InstanceID: "hist-a"},
 			heldOff:    true,
+		},
+		{
+			// Its fallback is off, or it runs an older quasar.
+			name:         "behind a lower-ID voter that never bootstraps",
+			peer:         voter("sitea"),
+			peerStatus:   PeerStatus{InstanceID: "hist-a"},
+			heldOff:      true,
+			keepsPinging: true,
+		},
+		{
+			// Its raft is shut down, or it is no longer in its own configuration.
+			name:         "behind a single-voter peer that never leads",
+			peer:         voter("sited"),
+			peerStatus:   PeerStatus{NumVotersInConfig: 1, InstanceID: "hist-d"},
+			heldOff:      true,
+			keepsPinging: true,
 		},
 		{
 			name:       "not behind a lower-ID voter in an established cluster",
@@ -171,7 +191,8 @@ func TestBootstrapFallbackAfterReset(t *testing.T) {
 			}
 
 			if tt.heldOff {
-				ctxHold, cancelHold := context.WithTimeout(ctx, 3*window)
+				// Short of the 2*(fallback wait + window) a voter ahead gets.
+				ctxHold, cancelHold := context.WithTimeout(ctx, 2*window)
 				defer cancelHold()
 				if eventually(ctxHold, func() bool { return !c.hasEmptyConfig() }) {
 					t.Fatalf("the fallback bootstrapped while it had to hold off:\n%s", out.String())
@@ -179,9 +200,11 @@ func TestBootstrapFallbackAfterReset(t *testing.T) {
 				if tt.plain {
 					return
 				}
-				// sitea goes away without bootstrapping: once its pings age
-				// out, nobody is ahead any more.
-				disc.status.Store(nil)
+				if !tt.keepsPinging {
+					// The peer goes away without bootstrapping: once its pings
+					// age out, nobody is ahead any more.
+					disc.status.Store(nil)
+				}
 			}
 
 			ctxLead, cancelLead := context.WithTimeout(ctx, window+5*time.Second)
@@ -266,69 +289,63 @@ func newConfiglessVoter(ctx context.Context, t *testing.T, window time.Duration)
 
 // TestBootstrapFallbackRechecksUnderLock: the fallback takes recoveryMutex
 // before it bootstraps, which can mean waiting out a rebuild. A leader that
-// pinged meanwhile must hold the bootstrap off without ending the fallback,
-// and a raft shut down meanwhile must be neither bootstrapped nor given a
-// fresh instance ID.
+// pinged meanwhile must hold the bootstrap off without ending the fallback.
 func TestBootstrapFallbackRechecksUnderLock(t *testing.T) {
 	const window = time.Second
 
-	t.Run("a leader pinged meanwhile", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
-		c, out := newConfiglessVoter(ctx, t, window)
+	c, out := newConfiglessVoter(ctx, t, window)
 
-		c.recoveryMutex.Lock()
-		go c.runBootstrapFallback(ctx, c.raft(), 0, c.transport)
-		time.Sleep(200 * time.Millisecond) // the fallback is due and waits for the lock
-		c.discovery.sawLeaderPingAt.Store(time.Now().UnixNano())
-		c.recoveryMutex.Unlock()
+	c.recoveryMutex.Lock()
+	go c.runBootstrapFallback(ctx, c.raft(), 0, c.transport)
+	time.Sleep(200 * time.Millisecond) // the fallback is due and waits for the lock
+	c.discovery.sawLeaderPingAt.Store(time.Now().UnixNano())
+	c.recoveryMutex.Unlock()
 
-		time.Sleep(window / 2)
-		if !c.hasEmptyConfig() || strings.Contains(out.String(), "bootstrap fallback") {
-			t.Fatalf("the fallback bootstrapped despite a fresh leader ping:\n%s", out.String())
-		}
-		// Once that ping is stale, the fallback, still armed, breaks the wedge.
-		ctxLead, cancelLead := context.WithTimeout(ctx, 5*time.Second)
-		defer cancelLead()
-		if !eventually(ctxLead, c.IsLeader) {
-			t.Fatalf("the fallback never bootstrapped:\n%s", out.String())
-		}
-	})
+	time.Sleep(window / 2)
+	if !c.hasEmptyConfig() || strings.Contains(out.String(), "bootstrap fallback") {
+		t.Fatalf("the fallback bootstrapped despite a fresh leader ping:\n%s", out.String())
+	}
+	// Once that ping is stale, the fallback, still armed, breaks the wedge.
+	ctxLead, cancelLead := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelLead()
+	if !eventually(ctxLead, c.IsLeader) {
+		t.Fatalf("the fallback never bootstrapped:\n%s", out.String())
+	}
+}
 
-	t.Run("the raft shut down meanwhile", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
+// TestBootstrapFallbackKeepsWaitingAfterAFailedBootstrap: bootstrapCluster
+// only logs a failed BootstrapCluster. The fallback used to end on it anyway,
+// with a fresh instance ID on a voter left configless for good (RT-15590). It
+// must keep the old ID and keep waiting, so a later poll tries again. A raft
+// that is shut down is the simplest one to fail a bootstrap.
+func TestBootstrapFallbackKeepsWaitingAfterAFailedBootstrap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
-		c, out := newConfiglessVoter(ctx, t, window)
-		rft, instanceID := c.raft(), c.getInstanceID()
+	c, out := newConfiglessVoter(ctx, t, time.Second)
+	rft, instanceID := c.raft(), c.getInstanceID()
+	_ = rft.Shutdown().Error()
 
-		c.recoveryMutex.Lock()
-		done := make(chan struct{})
-		go func() {
-			c.runBootstrapFallback(ctx, rft, 0, c.transport)
-			close(done)
-		}()
-		time.Sleep(200 * time.Millisecond) // the fallback is due and waits for the lock
-		_ = rft.Shutdown().Error()
-		c.recoveryMutex.Unlock()
-
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the fallback kept waiting on a shut-down raft")
-		}
-		if got := c.getInstanceID(); got != instanceID || strings.Contains(out.String(), "bootstrap fallback") {
-			t.Fatalf("the fallback bootstrapped a shut-down raft (instance ID %q, now %q):\n%s", instanceID, got, out.String())
-		}
-	})
+	if c.tryFallbackBootstrap(rft, func() bool { return true }, 0, time.Second, c.transport) {
+		t.Fatalf("the fallback ended on a failed bootstrap:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "bootstrap cluster failed") {
+		t.Fatalf("expected the failed bootstrap logged, got:\n%s", out.String())
+	}
+	if got := c.getInstanceID(); got != instanceID {
+		t.Fatalf("a failed bootstrap changed the instance ID from %q to %q", instanceID, got)
+	}
 }
 
 // TestBootstrapFallbackOutlivesALeaderThatWentAway: raft learns a leader from
 // its first AppendEntries, before any configuration arrives, and that RPC also
 // raises its term, after which raft refuses to bootstrap it. A leader that
 // reached a configless voter and went away must neither end the fallback nor
-// leave the voter unable to bootstrap (RT-15590).
+// leave the voter unable to bootstrap (RT-15590): the fallback restarts its
+// raft on fresh stores, whose own fallback bootstraps it.
 func TestBootstrapFallbackOutlivesALeaderThatWentAway(t *testing.T) {
 	const window = time.Second
 
@@ -336,6 +353,8 @@ func TestBootstrapFallbackOutlivesALeaderThatWentAway(t *testing.T) {
 	defer cancel()
 
 	c, out := newConfiglessVoter(ctx, t, window)
+	// The fallback the fresh raft gets; the startup one stays held off.
+	c.cfg.bootstrapFallback = 200 * time.Millisecond
 	voterTr, ok := c.transport.(*transports.InmemTransport)
 	if !ok {
 		t.Fatalf("unexpected transport %T", c.transport)
@@ -369,6 +388,72 @@ func TestBootstrapFallbackOutlivesALeaderThatWentAway(t *testing.T) {
 	defer cancelLead()
 	if !eventually(ctxLead, c.IsLeader) {
 		t.Fatalf("the voter never bootstrapped after the leader went away:\n%s", out.String())
+	}
+}
+
+// TestBootstrapFallbackHoldsWhileACandidateCampaigns: a configless voter grants
+// every vote, and a candidate can win with it. Pre-fix the fallback, seeing no
+// leader, wiped the voter's raft state, the vote with it, and bootstrapped a
+// competing cluster next to the one the candidate was winning (RT-15590). As
+// long as a candidate keeps raising its term, the fallback must hold off; once
+// it is gone, the fallback bootstraps.
+func TestBootstrapFallbackHoldsWhileACandidateCampaigns(t *testing.T) {
+	const window = time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	c, out := newConfiglessVoter(ctx, t, window)
+	c.cfg.bootstrapFallback = 200 * time.Millisecond
+	voterTr, ok := c.transport.(*transports.InmemTransport)
+	if !ok {
+		t.Fatalf("unexpected transport %T", c.transport)
+	}
+	candAddr, candTr := transports.NewInmemTransport("")
+	candTr.Connect(voterTr.LocalAddr(), voterTr)
+
+	ctxCampaign, stopCampaign := context.WithCancel(ctx)
+	defer stopCampaign()
+	go func() {
+		ticker := time.NewTicker(window / 4)
+		defer ticker.Stop()
+		for term := uint64(1); ; term++ {
+			req := &raft.RequestVoteRequest{
+				RPCHeader: raft.RPCHeader{
+					ProtocolVersion: raft.ProtocolVersionMax,
+					ID:              []byte("candidate"),
+					Addr:            candTr.EncodePeer("candidate", candAddr),
+				},
+				Term: term,
+			}
+			var resp raft.RequestVoteResponse
+			_ = candTr.RequestVote("voter", voterTr.LocalAddr(), req, &resp)
+			select {
+			case <-ctxCampaign.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+
+	rft := c.raft()
+	// The candidate reaches the voter before the fallback is armed, as it can
+	// at startup while the voter waits out its bootstrap decision.
+	if !eventually(ctx, func() bool { return rft.CurrentTerm() > 0 }) {
+		t.Fatal("the candidate never raised the voter's term")
+	}
+	go c.runBootstrapFallback(ctx, rft, 0, c.transport)
+
+	time.Sleep(2 * window)
+	if c.raft() != rft || !c.hasEmptyConfig() || strings.Contains(out.String(), "bootstrap fallback") {
+		t.Fatalf("the fallback acted while a candidate it voted for was campaigning:\n%s", out.String())
+	}
+
+	stopCampaign()
+	ctxLead, cancelLead := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelLead()
+	if !eventually(ctxLead, c.IsLeader) {
+		t.Fatalf("the voter never bootstrapped after the candidate went away:\n%s", out.String())
 	}
 }
 
