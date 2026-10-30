@@ -735,8 +735,8 @@ func (s *DiscoveryInjector) isAliveSince(id raft.ServerID, since time.Time) bool
 // or it has already bootstrapped a single-voter cluster that is still electing
 // itself. The bootstrap fallback waits for it, so voters left configless
 // together form one cluster, not one each; once it leads, its leader pings
-// hold the others off until it admits them. One that never bootstraps holds
-// the voters above it off for as long as it pings.
+// hold the others off until it admits them. voterAhead keeps reporting one
+// that never bootstraps for as long as it pings; fallbackDue bounds the hold.
 func (s *DiscoveryInjector) voterAhead(window time.Duration) bool {
 	local := raft.ServerID(s.cache.localID)
 	since := time.Now().Add(-window)
