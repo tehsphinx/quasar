@@ -62,14 +62,16 @@ func (s *snapshotStore) Create(version raft.SnapshotVersion, index, term uint64,
 // Cancel drops it.
 type pendingSink struct {
 	bytes.Buffer
-	create func() (raft.SnapshotSink, error)
-	sink   raft.SnapshotSink
+	create   func() (raft.SnapshotSink, error)
+	sink     raft.SnapshotSink
+	canceled bool
 }
 
 // Close creates the snapshot in the wrapped store. It is idempotent: an FSM's
-// Persist may close the sink, and raft closes it again.
+// Persist may close the sink, and raft closes it again. After Cancel it does
+// nothing, like raft's FileSnapshotSink.
 func (p *pendingSink) Close() error {
-	if p.sink != nil {
+	if p.sink != nil || p.canceled {
 		return nil
 	}
 	sink, err := p.create()
@@ -84,8 +86,10 @@ func (p *pendingSink) Close() error {
 	return sink.Close()
 }
 
-// Cancel drops the buffered snapshot; the wrapped store never sees it.
+// Cancel drops the buffered snapshot. The wrapped store never sees it, and a
+// later Close does not create it.
 func (p *pendingSink) Cancel() error {
+	p.canceled = true
 	p.Reset()
 	return nil
 }
