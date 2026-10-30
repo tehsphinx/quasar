@@ -46,11 +46,13 @@ func TestVotersResetIntoEmptyConfigsElectALeader(t *testing.T) {
 	const (
 		// WithAutoPrune's minimum; it is also the liveness window the
 		// bootstrap fallback ages leader pings out over.
-		pruneAfter    = 6 * time.Second
-		discoveryTick = 500 * time.Millisecond
-		// Fallback grace, a stale leader ping, the lower-ID voter's head start,
-		// an election and the leader's re-add sweep, with room for slow CI.
-		recoverBudget = 40 * time.Second
+		pruneAfter = 6 * time.Second
+		// Inside the 2-5s range NATSDiscovery pings at: a short tick would hide
+		// how long a fresh leader's first ping takes to reach the other voter.
+		discoveryTick = 4 * time.Second
+		// Fallback grace, a stale leader ping, an election, the leader's first
+		// ping and its admission of the other voter, with room for slow CI.
+		recoverBudget = 60 * time.Second
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -100,9 +102,13 @@ func TestVotersResetIntoEmptyConfigsElectALeader(t *testing.T) {
 			t.Fatalf("WaitReady %s: %v", id, err)
 		}
 	}
-	waitFor(t, 30*time.Second, "all three voters in the configuration", func() error {
+	ctxJoin, cancelJoin := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelJoin()
+	if err := waitForCondition(ctxJoin, func() error {
 		return hasVoters(caches["sitea"], "sitea", "siteb", "sitec")
-	})
+	}); err != nil {
+		t.Fatalf("waiting for all three voters in the configuration: %v", err)
+	}
 
 	// Site C's raft is gone.
 	if err := caches["sitec"].Shutdown(); err != nil {
@@ -130,7 +136,9 @@ func TestVotersResetIntoEmptyConfigsElectALeader(t *testing.T) {
 		}
 	}
 
-	waitFor(t, recoverBudget, "a leader with both reset voters", func() error {
+	ctxRecover, cancelRecover := context.WithTimeout(ctx, recoverBudget)
+	defer cancelRecover()
+	if err := waitForCondition(ctxRecover, func() error {
 		var lead *quasar.Cache
 		for _, c := range caches {
 			if c.IsLeader() {
@@ -147,7 +155,9 @@ func TestVotersResetIntoEmptyConfigsElectALeader(t *testing.T) {
 			return fmt.Errorf("histories differ: sitea %q, siteb %q", a, b)
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatalf("waiting for a leader with both reset voters: %v", err)
+	}
 
 	if n := strings.Count(out.String()[mark:], "bootstrap fallback"); n != 1 {
 		t.Fatalf("expected exactly one fallback bootstrap after the reset, got %d:\n%s", n, out.String()[mark:])
@@ -170,21 +180,4 @@ func hasVoters(c *quasar.Cache, ids ...raft.ServerID) error {
 		}
 	}
 	return nil
-}
-
-// waitFor polls cond until it returns nil or the timeout expires.
-func waitFor(t *testing.T, timeout time.Duration, what string, cond func() error) {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-	for {
-		err := cond()
-		if err == nil {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %s waiting for %s: %v", timeout, what, err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 }
