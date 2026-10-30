@@ -380,21 +380,12 @@ type blockingSnapFSM struct {
 
 func (blockingSnapFSM) Snapshot() (raft.FSMSnapshot, error) { return snapFSMSnapshot(nil), nil }
 
-// quickRaftShutdown makes rebuilds give up on a wedged old raft quickly.
-func quickRaftShutdown() Option {
-	return func(o *options) { o.awaitRaftShutdownTimeout = 200 * time.Millisecond }
-}
-
-// newWedgedRecoverableCache is a node whose FSM is wedged inside ApplyCmd and
-// whose configuration lists a second voter, "ghost", for quorum recovery to
-// drop. The change cannot commit without it, but the latest configuration
-// already lists it, and the node, unable to reach it, steps down.
-func newWedgedRecoverableCache(ctx context.Context, t *testing.T) (*Cache, *blockingFSM, func()) {
+// addGhostVoter adds a second voter, "ghost", that does not exist to c's
+// configuration for quorum recovery to drop. The change cannot commit without
+// it, but the latest configuration already lists it, and c, unable to reach
+// it, steps down.
+func addGhostVoter(ctx context.Context, t *testing.T, c *Cache) {
 	t.Helper()
-
-	fsm := newBlockingFSM()
-	c := newLeaderCache(ctx, t, blockingSnapFSM{fsm}, quickRaftShutdown())
-	release := wedgeApply(ctx, t, c, fsm)
 
 	_ = c.raft().AddVoter("ghost", "ghost", 0, 0)
 	ctxWait, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -402,134 +393,183 @@ func newWedgedRecoverableCache(ctx context.Context, t *testing.T) (*Cache, *bloc
 	if !eventually(ctxWait, func() bool { return c.raftHasServer("ghost") && !c.IsLeader() }) {
 		t.Fatal("expected the ghost voter in the configuration and the node stepped down")
 	}
-	return c, fsm, release
 }
 
-// awaitRestart waits until the raft old was replaced by a live one.
-func awaitRestart(ctx context.Context, t *testing.T, c *Cache, old *raft.Raft) {
-	t.Helper()
+// TestRebuildWaitsOutAWedgedFSM is the RT-15590 regression test for G2: on
+// Site C quorum recovery gave up awaiting the old raft after 10s, while its
+// FSM was stuck, and left the node on the raft it had already shut down. The
+// watcher's retry needed shouldRecoverQuorum to agree again, which it did not
+// for 32 minutes. A rebuild that shut the raft down must instead wait for it
+// to exit and then complete, on both paths that rebuild on a live cluster.
+func TestRebuildWaitsOutAWedgedFSM(t *testing.T) {
+	tests := []struct {
+		name    string
+		rebuild func(c *Cache) error
+		// rebuilt reports whether the rebuild did its work; instanceID is the
+		// one before it.
+		rebuilt func(c *Cache, instanceID string) bool
+	}{
+		{
+			name:    "quorum recovery",
+			rebuild: (*Cache).recoverQuorum,
+			rebuilt: func(c *Cache, instanceID string) bool {
+				return c.IsLeader() && !c.raftHasServer("ghost") && c.getInstanceID() != instanceID
+			},
+		},
+		{
+			name:    "hard reset",
+			rebuild: func(c *Cache) error { return c.localHardReset("reset-1", "initiator-hist", false) },
+			rebuilt: func(c *Cache, _ string) bool {
+				return c.hasEmptyConfig() && c.getInstanceID() == "initiator-hist" && c.getLastResetID() == "reset-1"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
 
-	ctxWait, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if !eventually(ctxWait, func() bool {
-		rft := c.raft()
-		return rft != old && rft.State() != raft.Shutdown
-	}) {
-		t.Fatal("the node stayed on the shut-down raft")
+			fsm := newBlockingFSM()
+			c := newLeaderCache(ctx, t, blockingSnapFSM{fsm})
+			release := wedgeApply(ctx, t, c, fsm)
+			addGhostVoter(ctx, t, c)
+			old, instanceID := c.raft(), c.getInstanceID()
+
+			done := make(chan error, 1)
+			go func() { done <- tt.rebuild(c) }()
+			select {
+			case err := <-done:
+				t.Fatalf("the rebuild returned while the old raft was still running: %v", err)
+			case <-time.After(time.Second):
+			}
+			if c.raft() != old {
+				t.Fatal("the raft was replaced while the old one was still running")
+			}
+
+			release()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("rebuild: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("the rebuild never completed after the FSM returned")
+			}
+			ctxDone, cancelDone := context.WithTimeout(ctx, 10*time.Second)
+			defer cancelDone()
+			if !eventually(ctxDone, func() bool { return tt.rebuilt(c, instanceID) }) {
+				t.Fatalf("the rebuild did not do its work (instance ID %q, configuration %v)",
+					c.getInstanceID(), c.raft().GetConfiguration().Configuration().Servers)
+			}
+		})
 	}
 }
 
-// TestRecoveryTimeoutRestartsRaft is the RT-15590 regression test for G2 on
-// Site C: quorum recovery timed out awaiting the old raft, which was already
-// shut down, and the node sat on the dead raft for 32 minutes because the
-// watcher's retry needed shouldRecoverQuorum to agree again. Once the old raft
-// has exited the node must run a live raft on its untouched stores, on which
-// recovery can be decided again.
-func TestRecoveryTimeoutRestartsRaft(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+// TestRebuildWaitEndsWithTheCache: the wait for a wedged FSM is not bounded,
+// but closing the cache must still end it rather than leak the rebuild.
+func TestRebuildWaitEndsWithTheCache(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	ctxCache, closeCache := context.WithCancel(ctx)
+	defer closeCache()
 
-	c, _, release := newWedgedRecoverableCache(ctx, t)
+	fsm := newBlockingFSM()
+	c := newLeaderCache(ctxCache, t, blockingSnapFSM{fsm})
+	wedgeApply(ctx, t, c, fsm)
+	addGhostVoter(ctx, t, c)
 
-	old, instanceID := c.raft(), c.getInstanceID()
-	if err := c.recoverQuorum(); !errors.Is(err, errAwaitRaftShutdown) {
-		t.Fatalf("expected recovery to time out awaiting the wedged raft, got %v", err)
-	}
-	if old.State() != raft.Shutdown {
-		t.Fatalf("expected the old raft shut down, it is %v", old.State())
-	}
+	done := make(chan error, 1)
+	go func() { done <- c.recoverQuorum() }()
+	time.Sleep(200 * time.Millisecond)
+	closeCache()
 
-	release()
-	awaitRestart(ctx, t, c, old)
-	if !c.raftHasServer("ghost") {
-		t.Fatal("the restart lost the configuration the recovery had not changed")
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected the closed cache to end the wait, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait outlived the cache")
 	}
-	if got := c.getInstanceID(); got != instanceID {
-		t.Fatalf("the restart changed the instance ID from %q to %q", instanceID, got)
+}
+
+// TestRecoveredRaftDoesNotOutliveTheCache: Shutdown does not take
+// recoveryMutex. One that runs while quorum recovery builds the recovered raft
+// shuts the old raft down and returns, and recovery then installed the new one
+// on the closed transport, where it ran for the life of the process. The
+// recovered raft must be shut down by its installer.
+func TestRecoveredRaftDoesNotOutliveTheCache(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ctxCache, closeCache := context.WithCancel(ctx)
+	defer closeCache()
+
+	c := newLeaderCache(ctxCache, t, newSnapFSM())
+	addGhostVoter(ctx, t, c)
+
+	c.newRaftFn = func(cfg options, fsm raft.FSM, logs raft.LogStore, stable raft.StableStore,
+		snaps raft.SnapshotStore, tr transports.Transport,
+	) (*raft.Raft, error) {
+		closeCache()
+		time.Sleep(200 * time.Millisecond) // the cache's shutdown runs on the old raft
+		return newRaft(cfg, fsm, logs, stable, snaps, tr)
 	}
 
 	if err := c.recoverQuorum(); err != nil {
-		t.Fatalf("recovery on the restarted raft: %v", err)
+		t.Fatalf("recoverQuorum: %v", err)
+	}
+	if state := c.raft().State(); state != raft.Shutdown {
+		t.Fatalf("the recovered raft outlived the cache: it is %v", state)
+	}
+}
+
+// TestRecoveryRetriedUntilTheRaftRuns: by the time quorum recovery builds the
+// recovered raft, RecoverCluster has rewritten the stores, so the history is
+// forked whether the build succeeds or not. A failed build used to return
+// before the instance ID was minted and the dropped voters were forgotten, and
+// the node came back on the forked history under its old ID, where survivors
+// would never be wiped (RT-15590). The recovery must be retried until the
+// recovered raft runs, and finish every step after it.
+func TestRecoveryRetriedUntilTheRaftRuns(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	out := &syncBuffer{}
+	c := newLeaderCache(ctx, t, newSnapFSM(),
+		WithHclogLogger(hclog.New(&hclog.LoggerOptions{Output: out, Level: hclog.Error})))
+	addGhostVoter(ctx, t, c)
+	c.discovery.setServer(raft.Server{ID: "ghost", Address: "ghost", Suffrage: raft.Voter})
+
+	var calls atomic.Int32
+	c.newRaftFn = func(cfg options, fsm raft.FSM, logs raft.LogStore, stable raft.StableStore,
+		snaps raft.SnapshotStore, tr transports.Transport,
+	) (*raft.Raft, error) {
+		if calls.Add(1) == 1 {
+			return nil, errors.New("failed to load any existing snapshots")
+		}
+		return newRaft(cfg, fsm, logs, stable, snaps, tr)
+	}
+
+	instanceID := c.getInstanceID()
+	if err := c.recoverQuorum(); err != nil {
+		t.Fatalf("recoverQuorum: %v", err)
+	}
+	if got := strings.Count(out.String(), "node is inert"); got != 1 {
+		t.Fatalf("expected the failed build logged once, got %d:\n%s", got, out.String())
+	}
+	if c.getInstanceID() == instanceID {
+		t.Fatal("the recovered raft runs under the old instance ID")
+	}
+	c.discovery.serversM.RLock()
+	_, known := c.discovery.servers["ghost"]
+	c.discovery.serversM.RUnlock()
+	if known {
+		t.Fatal("the dropped voter was not forgotten")
 	}
 	ctxLead, cancelLead := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelLead()
 	if !eventually(ctxLead, func() bool { return c.IsLeader() && !c.raftHasServer("ghost") }) {
 		t.Fatal("expected a recovered single-voter leader")
-	}
-}
-
-// TestHardResetRetryAppliesAfterTimeout is the reset half of G2: a hard reset
-// that timed out awaiting the old raft must leave the node on its old history
-// and must not be recorded, so the initiator's retry, once the old raft has
-// exited, applies it. Recorded, the retry was deduplicated away and the leader
-// went on to add a node that never reset.
-func TestHardResetRetryAppliesAfterTimeout(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	c, fsm, release := newWedgedRecoverableCache(ctx, t)
-
-	old, instanceID := c.raft(), c.getInstanceID()
-	if err := c.localHardReset("reset-1", "initiator-hist", false); !errors.Is(err, errAwaitRaftShutdown) {
-		t.Fatalf("expected the reset to time out awaiting the wedged raft, got %v", err)
-	}
-	if got := c.getLastResetID(); got == "reset-1" {
-		t.Fatal("the reset was recorded although it was not applied")
-	}
-	if got := c.getInstanceID(); got != instanceID || fsm.resets.Load() != 0 {
-		t.Fatalf("the reset changed the node before the old raft exited (instance ID %q, FSM resets %d)", got, fsm.resets.Load())
-	}
-
-	release()
-	awaitRestart(ctx, t, c, old)
-	if got := c.getInstanceID(); got != instanceID {
-		t.Fatalf("the restart changed the instance ID from %q to %q", instanceID, got)
-	}
-
-	if err := c.localHardReset("reset-1", "initiator-hist", false); err != nil {
-		t.Fatalf("retried reset: %v", err)
-	}
-	if got := c.getInstanceID(); got != "initiator-hist" || fsm.resets.Load() != 1 || !c.hasEmptyConfig() {
-		t.Fatalf("expected the retry applied (instance ID %q, FSM resets %d, empty configuration %v)",
-			got, fsm.resets.Load(), c.hasEmptyConfig())
-	}
-	if got := c.getLastResetID(); got != "reset-1" {
-		t.Fatalf("expected the applied reset recorded, got %q", got)
-	}
-}
-
-// TestRestartRaftSkipsReplacedRaft: the restart after a timed-out rebuild must
-// not run when another rebuild replaced the raft before the old one exited.
-func TestRestartRaftSkipsReplacedRaft(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	fsm := newBlockingFSM()
-	c := newLeaderCache(ctx, t, fsm, quickRaftShutdown())
-	release := wedgeApply(ctx, t, c, fsm)
-
-	if err := c.ReinitForTest("adopted"); !errors.Is(err, errAwaitRaftShutdown) {
-		t.Fatalf("expected the reinit to time out awaiting the wedged raft, got %v", err)
-	}
-
-	_, tr := transports.NewInmemTransport("")
-	c.newStores()
-	other, err := newRaft(c.cfg, c.fsm, c.logStore, c.stableStore, c.snapshotStore, tr)
-	if err != nil {
-		t.Fatalf("newRaft: %v", err)
-	}
-	c.recoveryMutex.Lock()
-	c.setRaft(other)
-	c.recoveryMutex.Unlock()
-
-	release()
-	time.Sleep(500 * time.Millisecond)
-
-	if c.raft() != other {
-		t.Fatal("the restart replaced a raft it was not for")
-	}
-	if fsm.resets.Load() != 0 {
-		t.Fatalf("the FSM was reset %d times", fsm.resets.Load())
 	}
 }
 

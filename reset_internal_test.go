@@ -105,10 +105,9 @@ func TestLocalHardResetSerializesWithRecovery(t *testing.T) {
 // TestReinitRaftRebuildFailureRetriesAndLogs is the RT-13042 m5 regression
 // test. After reinitRaftAdoptingInstance wipes the FSM and shuts the old raft
 // down, a failing rebuild used to return immediately, leaving the node inert
-// with no retry and no prominent log. rebuildRaft must retry a bounded number
-// of times and log loudly before giving up. The node must not stay inert
-// either: once the old raft has exited, restartRaft builds it a new raft
-// (RT-15590), and the failed reset stays unrecorded so its retry applies it.
+// with no retry and no prominent log. rebuildRaft must log every failed
+// attempt loudly and keep retrying until a raft runs: giving up after a few
+// attempts left the node inert for good (RT-15590).
 func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -132,37 +131,26 @@ func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
 		t.Fatal("lone nonvoter unexpectedly reports IsLeader() == true")
 	}
 
-	// The reset's rebuild fails every attempt; the restart after it succeeds.
+	// More failures than the three attempts rebuildRaft used to give up after.
+	const failures = 4
 	var calls atomic.Int32
-	wantErr := errors.New("rebuild boom")
 	c.newRaftFn = func(cfg options, fsm raft.FSM, logs raft.LogStore, stable raft.StableStore,
 		snaps raft.SnapshotStore, tr transports.Transport,
 	) (*raft.Raft, error) {
-		if calls.Add(1) <= rebuildRaftAttempts {
-			return nil, wantErr
+		if calls.Add(1) <= failures {
+			return nil, errors.New("rebuild boom")
 		}
 		return newRaft(cfg, fsm, logs, stable, snaps, tr)
 	}
 
 	old := c.raft()
-	if err := c.localHardReset("reset-1", "", false); !errors.Is(err, wantErr) {
-		t.Fatalf("expected the rebuild error to propagate, got %v", err)
+	if err := c.localHardReset("reset-1", "", false); err != nil {
+		t.Fatalf("expected the rebuild to be retried until it succeeds, got %v", err)
 	}
-	// Each failed attempt logs before the error propagates; the restart's
-	// attempt does not fail.
-	if got := strings.Count(out.String(), "node is inert"); got != rebuildRaftAttempts {
-		t.Fatalf("expected %d loud rebuild-failure logs, got %d:\n%s", rebuildRaftAttempts, got, out.String())
+	if got := strings.Count(out.String(), "node is inert"); got != failures {
+		t.Fatalf("expected %d loud rebuild-failure logs, got %d:\n%s", failures, got, out.String())
 	}
-	if got := c.getLastResetID(); got == "reset-1" {
-		t.Fatal("a reset that failed was recorded; its retry would be deduplicated away")
-	}
-
-	ctxWait, cancelWait := context.WithTimeout(ctx, 10*time.Second)
-	defer cancelWait()
-	if !eventually(ctxWait, func() bool {
-		rft := c.raft()
-		return rft != old && rft.State() != raft.Shutdown
-	}) {
+	if rft := c.raft(); rft == old || rft.State() == raft.Shutdown {
 		t.Fatal("the node stayed on the shut-down raft")
 	}
 }
@@ -331,40 +319,6 @@ func TestFollowerHardResetAwaitsOldRaftShutdown(t *testing.T) {
 
 	if fsm.stateAtReset != raft.Shutdown {
 		t.Fatalf("expected the old raft shut down before the FSM reset, it was %v", fsm.stateAtReset)
-	}
-}
-
-// TestAwaitRaftShutdownTimesOutOnWedgedFSM covers the bound: shutdownFuture
-// joins runFSM, which sits inside FSM.ApplyCmd — a write-through FSM stuck on
-// an unavailable backend would otherwise pin the rebuild, and recoveryMutex
-// with it, for as long as the FSM stays stuck.
-//
-// It is also the RT-15590 regression test for the retry: raft returns an empty
-// future from every Shutdown() after the first, so a second wait on the same
-// instance used to return at once while the old goroutines still ran. It must
-// wait for the same exit.
-func TestAwaitRaftShutdownTimesOutOnWedgedFSM(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	fsm := newBlockingFSM()
-	c := newLeaderCache(ctx, t, fsm)
-	release := wedgeApply(ctx, t, c, fsm)
-
-	rft := c.raft()
-	c.recoveryMutex.Lock()
-	defer c.recoveryMutex.Unlock()
-
-	if err := c.awaitRaftShutdown(rft, 200*time.Millisecond); !errors.Is(err, errAwaitRaftShutdown) {
-		t.Fatalf("expected the join to be bounded, got %v", err)
-	}
-	if err := c.awaitRaftShutdown(rft, 200*time.Millisecond); !errors.Is(err, errAwaitRaftShutdown) {
-		t.Fatalf("expected a retry to wait for the same exit, got %v", err)
-	}
-
-	release()
-	if err := c.awaitRaftShutdown(rft, 5*time.Second); err != nil {
-		t.Fatalf("expected the join to complete once the FSM returned, got %v", err)
 	}
 }
 

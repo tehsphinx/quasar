@@ -55,14 +55,6 @@ const (
 	// clearing does not cost an extra full window, but not a tight loop.
 	recoveryRetryAfter  = 1 * time.Second
 	observationChanSize = 5
-	// defaultAwaitRaftShutdownTimeout bounds the join on the goroutines of the
-	// raft instance a rebuild replaces (see awaitRaftShutdown). runFSM and
-	// runSnapshots sit inside user code — FSM.ApplyCmd, FSM.Snapshot and the
-	// snapshot's Persist — so a write-through FSM stuck on an unavailable
-	// backend would otherwise pin the rebuild, and recoveryMutex with it, for
-	// as long as the backend stays down. Sized well above a healthy snapshot
-	// Persist and well below the minutes such an outage can last.
-	defaultAwaitRaftShutdownTimeout = 10 * time.Second
 	// quorumProbeTimeout bounds the per-peer LatestUID probe used by
 	// getLeaderWait to detect quorum loss without waiting for the
 	// discovery alive-window to expire. Sized for a healthy LAN: long
@@ -106,12 +98,6 @@ var (
 	// what bought another retry until a raft wedge became a cluster-wide
 	// write outage (RT-13906).
 	ErrOverloaded = errors.New("leader overloaded: too many applies in flight")
-
-	// errAwaitRaftShutdown indicates the old raft instance did not finish
-	// shutting down within its bound (see defaultAwaitRaftShutdownTimeout).
-	// Nothing has been mutated when it is returned; the raft is restarted on
-	// the untouched stores once the old one has exited (see restartRaft).
-	errAwaitRaftShutdown = errors.New("timed out awaiting old raft shutdown")
 
 	// errNoVotersToRecover is returned by recoverQuorum when the current
 	// configuration has no peer voters to drop, so there is nothing for
@@ -366,10 +352,9 @@ func (s *Cache) fallbackDue(window time.Duration) bool {
 
 // tryFallbackBootstrap is runBootstrapFallback's bootstrap of rft. Rebuilds
 // swap the raft under recoveryMutex: holding it keeps a reset from landing
-// between the check and the bootstrap. Taking it can wait out a rebuild that
-// timed out on rft and left it shut down (the raft restarted after it gets
-// its own fallback), and a leader can ping meanwhile, so every check runs
-// again. It reports whether the fallback is done; false keeps it waiting.
+// between the check and the bootstrap. Taking it can wait out a rebuild, and
+// a leader can ping meanwhile, so every check runs again. It reports whether
+// the fallback is done; false keeps it waiting.
 func (s *Cache) tryFallbackBootstrap(rft *raft.Raft, after, window time.Duration, transport transports.Transport) bool {
 	s.recoveryMutex.Lock()
 	defer s.recoveryMutex.Unlock()
@@ -395,16 +380,12 @@ func (s *Cache) tryFallbackBootstrap(rft *raft.Raft, after, window time.Duration
 	if hasState, err := raft.HasExistingState(s.logStore, s.stableStore, s.snapshotStore); err != nil || hasState {
 		// See reinitRaftAdoptingInstance (RT-13010).
 		s.transport.SetHeartbeatHandler(nil)
-		if err := s.awaitRaftShutdown(rft, s.cfg.awaitRaftShutdownTimeout); err != nil {
-			// restartRaft brings a raft back once it has exited, with a
-			// fallback of its own.
-			s.logger.Warn("bootstrap fallback: shutting down raft failed", "local-id", s.localID, "error", err)
+		if err := awaitRaftShutdown(s.ctx, rft); err != nil {
 			return true
 		}
 		s.newStores()
-		fresh, err := s.rebuildRaft()
+		fresh, err := s.rebuildRaft(nil)
 		if err != nil {
-			// restartRaft tries again on the fresh stores.
 			return true
 		}
 		s.installRaft(fresh)
@@ -490,11 +471,6 @@ type Cache struct {
 		snapshotStore raft.SnapshotStore, transport transports.Transport) (*raft.Raft, error)
 
 	recoveryMutex sync.Mutex
-
-	// raftExit is the join on the raft instance a rebuild shut down, until
-	// restartRaft has run for it (see awaitRaftShutdown). Guarded by
-	// recoveryMutex.
-	raftExit *raftExit
 
 	// hardReset* remember the resetID of the most recent HardReset fan-out so
 	// a retry after a partial failure reuses it instead of minting a fresh
@@ -1275,21 +1251,13 @@ func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID s
 // the losing raft instance left running on the shared transport. The resetID
 // dedup check sits inside the lock so a duplicate RPC that waited out an
 // in-flight reset no-ops instead of wiping the node a second time.
-func (s *Cache) localHardReset(resetID, initiatorInstanceID string, full bool) (err error) {
+func (s *Cache) localHardReset(resetID, initiatorInstanceID string, full bool) error {
 	s.recoveryMutex.Lock()
 	defer s.recoveryMutex.Unlock()
 
-	if resetID != "" && resetID == s.getLastResetID() {
+	if !s.markResetID(resetID) {
 		return nil
 	}
-	// Recorded only once applied: a reset that failed, e.g. timed out awaiting
-	// the old raft, is applied by the initiator's retry instead of being
-	// deduplicated away while the node still runs its old raft (RT-15590).
-	defer func() {
-		if err == nil {
-			s.markResetID(resetID)
-		}
-	}()
 
 	if s.IsLeader() {
 		s.logger.Info("hard reset: FSM cleared; keeping raft state because this node is leader",
@@ -1299,6 +1267,9 @@ func (s *Cache) localHardReset(resetID, initiatorInstanceID string, full bool) (
 
 	s.logger.Info("hard reset: reinitializing raft because this node is a follower",
 		"local-id", s.localID, "reset-id", resetID, "adopt-instance-id", initiatorInstanceID, "full", full)
+	if initiatorInstanceID == "" {
+		s.setInstanceID("")
+	}
 	return s.reinitRaftAdoptingInstance(initiatorInstanceID, full)
 }
 
@@ -1334,9 +1305,7 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	// with a stale high index, making WaitFor return early — stale reads until
 	// the new raft has genuinely caught up (RT-14147). Awaiting is safe because
 	// raft was handed a transport wrapper that hides Close(); see hideClose.
-	// Bounded: on expiry nothing below has run yet, and the node is restarted
-	// on its untouched stores once the old raft has exited (see restartRaft).
-	if err := s.awaitRaftShutdown(s.raft(), s.cfg.awaitRaftShutdownTimeout); err != nil {
+	if err := awaitRaftShutdown(s.ctx, s.raft()); err != nil {
 		return fmt.Errorf("shutting down raft for reinit: %w", err)
 	}
 
@@ -1354,12 +1323,11 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	s.fsm.applyRaftReset()
 
 	s.newStores()
-	// Set only past the await: a reinit that timed out restarts on the old
-	// history, which must keep its ID. An empty adoptInstanceID clears it, so
-	// the next leader ping re-seeds it (see localHardReset).
-	s.setInstanceID(adoptInstanceID)
+	if adoptInstanceID != "" {
+		s.setInstanceID(adoptInstanceID)
+	}
 
-	rft, err := s.rebuildRaft()
+	rft, err := s.rebuildRaft(nil)
 	if err != nil {
 		return err
 	}
@@ -1400,113 +1368,66 @@ func (s *Cache) installRaft(rft *raft.Raft) {
 }
 
 const (
-	rebuildRaftAttempts = 3
-	rebuildRaftBackoff  = 200 * time.Millisecond
+	rebuildRaftBackoff    = 200 * time.Millisecond
+	rebuildRaftMaxBackoff = 5 * time.Second
 )
 
-// rebuildRaft constructs the post-reset raft instance, retrying a bounded
-// number of times. By the time it runs, reinitRaftAdoptingInstance has already
-// wiped the FSM and shut the old raft down, so a failure here leaves the node
-// inert — every raft call returns ErrRaftShutdown, and only restartRaft tries
-// once more (m5). The bounded retry rides out a transient store/transport
-// failure; if every attempt fails the node is logged about as loudly as a
-// library can manage before the error propagates to the caller.
-func (s *Cache) rebuildRaft() (*raft.Raft, error) {
-	var err error
-	for attempt := 1; attempt <= rebuildRaftAttempts; attempt++ {
-		var rft *raft.Raft
-		rft, err = s.newRaftFn(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport)
-		if err == nil {
-			return rft, nil
+// rebuildRaft constructs the raft instance that replaces the one a rebuild
+// shut down, retrying with backoff until it succeeds or the cache closes.
+// prepare, when set, readies the stores and the FSM before every attempt. By
+// the time it runs the old raft has exited and there is no way back to it, so
+// giving up would leave the node inert — every raft call returns
+// ErrRaftShutdown and nothing else replaces the raft (m5, RT-15590). Every
+// failed attempt is logged about as loudly as a library can manage.
+func (s *Cache) rebuildRaft(prepare func() error) (*raft.Raft, error) {
+	backoff := rebuildRaftBackoff
+	for attempt := 1; ; attempt++ {
+		var err error
+		if prepare != nil {
+			err = prepare()
 		}
-		s.logger.Error("raft rebuild after reset failed; node is inert until it succeeds",
+		if err == nil {
+			var rft *raft.Raft
+			if rft, err = s.newRaftFn(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport); err == nil {
+				return rft, nil
+			}
+		}
+		s.logger.Error("raft rebuild failed; node is inert until it succeeds",
 			"local-id", s.localID,
 			"attempt", attempt,
-			"max-attempts", rebuildRaftAttempts,
+			"retry-in", backoff,
 			"error", err,
 		)
-		if attempt < rebuildRaftAttempts {
-			time.Sleep(rebuildRaftBackoff)
+		select {
+		case <-s.ctx.Done():
+			return nil, err
+		case <-time.After(backoff):
 		}
+		backoff = min(2*backoff, rebuildRaftMaxBackoff)
 	}
-	return nil, err
-}
-
-// raftExit is the join on one raft instance's goroutines: done closes once
-// they have all exited, err is the shutdown future's result.
-type raftExit struct {
-	rft  *raft.Raft
-	done chan struct{}
-	err  error
 }
 
 // awaitRaftShutdown shuts down the raft instance a rebuild replaces and joins
-// its goroutines, bounded by timeout. shutdownFuture.Error() is the only thing
-// that joins run, runFSM and runSnapshots, but the latter two sit inside user
-// FSM code, so a wedged FSM must not pin the rebuild — and recoveryMutex —
-// forever (see defaultAwaitRaftShutdownTimeout). Both call sites run this
-// before mutating anything shared, so on expiry nothing is touched yet.
-//
-// The join is kept per instance: raft returns an empty future from every
-// Shutdown() after the first, so a retry that called it again would not wait
-// at all and could rebuild on top of goroutines still running (RT-15590).
-// Once the instance has exited, restartRaft brings the node back on a live
-// raft unless a rebuild replaced it. Callers hold recoveryMutex.
-func (s *Cache) awaitRaftShutdown(rft *raft.Raft, timeout time.Duration) error {
-	exit := s.raftExit
-	if exit == nil || exit.rft != rft {
-		exit = &raftExit{rft: rft, done: make(chan struct{})}
-		s.raftExit = exit
-		go func() {
-			exit.err = rft.Shutdown().Error()
-			close(exit.done)
-			s.restartRaft(rft)
-		}()
-	}
-
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+// its goroutines. shutdownFuture.Error() is the only thing that joins run,
+// runFSM and runSnapshots. The latter two sit inside user FSM code, so a
+// write-through FSM stuck on an unavailable backend holds the rebuild, and
+// recoveryMutex with it, until the backend is back. The wait is deliberately
+// not bounded: Shutdown() has run by then, and nothing can rebuild on the
+// stores or the FSM before those goroutines are gone. Giving up instead left
+// the node on a shut-down raft that nothing replaced (RT-15590). Only ctx, the
+// cache's, ends it early.
+func awaitRaftShutdown(ctx context.Context, rft *raft.Raft) error {
+	done := make(chan error, 1)
+	go func() { done <- rft.Shutdown().Error() }()
 
 	select {
-	case <-exit.done:
+	case err := <-done:
 		// raft@v1.7.3 returns nil unconditionally here; forwarding it is
 		// upgrade insurance, not a live branch.
-		return exit.err
-	case <-timer.C:
-		return errAwaitRaftShutdown
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-}
-
-// restartRaft runs once old, shut down by a rebuild, has exited. A rebuild
-// that completed has replaced it by then, and this does nothing. One that did
-// not (it timed out awaiting the exit, or failed past it) left the node on a
-// shut-down raft that nothing else would replace: the quorum watcher only
-// retries while shouldRecoverQuorum agrees, which a peer still pinging can
-// keep it from doing (RT-15590). So the raft is restarted on the current
-// stores, untouched when the rebuild timed out, and what to do is decided
-// again on what holds now: the quorum watcher re-evaluates recovery, a fork
-// adoption fires again on the next leader ping, and a hard reset is retried by
-// its initiator (localHardReset records only applied resets).
-func (s *Cache) restartRaft(old *raft.Raft) {
-	s.recoveryMutex.Lock()
-	defer s.recoveryMutex.Unlock()
-
-	if s.raftExit != nil && s.raftExit.rft == old {
-		// Nothing is left to join. Dropping the join keeps the old instance,
-		// and its in-memory log, from staying reachable until the next rebuild.
-		s.raftExit = nil
-	}
-	if s.ctx.Err() != nil || s.raft() != old {
-		return
-	}
-
-	s.logger.Warn("raft rebuild did not complete; restarting raft on the current stores",
-		"local-id", s.localID)
-	rft, err := s.rebuildRaft()
-	if err != nil {
-		return
-	}
-	s.installRaft(rft)
 }
 
 // runQuorumRecoveryWatch is the long-running goroutine that decides when to
@@ -1816,17 +1737,18 @@ func (s *Cache) recoverQuorum() error {
 	// listener shutdown, either of which would brick the transport the new raft
 	// instance below runs on. Hence hideClose: the transport raft holds does not
 	// satisfy raft.WithClose, which makes the wait safe.
-	//
-	// Bounded, and it matters more here than in reinit: this path runs from the
-	// quorum watcher holding recoveryMutex, and it is needed exactly when the
-	// cluster is already wedged. On expiry every store is still untouched, so
-	// fire() logs, the raft is restarted on them once the old one has exited
-	// (see restartRaft) and the watcher decides on recovery again — better
-	// than an indefinite hold that also queues a concurrent hard reset or fork
-	// adoption behind the mutex.
-	if err := s.awaitRaftShutdown(rft, s.cfg.awaitRaftShutdownTimeout); err != nil {
+	if err := awaitRaftShutdown(s.ctx, rft); err != nil {
 		return fmt.Errorf("shutting down raft for recovery: %w", err)
 	}
+
+	// Mint a fresh instance ID — recoverQuorum forks the consensus
+	// history line on purpose (RT-12862). Surviving peers compare the
+	// captain's new ID against their own on the next discovery ping;
+	// any mismatch triggers their reinitRaftAdoptingInstance, which wipes the stale
+	// in-memory log/snapshot state that would otherwise trap them in a
+	// snapshot-regression catchup loop on top of the captain's
+	// (possibly older) recovered snapshot.
+	s.setInstanceID(uuid.NewString())
 
 	// RecoverCluster restores the newest snapshot into the FSM and then
 	// re-applies every LogCommand after it. We deliberately pass the live
@@ -1838,40 +1760,35 @@ func (s *Cache) recoverQuorum() error {
 	// contains those entries; a non-idempotent applier would corrupt itself.
 	// Reset the FSM first so the full-log replay rebuilds the state exactly
 	// (M2).
-	if snaps, err := s.snapshotStore.List(); err != nil {
-		return fmt.Errorf("list snapshots: %w", err)
-	} else if len(snaps) == 0 {
-		// Not a full reset (full is reserved for an explicit operator full reset;
-		// recovery never wipes cache-only data on its own). This clear only gives
-		// the full-log replay an idempotent base (M2) — the replay rebuilds all
-		// cache content from the log, KeepOnReset stores included, so there is no
-		// need to clear those here.
-		if err := s.fsm.applyReset(false); err != nil {
-			return fmt.Errorf("reset fsm before log replay: %w", err)
-		}
-	}
-
+	//
+	// Past the shutdown there is no way back to the old raft, so a failure is
+	// retried from the snapshot check on until the recovered raft runs (see
+	// rebuildRaft). Repeating RecoverCluster is safe: a snapshot an earlier
+	// attempt wrote replaces the FSM on restore, and the log replayed after it
+	// is the same.
 	conf := raftConfig(s.cfg)
-	if err := raft.RecoverCluster(conf, s.fsm, s.logStore, s.stableStore, s.snapshotStore,
-		s.transport, raft.Configuration{Servers: keep}); err != nil {
-		return fmt.Errorf("recover cluster: %w", err)
-	}
-
-	rftNew, err := newRaft(s.cfg, s.fsm, s.logStore, s.stableStore, s.snapshotStore, s.transport)
+	rftNew, err := s.rebuildRaft(func() error {
+		if snaps, err := s.snapshotStore.List(); err != nil {
+			return fmt.Errorf("list snapshots: %w", err)
+		} else if len(snaps) == 0 {
+			// Not a full reset (full is reserved for an explicit operator full reset;
+			// recovery never wipes cache-only data on its own). This clear only gives
+			// the full-log replay an idempotent base (M2) — the replay rebuilds all
+			// cache content from the log, KeepOnReset stores included, so there is no
+			// need to clear those here.
+			if err := s.fsm.applyReset(false); err != nil {
+				return fmt.Errorf("reset fsm before log replay: %w", err)
+			}
+		}
+		if err := raft.RecoverCluster(conf, s.fsm, s.logStore, s.stableStore, s.snapshotStore,
+			s.transport, raft.Configuration{Servers: keep}); err != nil {
+			return fmt.Errorf("recover cluster: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("restart raft: %w", err)
 	}
-
-	// Mint a fresh instance ID — recoverQuorum forks the consensus
-	// history line on purpose (RT-12862). Surviving peers compare the
-	// captain's new ID against their own on the next discovery ping;
-	// any mismatch triggers their reinitRaftAdoptingInstance, which wipes the stale
-	// in-memory log/snapshot state that would otherwise trap them in a
-	// snapshot-regression catchup loop on top of the captain's
-	// (possibly older) recovered snapshot. Minted only once nothing can fail
-	// any more: a failed recovery restarts on the old history (see
-	// restartRaft), which must keep its ID.
-	s.setInstanceID(uuid.NewString())
 
 	// Forget every peer voter we dropped so that, when they ping discovery
 	// again (whether currently alive or after a restart), ProcessServer
@@ -1880,8 +1797,7 @@ func (s *Cache) recoverQuorum() error {
 		s.discovery.forgetServer(srv.ID)
 	}
 
-	s.setRaft(rftNew)
-	s.discovery.run(s.ctx, rftNew)
+	s.installRaft(rftNew)
 	go s.reassertRecoveredConfig(rftNew)
 	return nil
 }
@@ -2132,12 +2048,6 @@ func (s *Cache) shouldRecoverQuorum(now time.Time, aliveCutoff time.Duration) bo
 		return false
 	}
 	if s.IsLeader() || s.hasLeader() {
-		return false
-	}
-	// A rebuild shut the raft down and has not replaced it yet. Nothing can be
-	// recovered before it exits, and the raft restarted then is judged afresh
-	// (see restartRaft).
-	if rft := s.raft(); rft != nil && rft.State() == raft.Shutdown {
 		return false
 	}
 

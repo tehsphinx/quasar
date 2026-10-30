@@ -39,11 +39,8 @@ type options struct {
 	bootstrapFallback  time.Duration
 	noLeaderTimeout    time.Duration
 	maxInflightApplies int
-	// awaitRaftShutdownTimeout is defaultAwaitRaftShutdownTimeout; only tests
-	// shorten it.
-	awaitRaftShutdownTimeout time.Duration
-	hclogLogger              hclog.Logger
-	slogLogger               *slog.Logger
+	hclogLogger        hclog.Logger
+	slogLogger         *slog.Logger
 
 	kv     stores.KVStore
 	pStore stores.PersistentStorage
@@ -57,8 +54,6 @@ func getOptions(opts []Option) options {
 		noLeaderTimeout:   defaultNoLeaderTimeout,
 		bootstrapWait:     defaultBootstrapWait,
 		bootstrapFallback: defaultBootstrapFallback,
-
-		awaitRaftShutdownTimeout: defaultAwaitRaftShutdownTimeout,
 	}
 	for _, opt := range opts {
 		opt(&cfg)

@@ -19,7 +19,7 @@ func TestRecoverQuorumResetsFSMWhenNoSnapshot(t *testing.T) {
 	defer cancel()
 
 	addr, tr := transports.NewInmemTransport("")
-	fsm := &stubFSM{}
+	fsm := &snapStubFSM{}
 	c, err := NewCache(ctx, fsm,
 		WithLocalID("self"),
 		WithTransport(tr),
@@ -44,12 +44,19 @@ func TestRecoverQuorumResetsFSMWhenNoSnapshot(t *testing.T) {
 		t.Fatalf("expected an empty snapshot store, got %d snapshots", len(snaps))
 	}
 
-	// RecoverCluster snapshots the FSM at the end, which stubFSM cannot do,
-	// so recoverQuorum may return an error — but the FSM reset happens first,
-	// which is what we assert.
-	_ = c.recoverQuorum()
+	if err := c.recoverQuorum(); err != nil {
+		t.Fatalf("recoverQuorum: %v", err)
+	}
 
 	if got := fsm.resets.Load(); got != 1 {
 		t.Fatalf("expected the FSM to be reset once before log replay, got %d resets", got)
 	}
 }
+
+// snapStubFSM is a stubFSM that can snapshot, which RecoverCluster needs at
+// its end: a recovery that cannot snapshot is retried until the cache closes.
+type snapStubFSM struct {
+	stubFSM
+}
+
+func (*snapStubFSM) Snapshot() (raft.FSMSnapshot, error) { return snapFSMSnapshot(nil), nil }
