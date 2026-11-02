@@ -34,13 +34,19 @@ type snapshotStore struct {
 	fsm *fsmWrapper
 
 	// closeMu makes the newer-snapshot check in pendingSink.Close and the
-	// create that follows it one step.
-	closeMu sync.Mutex
+	// create and write that follow it one step. Open takes it for reading so
+	// it never copies a snapshot that is still being written.
+	closeMu sync.RWMutex
 }
 
 // Open opens the given snapshot and records its meta index for the restore
-// that may follow.
+// that may follow. It waits for a pendingSink.Close that is still writing:
+// raft.InmemSnapshotStore lists a snapshot from its Create on, so a leader
+// streaming it to a follower would otherwise send it empty, and the follower
+// would store the empty snapshot at that index (RT-15590).
 func (s *snapshotStore) Open(id string) (*raft.SnapshotMeta, io.ReadCloser, error) {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
 	meta, rc, err := s.SnapshotStore.Open(id)
 	if err != nil {
 		return meta, rc, err
