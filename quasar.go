@@ -1024,7 +1024,8 @@ func (s *Cache) handleRPC(ctx context.Context, rpc raft.RPC) {
 		resp = &pb.StoreResponse{Uid: uid}
 	case *pb.ResetCache:
 		if cmd.Hard {
-			err = s.localHardReset(cmd.Uuid, cmd.GetInitiatorInstanceId(), cmd.GetFull())
+			err = s.localHardReset(cmd.Uuid, cmd.GetInitiatorInstanceId(), cmd.GetFull(),
+				cmd.GetInitiatorId(), cmd.GetInitiatorVoters())
 		} else {
 			err = s.reset(ctx, cmd.GetFull())
 		}
@@ -1189,7 +1190,7 @@ func (s *Cache) HardReset(ctx context.Context, opts ...ResetOption) error {
 		if server.ID == raft.ServerID(s.localID) {
 			continue
 		}
-		if r := s.sendHardReset(ctx, server, resetID, o.full); r != nil {
+		if r := s.sendHardReset(ctx, server, resetID, o.full, false); r != nil {
 			retErrs = append(retErrs, r)
 		}
 	}
@@ -1252,13 +1253,23 @@ func (s *Cache) localInitiatorReset(resetID string, full bool) error {
 // carries this node's instance ID so the receiver adopts the initiator's
 // consensus-history line right at the wipe instead of waiting to re-adopt it
 // from a later discovery ping (RT-13067).
-func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID string, full bool) error {
-	resp, err := s.transport.ResetCache(ctx, server.ID, server.Address, &pb.ResetCache{
+//
+// admission marks a discovery admission wipe: the RPC then also carries this
+// node's server ID and voter count, so a receiver whose own cluster outranks
+// this one refuses instead of being wiped (RT-14149, see outranksInitiator).
+// An operator HardReset passes false.
+func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID string, full, admission bool) error {
+	msg := &pb.ResetCache{
 		Uuid:                resetID,
 		Hard:                true,
 		Full:                full,
 		InitiatorInstanceId: s.getInstanceID(),
-	})
+	}
+	if admission {
+		msg.InitiatorId = s.localID
+		msg.InitiatorVoters = s.voters()
+	}
+	resp, err := s.transport.ResetCache(ctx, server.ID, server.Address, msg)
 	if err != nil {
 		return err
 	}
@@ -1293,26 +1304,92 @@ func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID s
 // the losing raft instance left running on the shared transport. The resetID
 // dedup check sits inside the lock so a duplicate RPC that waited out an
 // in-flight reset no-ops instead of wiping the node a second time.
-func (s *Cache) localHardReset(resetID, initiatorInstanceID string, full bool) error {
+//
+// initiatorID and initiatorVoters are set only on a discovery admission wipe
+// (see sendHardReset). Two leaders from different histories that meet wipe
+// each other this way. The leader branch used to clear the FSM while keeping
+// the log, snapshot and lastApplied on both, so the surviving leader served an
+// empty FSM its log claimed was applied (RT-14149). Now the ranks decide: a
+// node whose cluster outranks the initiator's refuses, without recording the
+// resetID so a later wipe once ranks have changed still applies; an outranked
+// leader steps down through the follower rebuild below and adopts the
+// initiator's history. A follower ranks its leader's cluster the same way: the
+// losing leader's gate wipes the winner's followers too, and a follower that
+// let it would hand the loser its quorum.
+func (s *Cache) localHardReset(resetID, initiatorInstanceID string, full bool,
+	initiatorID string, initiatorVoters uint32,
+) error {
 	s.recoveryMutex.Lock()
 	defer s.recoveryMutex.Unlock()
+
+	if initiatorID != "" && s.outranksInitiator(initiatorID, initiatorVoters) {
+		return errOutranksInitiator
+	}
 
 	if !s.markResetID(resetID) {
 		return nil
 	}
 
-	if s.IsLeader() {
+	switch {
+	case s.IsLeader() && initiatorID == "":
 		s.logger.Info("hard reset: FSM cleared; keeping raft state because this node is leader",
 			"local-id", s.localID, "reset-id", resetID, "full", full)
 		return s.fsm.applyReset(full)
+	case s.IsLeader():
+		s.logger.Warn("hard reset: stepping down and reinitializing raft; the initiator's cluster outranks this one",
+			"local-id", s.localID, "reset-id", resetID, "initiator-id", initiatorID,
+			"initiator-voters", initiatorVoters, "adopt-instance-id", initiatorInstanceID, "full", full)
+	default:
+		s.logger.Info("hard reset: reinitializing raft because this node is a follower",
+			"local-id", s.localID, "reset-id", resetID, "adopt-instance-id", initiatorInstanceID, "full", full)
 	}
-
-	s.logger.Info("hard reset: reinitializing raft because this node is a follower",
-		"local-id", s.localID, "reset-id", resetID, "adopt-instance-id", initiatorInstanceID, "full", full)
 	if initiatorInstanceID == "" {
 		s.setInstanceID("")
 	}
 	return s.reinitRaftAdoptingInstance(initiatorInstanceID, full)
+}
+
+// errOutranksInitiator is returned to the sender of an admission wipe that the
+// receiver refuses (see localHardReset). It crosses the RPC as a string.
+var errOutranksInitiator = errors.New("hard reset: refusing admission wipe; this node's cluster outranks the initiator's")
+
+// outranksInitiator reports whether the cluster this node is in outranks the
+// cluster of the leader sending an admission wipe (RT-14149). A cluster's rank
+// is the number of voters in its configuration, more wins, and a tie goes to
+// the lower leader server ID, the rule voterAhead uses for bootstrap. Both
+// leaders apply the same rule to the same pair, so of two that wipe each other
+// exactly one refuses and the other steps down. A node that knows no leader, or
+// follows the initiator itself, has no other cluster to keep and never
+// outranks; a follower that still believes in a dead leader refuses only until
+// its heartbeat timeout clears that leader, and the sender's sweep retries.
+//
+// ponytail: each side ranks its live configuration against the count the other
+// sent, so a membership change mid-merge can make both refuse (the next sweep
+// retries) or both step down (both histories lost; the bootstrap fallback forms
+// one cluster). Rank by server ID alone if that shows up: it cannot change
+// mid-merge, at the cost of rebuilding the larger side.
+func (s *Cache) outranksInitiator(initiatorID string, initiatorVoters uint32) bool {
+	rft := s.raft()
+	if rft == nil {
+		return false
+	}
+	_, leaderID := rft.LeaderWithID()
+	if leaderID == "" || string(leaderID) == initiatorID {
+		return false
+	}
+	if voters := s.voters(); voters != initiatorVoters {
+		return voters > initiatorVoters
+	}
+	return string(leaderID) < initiatorID
+}
+
+// voters returns the number of voters in this node's raft configuration, self
+// included, refreshing the value discovery pings report.
+func (s *Cache) voters() uint32 {
+	if rft := s.raft(); rft != nil {
+		s.discovery.refreshVoterCount(rft)
+	}
+	return s.discovery.voterCount.Load()
 }
 
 // reinitRaftAdoptingInstance tears down the local raft and rebuilds it on

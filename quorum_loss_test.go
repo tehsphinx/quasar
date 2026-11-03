@@ -24,17 +24,20 @@ import (
 //
 // muted holds a set of sender localIDs whose pings should not be
 // delivered to anyone, used by tests that need to partition discovery
-// independently of transport.
+// independently of transport. silenced holds senders whose pings are
+// dropped while they still receive everyone else's: a one-way partition.
 type inmemBus struct {
-	mu      sync.RWMutex
-	members map[*inmemDiscovery]struct{}
-	muted   map[string]struct{}
+	mu       sync.RWMutex
+	members  map[*inmemDiscovery]struct{}
+	muted    map[string]struct{}
+	silenced map[string]struct{}
 }
 
 func newInmemBus() *inmemBus {
 	return &inmemBus{
-		members: map[*inmemDiscovery]struct{}{},
-		muted:   map[string]struct{}{},
+		members:  map[*inmemDiscovery]struct{}{},
+		muted:    map[string]struct{}{},
+		silenced: map[string]struct{}{},
 	}
 }
 
@@ -66,9 +69,24 @@ func (b *inmemBus) unmute(localID string) {
 	delete(b.muted, localID)
 }
 
+// silence and unsilence toggle whether a given localID's discovery pings are
+// delivered, without changing what it receives.
+func (b *inmemBus) silence(localID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.silenced[localID] = struct{}{}
+}
+
+func (b *inmemBus) unsilence(localID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.silenced, localID)
+}
+
 func (b *inmemBus) broadcast(srv raft.Server, status quasar.PeerStatus, sender *inmemDiscovery) {
 	b.mu.RLock()
-	if _, muted := b.muted[string(srv.ID)]; muted {
+	_, silenced := b.silenced[string(srv.ID)]
+	if _, muted := b.muted[string(srv.ID)]; muted || silenced {
 		b.mu.RUnlock()
 		return
 	}

@@ -81,7 +81,7 @@ func TestLocalHardResetSerializesWithRecovery(t *testing.T) {
 	c.recoveryMutex.Lock()
 
 	done := make(chan error, 1)
-	go func() { done <- c.localHardReset("reset-1", "", false) }()
+	go func() { done <- c.localHardReset("reset-1", "", false, "", 0) }()
 
 	select {
 	case <-done:
@@ -144,7 +144,7 @@ func TestReinitRaftRebuildFailureRetriesAndLogs(t *testing.T) {
 	}
 
 	old := c.raft()
-	if err := c.localHardReset("reset-1", "", false); err != nil {
+	if err := c.localHardReset("reset-1", "", false, "", 0); err != nil {
 		t.Fatalf("expected the rebuild to be retried until it succeeds, got %v", err)
 	}
 	if got := strings.Count(out.String(), "node is inert"); got != failures {
@@ -197,7 +197,7 @@ func TestLocalHardResetAdoptsInitiatorInstanceID(t *testing.T) {
 
 	c.setInstanceID("stale-instance-id")
 
-	if err := c.localHardReset("reset-1", "initiator-instance-id", false); err != nil {
+	if err := c.localHardReset("reset-1", "initiator-instance-id", false, "", 0); err != nil {
 		t.Fatalf("localHardReset: %v", err)
 	}
 
@@ -220,7 +220,7 @@ func TestLocalHardResetClearsInstanceID(t *testing.T) {
 
 	c.setInstanceID("stale-instance-id")
 
-	if err := c.localHardReset("reset-1", "", false); err != nil {
+	if err := c.localHardReset("reset-1", "", false, "", 0); err != nil {
 		t.Fatalf("localHardReset: %v", err)
 	}
 
@@ -248,7 +248,7 @@ func TestLocalHardResetDeduplicatesConcurrentResets(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := c.localHardReset("reset-1", "", false); err != nil {
+			if err := c.localHardReset("reset-1", "", false, "", 0); err != nil {
 				t.Errorf("localHardReset: %v", err)
 			}
 		}()
@@ -313,7 +313,7 @@ func TestFollowerHardResetAwaitsOldRaftShutdown(t *testing.T) {
 
 	fsm.raftState = c.raft().State
 
-	if err := c.localHardReset("reset-1", "", false); err != nil {
+	if err := c.localHardReset("reset-1", "", false, "", 0); err != nil {
 		t.Fatalf("localHardReset: %v", err)
 	}
 
@@ -374,7 +374,7 @@ func TestFollowerHardResetRebuildsRaftWhenFSMResetFails(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Shutdown() })
 
-	if err := c.localHardReset("reset-1", "", false); err != nil {
+	if err := c.localHardReset("reset-1", "", false, "", 0); err != nil {
 		t.Fatalf("localHardReset must not surface the reset error, got %v", err)
 	}
 	if fsm.resets.Load() != 1 {
@@ -382,5 +382,93 @@ func TestFollowerHardResetRebuildsRaftWhenFSMResetFails(t *testing.T) {
 	}
 	if state := c.raft().State(); state == raft.Shutdown {
 		t.Fatal("raft was not rebuilt after the failed FSM reset; the node is inert")
+	}
+}
+
+// TestAdmissionWipeRanksLeaders is the RT-14149 regression test. Two leaders
+// from different histories that meet wipe each other through the discovery
+// admission gate. A leader receiving that wipe used to clear its FSM and keep
+// its log, snapshot and lastApplied, so the surviving leader served an empty
+// FSM its log claimed was applied. Now the ranks decide: more voters wins, a
+// tie goes to the lower server ID; the winner refuses and leaves the resetID
+// unrecorded, the loser steps down through the follower rebuild.
+func TestAdmissionWipeRanksLeaders(t *testing.T) {
+	tests := []struct {
+		name            string
+		localID         string
+		initiatorID     string
+		initiatorVoters uint32
+		refuse          bool
+	}{
+		{name: "tie, lower ID refuses", localID: "a", initiatorID: "b", initiatorVoters: 1, refuse: true},
+		{name: "tie, higher ID steps down", localID: "b", initiatorID: "a", initiatorVoters: 1},
+		{name: "more voters refuses despite higher ID", localID: "z", initiatorID: "a", initiatorVoters: 0, refuse: true},
+		{name: "fewer voters steps down despite lower ID", localID: "a", initiatorID: "z", initiatorVoters: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			fsm := &stubFSM{}
+			c := newLeaderCache(ctx, t, fsm, WithLocalID(tt.localID))
+			ownInst := c.getInstanceID()
+			old := c.raft()
+
+			err := c.localHardReset("initiator-inst", "initiator-inst", false, tt.initiatorID, tt.initiatorVoters)
+
+			if tt.refuse {
+				if !errors.Is(err, errOutranksInitiator) {
+					t.Fatalf("expected errOutranksInitiator, got %v", err)
+				}
+				if got := fsm.resets.Load(); got != 0 {
+					t.Fatalf("the outranking leader cleared its FSM %d times", got)
+				}
+				if c.raft() != old || !c.IsLeader() || c.getInstanceID() != ownInst {
+					t.Fatal("the outranking leader lost its raft, leadership or instance ID")
+				}
+				if c.getLastResetID() == "initiator-inst" {
+					t.Fatal("a refused wipe recorded its resetID; a later wipe with it would be skipped")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("localHardReset: %v", err)
+			}
+			if c.raft() == old {
+				t.Fatal("the outranked leader kept its raft instead of stepping down")
+			}
+			if got := c.getInstanceID(); got != "initiator-inst" {
+				t.Fatalf("expected the initiator's instance ID adopted, got %q", got)
+			}
+			if got := fsm.resets.Load(); got != 1 {
+				t.Fatalf("expected one FSM reset on the step-down, got %d", got)
+			}
+		})
+	}
+}
+
+// TestOperatorHardResetKeepsLeaderRaft guards the operator path RT-14149 left
+// alone: a hard reset without an initiator server ID (an operator HardReset,
+// or a sender older than RT-14149) still clears only the leader's FSM and
+// keeps its raft, whatever the initiator's instance ID.
+func TestOperatorHardResetKeepsLeaderRaft(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fsm := &stubFSM{}
+	c := newLeaderCache(ctx, t, fsm)
+	ownInst := c.getInstanceID()
+	old := c.raft()
+
+	if err := c.localHardReset("reset-1", "other-inst", false, "", 0); err != nil {
+		t.Fatalf("localHardReset: %v", err)
+	}
+	if got := fsm.resets.Load(); got != 1 {
+		t.Fatalf("expected one FSM reset, got %d", got)
+	}
+	if c.raft() != old || !c.IsLeader() || c.getInstanceID() != ownInst {
+		t.Fatal("the leader lost its raft, leadership or instance ID on an operator hard reset")
 	}
 }

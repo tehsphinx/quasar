@@ -504,7 +504,7 @@ func TestRebuildWaitsOutAWedgedFSM(t *testing.T) {
 		},
 		{
 			name:    "hard reset",
-			rebuild: func(c *Cache) error { return c.localHardReset("reset-1", "initiator-hist", false) },
+			rebuild: func(c *Cache) error { return c.localHardReset("reset-1", "initiator-hist", false, "", 0) },
 			rebuilt: func(c *Cache, _ string) bool {
 				return c.hasEmptyConfig() && c.getInstanceID() == "initiator-hist" && c.getLastResetID() == "reset-1"
 			},

@@ -83,6 +83,16 @@ message ResetCache {
   // triggers no raft reinit. Used by an explicit operator hard reset to wipe cache-only data, while
   // a no-leader auto-escalation leaves it false to preserve that data.
   bool full = 4;
+
+  // initiator_id is the raft server ID of the leader sending a discovery admission wipe; an operator
+  // HardReset leaves it empty. Together with initiator_voters it ranks the initiator's cluster against
+  // the receiver's, so that when two leaders from different histories meet, exactly one keeps its
+  // history: more voters wins, a tie goes to the lower server ID (RT-14149).
+  string initiator_id = 5;
+
+  // initiator_voters is the number of voters in the initiator's raft configuration. Only set together
+  // with initiator_id.
+  uint32 initiator_voters = 6;
 }
 
 message ResetCacheResponse {
