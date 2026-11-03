@@ -216,9 +216,14 @@ func (s *DiscoveryInjector) ProcessServerWithStatus(srv raft.Server, status Peer
 // ErrNotLeader is the expected outcome on every other node — once per newly
 // discovered peer — and is dropped rather than logged (RT-14059). Anything
 // else is a real error: the kind that used to be swallowed here and exile the
-// peer (RT-13934).
+// peer (RT-13934). A refused admission wipe is the expected outcome for the
+// lower-ranked of two leaders until it steps down (RT-14149), so it is Info.
 func (s *DiscoveryInjector) logAddServerFailure(srv raft.Server, err error) {
 	if errors.Is(err, raft.ErrNotLeader) {
+		return
+	}
+	if errors.Is(err, errOutranksInitiator) {
+		s.Logger().Info("not adding discovered server: its cluster outranks this one", "server", srv.ID)
 		return
 	}
 	s.Logger().Error("failed to add discovered server to raft",

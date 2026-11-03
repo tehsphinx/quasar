@@ -1270,13 +1270,15 @@ func (s *Cache) sendHardReset(ctx context.Context, server raft.Server, resetID s
 		msg.InitiatorVoters = s.voters()
 	}
 	resp, err := s.transport.ResetCache(ctx, server.ID, server.Address, msg)
-	if err != nil {
-		return err
+	if err == nil && resp.GetError() != "" {
+		err = errors.New(resp.GetError())
 	}
-	if resp.GetError() != "" {
-		return errors.New(resp.GetError())
+	if err != nil && err.Error() == errOutranksInitiator.Error() {
+		// NATS carries the receiver's error as a string; restore the sentinel
+		// so addServer's caller can tell a refusal from a failure.
+		return errOutranksInitiator
 	}
-	return nil
+	return err
 }
 
 // localHardReset applies a hard reset to this node. resetID deduplicates resets

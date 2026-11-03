@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+	"github.com/tehsphinx/quasar/pb/v1"
 	"github.com/tehsphinx/quasar/transports"
 )
 
@@ -470,5 +471,36 @@ func TestOperatorHardResetKeepsLeaderRaft(t *testing.T) {
 	}
 	if c.raft() != old || !c.IsLeader() || c.getInstanceID() != ownInst {
 		t.Fatal("the leader lost its raft, leadership or instance ID on an operator hard reset")
+	}
+}
+
+// stringErrResetTransport answers every ResetCache with the given error
+// flattened to a string, as the NATS transport delivers a receiver's error.
+type stringErrResetTransport struct {
+	transports.Transport
+	err error
+}
+
+func (t *stringErrResetTransport) ResetCache(context.Context, raft.ServerID, raft.ServerAddress,
+	*pb.ResetCache,
+) (*pb.ResetCacheResponse, error) {
+	return nil, errors.New(t.err.Error())
+}
+
+// TestSendHardResetRestoresRefusalSentinel guards the sender side of RT-14149:
+// a refused admission wipe arrives over NATS as a plain string, and
+// sendHardReset must turn it back into errOutranksInitiator so discovery logs
+// the routine refusal at Info instead of as a failure.
+func TestSendHardResetRestoresRefusalSentinel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, inmem := transports.NewInmemTransport("")
+	tr := &stringErrResetTransport{Transport: inmem, err: errOutranksInitiator}
+	c := newLeaderCache(ctx, t, &stubFSM{}, WithTransport(tr))
+
+	err := c.sendHardReset(ctx, raft.Server{ID: "peer", Address: "peer"}, "reset-1", false, true)
+	if !errors.Is(err, errOutranksInitiator) {
+		t.Fatalf("sendHardReset returned %v, want errOutranksInitiator", err)
 	}
 }
