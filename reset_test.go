@@ -3,6 +3,7 @@ package quasar_test
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -977,4 +978,182 @@ func TestFreshLeaderWipesAheadPeersOnAdmission_RT13067(t *testing.T) {
 		}
 		return nil
 	}))
+}
+
+// resetCountingFSM counts FSM clears, so a merge test can assert that the
+// surviving leader's FSM was never wiped.
+type resetCountingFSM struct {
+	*exampleFSM.InMemoryFSM
+	resets atomic.Int32
+}
+
+func (f *resetCountingFSM) Reset() error {
+	f.resets.Add(1)
+	return f.InMemoryFSM.Reset()
+}
+
+type mergeNode struct {
+	id    string
+	cache *quasar.Cache
+	fsm   *resetCountingFSM
+}
+
+// startMergeVoters starts one discovery-enabled voter per id, in order, with
+// every transport connected. Mute an id on bus first to have it bootstrap on
+// its own, then unmute it to let the clusters meet.
+func startMergeVoters(ctx context.Context, t *testing.T, bus *inmemBus, ids ...string) map[string]*mergeNode {
+	t.Helper()
+
+	addrs := map[string]raft.ServerAddress{}
+	trs := map[string]*transports.InmemTransport{}
+	for _, id := range ids {
+		addrs[id], trs[id] = transports.NewInmemTransport("")
+	}
+	for _, id := range ids {
+		for _, other := range ids {
+			if id != other {
+				trs[id].Connect(addrs[other], trs[other])
+			}
+		}
+	}
+
+	nodes := map[string]*mergeNode{}
+	for _, id := range ids {
+		fsm := &resetCountingFSM{InMemoryFSM: exampleFSM.NewInMemoryFSM()}
+		c, err := quasar.NewCache(ctx, fsm,
+			quasar.WithLocalID(id),
+			quasar.WithTransport(trs[id]),
+			quasar.WithDiscovery(newInmemDiscovery(bus, 200*time.Millisecond)),
+			quasar.WithBootstrapWait(time.Second),
+		)
+		if err != nil {
+			t.Fatalf("NewCache %s: %v", id, err)
+		}
+		t.Cleanup(func() { _ = c.Shutdown() })
+		nodes[id] = &mergeNode{id: id, cache: c, fsm: fsm}
+	}
+	return nodes
+}
+
+// waitMerged waits until every node carries instance ID inst and an FSM that
+// holds keep and not drop, and the leader has every node in its configuration.
+func waitMerged(ctx context.Context, inst, keep, drop string, nodes ...*mergeNode) error {
+	return waitForCondition(ctx, func() error {
+		leaders := 0
+		for _, n := range nodes {
+			id := n.id
+			if got := n.cache.InstanceID(); got != inst {
+				return fmt.Errorf("%s has instance ID %q, want %q", id, got, inst)
+			}
+			if err := hasAll(n.fsm.InMemoryFSM, keep); err != nil {
+				return fmt.Errorf("%s: %w", id, err)
+			}
+			if err := allCleared(n.fsm.InMemoryFSM, drop); err != nil {
+				return fmt.Errorf("%s: %w", id, err)
+			}
+			if !n.cache.IsLeader() {
+				continue
+			}
+			leaders++
+			srvs, err := n.cache.GetServerList()
+			if err != nil {
+				return err
+			}
+			if len(srvs) != len(nodes) {
+				return fmt.Errorf("leader %s has %d servers, want %d", id, len(srvs), len(nodes))
+			}
+		}
+		if leaders != 1 {
+			return fmt.Errorf("%d leaders, want 1", leaders)
+		}
+		return nil
+	})
+}
+
+// TestTwoLeadersMergeOntoLowerID_RT14149 is the RT-14149 acceptance test. Two
+// voters bootstrap on their own, each takes a write, then discovery connects
+// them. Each leader's admission gate hard-resets the other, and a leader
+// receiving that used to clear its FSM while keeping its log. With equal
+// voter counts the lower server ID now keeps its history: both nodes end on
+// a's instance ID and a's FSM, which was never cleared.
+func TestTwoLeadersMergeOntoLowerID_RT14149(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping two-leader merge in -short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	asrt := is.New(t)
+
+	bus := newInmemBus()
+	bus.mute("a")
+	nodes := startMergeVoters(ctx, t, bus, "a", "b")
+	a, b := nodes["a"], nodes["b"]
+
+	asrt.NoErr(waitForCondition(ctx, func() error {
+		if !a.cache.IsLeader() || !b.cache.IsLeader() {
+			return fmt.Errorf("a and b are not both leaders yet")
+		}
+		return nil
+	}))
+	asrt.NoErr(writeMusician(ctx, a.fsm.InMemoryFSM, "ka"))
+	asrt.NoErr(writeMusician(ctx, b.fsm.InMemoryFSM, "kb"))
+	instA := a.cache.InstanceID()
+	asrt.True(instA != b.cache.InstanceID())
+
+	bus.unmute("a")
+
+	mergeCtx, cancelMerge := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelMerge()
+	asrt.NoErr(waitMerged(mergeCtx, instA, "ka", "kb", a, b))
+	asrt.Equal(a.fsm.resets.Load(), int32(0)) // the winner's FSM was never cleared
+}
+
+// TestLargerClusterWinsLeaderMerge_RT14149: a two-voter cluster b+c meets a
+// single-voter leader a. The larger configuration wins over the lower server
+// ID, so all three end on b's instance ID and b's FSM. a hears b and c before
+// they hear a, so a's admission gate wipes c, b's follower, first: c must
+// refuse it like its leader does, or a takes c over, ties b on two voters, and
+// wins on the lower server ID.
+func TestLargerClusterWinsLeaderMerge_RT14149(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping two-leader merge in -short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	asrt := is.New(t)
+
+	bus := newInmemBus()
+	bus.mute("a")
+	nodes := startMergeVoters(ctx, t, bus, "a", "b", "c")
+	a, b, c := nodes["a"], nodes["b"], nodes["c"]
+
+	asrt.NoErr(waitForCondition(ctx, func() error {
+		if !a.cache.IsLeader() || !b.cache.IsLeader() {
+			return fmt.Errorf("a and b are not both leaders yet")
+		}
+		if srvs, err := b.cache.GetServerList(); err != nil || len(srvs) != 2 {
+			return fmt.Errorf("b has not admitted c yet")
+		}
+		if c.cache.InstanceID() != b.cache.InstanceID() {
+			return fmt.Errorf("c has not adopted b's instance ID yet")
+		}
+		return nil
+	}))
+	asrt.NoErr(writeMusician(ctx, a.fsm.InMemoryFSM, "ka"))
+	asrt.NoErr(writeMusician(ctx, b.fsm.InMemoryFSM, "kb"))
+	asrt.NoErr(waitForCondition(ctx, func() error { return hasAll(c.fsm.InMemoryFSM, "kb") }))
+	instB := b.cache.InstanceID()
+
+	// a hears b and c for a few discovery ticks before they hear a.
+	bus.silence("a")
+	bus.unmute("a")
+	time.Sleep(time.Second)
+	bus.unsilence("a")
+
+	mergeCtx, cancelMerge := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelMerge()
+	asrt.NoErr(waitMerged(mergeCtx, instB, "kb", "ka", a, b, c))
+	asrt.Equal(b.fsm.resets.Load(), int32(0)) // the winner's FSM was never cleared
 }

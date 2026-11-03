@@ -301,13 +301,18 @@ func (s *DiscoveryInjector) addServer(srv raft.Server) error {
 	// recovery on a node that was itself wiped earlier), a key the peers have
 	// already recorded — keying on it made their dedup silently skip the
 	// admission wipe, readmitting a potentially forked peer unwiped.
+	//
+	// The wipe carries this leader's rank. A peer that is itself in a cluster
+	// that outranks this one refuses it, so the wipe fails and the peer is not
+	// added: when two leaders meet, the lower-ranked one steps down instead of
+	// both clearing their FSMs (RT-14149, see Cache.outranksInitiator).
 	localInst := s.cache.getInstanceID()
 	if s.cache.IsLeader() && localInst != "" && s.peerInstanceID(srv.ID) != localInst {
 		ctx, cancel := context.WithTimeout(s.cache.ctx, addServerHardResetTimeout)
 		// Admission wipe recovers raft consensus for a forked/ahead peer; it never
 		// wipes cache-only data (full=false). The peer converges to the leader's
 		// cache-only state via snapshot catch-up.
-		r := s.cache.sendHardReset(ctx, srv, localInst, false)
+		r := s.cache.sendHardReset(ctx, srv, localInst, false, true)
 		cancel()
 		if r != nil {
 			return r
