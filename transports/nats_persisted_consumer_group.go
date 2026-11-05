@@ -16,7 +16,8 @@ type natsPersistedConsumerGroup struct {
 }
 
 // launch starts a puller goroutine on pullCtx for every consumer in the group.
-// Each consumer must already have been opened with start.
+// A consumer that startConsumer could not open begins in its reconnect loop
+// (see run).
 func (g *natsPersistedConsumerGroup) launch(pullCtx context.Context) {
 	for _, c := range g.consumers {
 		g.wg.Add(1)

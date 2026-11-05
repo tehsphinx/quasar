@@ -328,9 +328,14 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context, apply PersistedA
 		cancel: cancel,
 	}
 
-	// Create each shard's consumer and open its pull subscription first; only
-	// launch the puller goroutines once all succeeded, so a mid-loop failure
-	// tears down cleanly without leaking half-started pullers.
+	// Create each shard's consumer and open its pull subscription before any
+	// puller is launched. A shard whose consumer cannot be created yet still
+	// joins the group and starts in its reconnect loop (see run), so one
+	// unavailable consumer does not keep a new leader from draining every other
+	// shard (RT-15781). The start fails only when no shard connected or the
+	// caller gave up; the cache then retries the whole start, and a
+	// single-shard queue keeps failing its start exactly as before.
+	var errs []error
 	for i := 0; i < q.shards; i++ {
 		c := &natsPersistedConsumer{
 			queue: q,
@@ -338,12 +343,18 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context, apply PersistedA
 			shard: i,
 			group: g,
 		}
-		if r := c.connect(ctx, stream); r != nil {
-			g.stopContexts()
-			cancel()
-			return nil, r
-		}
 		g.consumers = append(g.consumers, c)
+		if r := c.connect(ctx, stream); r != nil {
+			errs = append(errs, r)
+		}
+	}
+	if len(errs) == q.shards || ctx.Err() != nil {
+		g.stopContexts()
+		cancel()
+		return nil, errors.Join(append(errs, ctx.Err())...)
+	}
+	for _, r := range errs {
+		q.logger.Error("persisted consumer shard failed to start; reconnecting", "error", r)
 	}
 
 	g.launch(pullCtx)

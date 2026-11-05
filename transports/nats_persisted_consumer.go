@@ -32,7 +32,8 @@ type natsPersistedConsumer struct {
 // connect creates (or opens) this shard's durable JetStream consumer and opens a
 // heartbeated pull subscription, attaching the resulting Messages context to
 // the consumer. It does not launch the puller goroutine — the group launches
-// every puller together once all shards have opened (see startConsumer).
+// every puller together once each shard has tried to open, and a shard that
+// could not open starts in reconnect (see startConsumer and run).
 func (c *natsPersistedConsumer) connect(ctx context.Context, stream jetstream.Stream) error {
 	// Durable consumer name keyed to the stream (and shard) so a leadership
 	// flip resumes from the same pending state instead of starting from the
@@ -89,6 +90,13 @@ func (c *natsPersistedConsumer) setMctx(mctx jetstream.MessagesContext) {
 	c.mctxM.Unlock()
 }
 
+// hasMctx reports whether this shard has ever opened a messages context.
+func (c *natsPersistedConsumer) hasMctx() bool {
+	c.mctxM.Lock()
+	defer c.mctxM.Unlock()
+	return c.mctx != nil
+}
+
 // nextMsg pulls the next message from the shard's current messages context.
 func (c *natsPersistedConsumer) nextMsg() (jetstream.Msg, error) {
 	c.mctxM.Lock()
@@ -118,6 +126,13 @@ func (c *natsPersistedConsumer) stopMctx() {
 // only this goroutine's shard pauses while it reconnects (RT-12964).
 func (c *natsPersistedConsumer) run(ctx context.Context) {
 	defer c.group.wg.Done()
+
+	// A shard whose consumer could not be created at start has no messages
+	// context yet, so it begins where a shard that died would: in reconnect
+	// (RT-15781).
+	if !c.hasMctx() && !c.reconnect(ctx) {
+		return
+	}
 
 	for {
 		c.pull(ctx)
