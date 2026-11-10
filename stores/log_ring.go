@@ -16,6 +16,12 @@ const (
 
 	// logRingGrowth is the factor the buffer grows by when it is full.
 	logRingGrowth = 2
+
+	// logSlotBytes is what an entry weighs against the budget besides its
+	// payload: its slot in the buffer, a raft.Log on a 64-bit platform. Counting
+	// it is what keeps a budget from admitting an unbounded number of tiny
+	// entries.
+	logSlotBytes = 96
 )
 
 var (
@@ -26,6 +32,13 @@ var (
 // NewLogRing creates a new in-memory ring-buffer log store for the cache.
 func NewLogRing() *LogRing {
 	return &LogRing{}
+}
+
+// NewBoundedLogRing creates a log ring with a byte budget: a compaction drops the
+// oldest entries only until the rest fits maxBytes, see DeleteRange. Zero means
+// no budget, which is NewLogRing.
+func NewBoundedLogRing(maxBytes int) *LogRing {
+	return &LogRing{maxBytes: maxBytes}
 }
 
 // LogRing implements an in-memory raft.LogStore as a ring buffer.
@@ -53,6 +66,9 @@ type LogRing struct {
 	head  int        // position in buf of the entry at index first
 	n     int        // number of entries held
 	first uint64     // raft index of buf[head]; 0 when empty
+
+	maxBytes int // budget a compaction trims down to; 0 for none
+	bytes    int // what the held entries weigh; kept only with a budget
 }
 
 // IsMonotonic implements the raft.MonotonicLogStore interface, and deliberately
@@ -142,6 +158,16 @@ func (s *LogRing) StoreLogs(logs []*raft.Log) error {
 // slot is reused, which the next append does for free, so the retention is
 // bounded by the slack between the buffer and the stored range and disappears as
 // the log fills back up. GetLog only ever serves [FirstIndex, LastIndex].
+//
+// A ring with a byte budget (NewBoundedLogRing) answers a compaction
+// differently: it drops the oldest entries only until the rest fits the budget,
+// and keeps the remainder of the range raft asked for. raft's TrailingLogs
+// counts entries, and an entry weighs anything from a few bytes to tens of
+// kilobytes, so a count sized for one cluster is either no repair window or
+// gigabytes of log on another. The budget only ever keeps more than raft asked
+// for: entries above the compaction may not be applied yet. Such a ring walks
+// what it drops, to take the entries off the books and to let go of their
+// payloads at once — the budget is about the memory held.
 func (s *LogRing) DeleteRange(minIdx, maxIdx uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -156,11 +182,18 @@ func (s *LogRing) DeleteRange(minIdx, maxIdx uint64) error {
 		s.reset()
 	case minIdx <= s.first:
 		count := int(maxIdx - s.first + 1)
+		if s.maxBytes > 0 {
+			count = s.releaseHead(count)
+		}
 		s.head = (s.head + count) % len(s.buf)
-		s.first = maxIdx + 1
+		s.first += uint64(count)
 		s.n -= count
 	case maxIdx >= last:
-		s.n -= int(last - minIdx + 1)
+		count := int(last - minIdx + 1)
+		if s.maxBytes > 0 {
+			s.releaseTail(count)
+		}
+		s.n -= count
 	default:
 		return fmt.Errorf("log ring: refusing interior delete of %d-%d from range %d-%d",
 			minIdx, maxIdx, s.first, last)
@@ -180,7 +213,11 @@ func (s *LogRing) store(log *raft.Log) error {
 		// Overwrite in place and keep the entries above it, as the map
 		// assignment in raft.InmemStore does. raft clears a conflicting suffix
 		// before storing, so this is contract compatibility, not a live path.
-		s.buf[s.pos(log.Index)] = *log
+		slot := &s.buf[s.pos(log.Index)]
+		if s.maxBytes > 0 {
+			s.bytes += logBytes(log) - logBytes(slot)
+		}
+		*slot = *log
 		return nil
 	case log.Index > s.lastIndex()+1:
 		// The live gap is the first append after a snapshot restore, where raft
@@ -197,7 +234,40 @@ func (s *LogRing) store(log *raft.Log) error {
 	}
 	s.buf[s.pos(s.first+uint64(s.n))] = *log
 	s.n++
+	if s.maxBytes > 0 {
+		s.bytes += logBytes(log)
+	}
 	return nil
+}
+
+// releaseHead lets go of up to limit entries from the head, oldest first, and
+// stops as soon as the rest fits the budget. It reports how many it let go. The
+// caller holds the lock.
+func (s *LogRing) releaseHead(limit int) int {
+	released := 0
+	for ; released < limit && s.bytes > s.maxBytes; released++ {
+		s.release(&s.buf[(s.head+released)%len(s.buf)])
+	}
+	return released
+}
+
+// releaseTail lets go of the newest count entries. The caller holds the lock.
+func (s *LogRing) releaseTail(count int) {
+	for i := s.n - count; i < s.n; i++ {
+		s.release(&s.buf[(s.head+i)%len(s.buf)])
+	}
+}
+
+// release takes an entry off the books and drops its payload, so the memory goes
+// with the entry rather than when its slot is next reused.
+func (s *LogRing) release(slot *raft.Log) {
+	s.bytes -= logBytes(slot)
+	slot.Data, slot.Extensions = nil, nil
+}
+
+// logBytes is what an entry weighs against the budget.
+func logBytes(log *raft.Log) int {
+	return logSlotBytes + len(log.Data) + len(log.Extensions)
 }
 
 // grow replaces the buffer with a larger one holding the entries from its front.
@@ -226,6 +296,16 @@ func (s *LogRing) reset() {
 	s.head = 0
 	s.n = 0
 	s.first = 0
+	s.bytes = 0
+}
+
+// Bytes reports what the held entries weigh against the budget, slots included.
+// It is 0 for a ring without a budget, which keeps no books.
+func (s *LogRing) Bytes() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.bytes
 }
 
 // lastIndex reports the highest stored index, 0 when empty. The caller holds the
