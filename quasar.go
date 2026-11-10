@@ -569,9 +569,26 @@ type Cache struct {
 // requires fresh stores; the recovery path is the exception (it reuses the
 // existing stores via raft.RecoverCluster).
 func (s *Cache) newStores() {
-	s.logStore = wrapStore(stores.NewLogRing(), s.fsm)
+	// The log may grow to maxLogBytes; the snapshot that then follows trims it
+	// to half, so the next one is half a budget of appends away.
+	logs := wrapStore(stores.NewBoundedLogRing(s.cfg.maxLogBytes/2), s.fsm)
+	logs.snapshotOver(s.cfg.cacheName, s.cfg.maxLogBytes, s.snapshotLog)
+	s.logStore = logs
 	s.stableStore = stores.NewStableInMemory()
 	s.snapshotStore = wrapSnapshotStore(raft.NewInmemSnapshotStore(), s.fsm)
+}
+
+// snapshotLog has raft take a snapshot and waits for it, compaction included.
+// See store.snapshotOver.
+func (s *Cache) snapshotLog() {
+	rft := s.raft()
+	if rft == nil {
+		return
+	}
+	err := rft.Snapshot().Error()
+	if err != nil && !errors.Is(err, raft.ErrNothingNewToSnapshot) && !errors.Is(err, raft.ErrRaftShutdown) {
+		s.logger.Warn("snapshot for the log budget failed", "error", err)
+	}
 }
 
 func (s *Cache) serverInfo() raft.Server {

@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/hashicorp/raft"
 )
@@ -421,7 +422,15 @@ func TestLogRing_AgainstInmemStore(t *testing.T) {
 // goroutine appends, the snapshot goroutine truncates, and the replication
 // goroutines read. Fails under -race without internal locking.
 func TestLogRing_ConcurrentAccess(t *testing.T) {
-	ring := NewLogRing()
+	t.Run("unbounded", func(t *testing.T) { concurrentAccess(t, NewLogRing()) })
+	// A budget above what the compactor leaves, so every compaction is cut short
+	// and walks the slots it lets go of.
+	t.Run("bounded", func(t *testing.T) { concurrentAccess(t, NewBoundedLogRing(800*(len(payload)+logSlotBytes))) })
+}
+
+func concurrentAccess(t *testing.T, ring *LogRing) {
+	t.Helper()
+
 	storeRange(t, ring, 1, 1000)
 
 	done := make(chan struct{})
@@ -521,4 +530,142 @@ func bytesPerEntry(t testing.TB, store raft.LogStore, entries uint64) float64 {
 	runtime.KeepAlive(store)
 
 	return float64(after.HeapAlloc-before.HeapAlloc) / float64(entries)
+}
+
+// sizedLog is an entry whose payload has the given length.
+func sizedLog(index uint64, size int) *raft.Log {
+	return &raft.Log{Index: index, Term: 1, Type: raft.LogCommand, Data: make([]byte, size)}
+}
+
+func storeSized(t testing.TB, ring *LogRing, from, to uint64, size int) {
+	t.Helper()
+
+	for i := from; i <= to; i++ {
+		if err := ring.StoreLog(sizedLog(i, size)); err != nil {
+			t.Fatalf("StoreLog(%d): %v", i, err)
+		}
+	}
+}
+
+// liveBytes recomputes what the bounded ring should have on its books.
+func liveBytes(t testing.TB, ring *LogRing) int {
+	t.Helper()
+
+	first, _ := ring.FirstIndex()
+	last, _ := ring.LastIndex()
+	total := 0
+	for i := first; i <= last && first != 0; i++ {
+		var log raft.Log
+		if err := ring.GetLog(i, &log); err != nil {
+			t.Fatalf("GetLog(%d): %v", i, err)
+		}
+		total += logSlotBytes + len(log.Data) + len(log.Extensions)
+	}
+	return total
+}
+
+// A compaction on a bounded ring drops the oldest entries only until the rest
+// fits the budget: raft's TrailingLogs counts entries, and what an entry weighs
+// differs by orders of magnitude between clusters.
+func TestLogRing_BudgetKeepsWhatFits(t *testing.T) {
+	const size = 1000
+	ring := NewBoundedLogRing(50 * (size + logSlotBytes))
+	storeSized(t, ring, 1, 100, size)
+
+	dropped := &ring.buf[0]
+	if err := ring.DeleteRange(1, 90); err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	assertRange(t, ring, 51, 100)
+	if dropped.Data != nil {
+		t.Error("a dropped entry kept its payload; the budget is about the memory held")
+	}
+	if got, expected := ring.bytes, liveBytes(t, ring); got != expected {
+		t.Errorf("bytes: got %d, expected %d", got, expected)
+	}
+}
+
+// Under its budget a bounded ring keeps everything raft asked it to compact.
+func TestLogRing_BudgetUnderLimitKeepsAll(t *testing.T) {
+	ring := NewBoundedLogRing(1 << 30)
+	storeSized(t, ring, 1, 100, 1000)
+
+	if err := ring.DeleteRange(1, 90); err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	assertRange(t, ring, 1, 100)
+}
+
+// The budget only ever keeps more than raft asked for, never less: entries above
+// the compaction are ones raft may not have applied yet.
+func TestLogRing_BudgetNeverDropsAboveTheCompaction(t *testing.T) {
+	ring := NewBoundedLogRing(1)
+	storeSized(t, ring, 1, 100, 1000)
+
+	if err := ring.DeleteRange(1, 60); err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	assertRange(t, ring, 61, 100)
+}
+
+// The books stay right through every way entries come and go.
+func TestLogRing_BudgetAccounting(t *testing.T) {
+	check := func(ring *LogRing, step string) {
+		t.Helper()
+		if got, expected := ring.bytes, liveBytes(t, ring); got != expected {
+			t.Errorf("%s: bytes: got %d, expected %d", step, got, expected)
+		}
+	}
+
+	ring := NewBoundedLogRing(100 * (200 + logSlotBytes))
+	storeSized(t, ring, 1, 150, 200)
+	check(ring, "append")
+	if got := ring.Bytes(); got != ring.bytes {
+		t.Errorf("Bytes: got %d, expected %d", got, ring.bytes)
+	}
+
+	if err := ring.DeleteRange(1, 140); err != nil { // head, cut short by the budget
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	assertRange(t, ring, 51, 150)
+	check(ring, "head truncation")
+
+	storeSized(t, ring, 151, 400, 50) // wraps onto the dropped slots and grows
+	check(ring, "wrap and grow")
+
+	if err := ring.DeleteRange(351, 400); err != nil { // tail
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	check(ring, "tail truncation")
+
+	if err := ring.StoreLog(sizedLog(300, 5000)); err != nil { // overwrite in place
+		t.Fatalf("StoreLog: %v", err)
+	}
+	check(ring, "overwrite")
+
+	if err := ring.DeleteRange(51, 340); err != nil { // head again, across the wrap
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	if first, _ := ring.FirstIndex(); first <= 150 || first >= 341 {
+		t.Errorf("head truncation across the wrap: first index %d, expected the budget to cut between 151 and 340", first)
+	}
+	check(ring, "head truncation across the wrap")
+
+	if err := ring.StoreLog(sizedLog(1000, 10)); err != nil { // forward gap restarts the ring
+		t.Fatalf("StoreLog: %v", err)
+	}
+	check(ring, "forward gap")
+
+	if err := ring.DeleteRange(1000, 1000); err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	if ring.bytes != 0 {
+		t.Errorf("full delete: bytes: got %d, expected 0", ring.bytes)
+	}
+}
+
+func TestLogRing_SlotBytes(t *testing.T) {
+	if got := int(unsafe.Sizeof(raft.Log{})); got != logSlotBytes {
+		t.Errorf("logSlotBytes is %d, a raft.Log slot is %d bytes", logSlotBytes, got)
+	}
 }
