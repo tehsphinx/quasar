@@ -43,8 +43,8 @@ type KVCache struct {
 }
 
 // Store stores the given data associated with the provided key in the cache.
-// It returns the UID (unique identifier) of the stored data and any error that occurred during the process.
-func (s *KVCache) Store(ctx context.Context, key string, data []byte) (uint64, error) {
+// It returns the WaitToken of the stored data (see WaitForUID) and any error that occurred during the process.
+func (s *KVCache) Store(ctx context.Context, key string, data []byte) (WaitToken, error) {
 	return s.store(ctx, key, data)
 }
 
@@ -56,15 +56,15 @@ func (s *KVCache) Store(ctx context.Context, key string, data []byte) (uint64, e
 func (s *KVCache) Load(ctx context.Context, key string, opts ...LoadOption) ([]byte, error) {
 	cfg := getLoadOptions(opts)
 
-	uid := cfg.waitFor
-	if uid == 0 {
+	token := cfg.waitFor
+	if token.Index == 0 {
 		id, err := s.masterLastIndex(ctx)
 		if err != nil {
 			return nil, err
 		}
-		uid = id
+		token = WaitToken{Index: id}
 	}
-	if err := s.Cache.fsm.WaitFor(ctx, uid); err != nil {
+	if err := s.waitFor(ctx, token); err != nil {
 		return nil, err
 	}
 
@@ -78,8 +78,8 @@ func (s *KVCache) Load(ctx context.Context, key string, opts ...LoadOption) ([]b
 func (s *KVCache) LoadLocal(ctx context.Context, key string, opts ...LoadOption) ([]byte, error) {
 	cfg := getLoadOptions(opts)
 
-	if cfg.waitFor != 0 {
-		if err := s.Cache.fsm.WaitFor(ctx, cfg.waitFor); err != nil {
+	if cfg.waitFor.Index != 0 {
+		if err := s.waitFor(ctx, cfg.waitFor); err != nil {
 			return nil, err
 		}
 	}

@@ -2,7 +2,9 @@ package quasar
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -156,5 +158,42 @@ func TestWaitForWokenByStoreConfiguration(t *testing.T) {
 
 	if err := <-done; err != nil {
 		t.Fatalf("WaitFor was not woken by regSystemUID: %v", err)
+	}
+}
+
+// TestWaitForNoticesHistoryChangeWhileWaiting covers a waiter that is parked on
+// an index of the history the node then leaves (RT-15900). The history is
+// checked on every pass, so the first entry of the new log ends the wait
+// instead of the deadline.
+func TestWaitForNoticesHistoryChangeWhileWaiting(t *testing.T) {
+	a, b := historyA, historyB
+	var instanceID atomic.Pointer[string]
+	instanceID.Store(&a)
+
+	fsm := &fsmWrapper{cond: cond.New(), instanceID: func() string { return *instanceID.Load() }}
+	fsm.setLastApplied(151000)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- fsm.waitFor(ctx, WaitToken{InstanceID: historyA, Index: 151763}) }()
+
+	// Let waitFor reach its select.
+	time.Sleep(100 * time.Millisecond)
+
+	// The rebuild in the order of reinitRaftAdoptingInstance, then the first
+	// entry of the new log.
+	fsm.applyRaftReset()
+	instanceID.Store(&b)
+	fsm.uidApplied(1)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errOtherHistory) {
+			t.Fatalf("waitFor returned %v, expected errOtherHistory", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitFor did not notice the other history")
 	}
 }

@@ -414,11 +414,11 @@ func TestWaitReadyEndsTheStartupReplay(t *testing.T) {
 		t.Fatalf("WaitReady: %v", err)
 	}
 
-	uid, err := leader.store(ctx, "key", []byte("value"))
+	token, err := leader.store(ctx, "key", []byte("value"))
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
-	if err := follower.fsm.WaitFor(ctx, uid); err != nil {
+	if err := follower.fsm.waitFor(ctx, token); err != nil {
 		t.Fatalf("WaitFor: %v", err)
 	}
 	fsm.expect(t, "a write after WaitReady", 1, 0)

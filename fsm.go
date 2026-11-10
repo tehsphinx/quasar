@@ -137,6 +137,13 @@ type fsmWrapper struct {
 	// there is no leader to make progress.
 	hasLeader func() bool
 
+	// instanceID returns the cache's raft instance ID, for a wait to tell an
+	// index of another history apart (see applied). Wired up by newCache when
+	// a discovery is configured, nil otherwise: only discovery reconciles the
+	// ID across a cluster, and without it every node of a static cluster keeps
+	// the one it minted at bootstrap.
+	instanceID func() string
+
 	isLogApplier bool
 }
 
@@ -354,7 +361,31 @@ func (s *fsmWrapper) endStartup(index, term, epoch uint64) bool {
 	return true
 }
 
+// WaitToken names a write, for a caller that waits for it before it reads
+// (FSMInjector.WaitFor, WaitForUID). Index is the index of the write in the
+// raft log, and InstanceID the raft instance ID of the leader that took it:
+// the history the index belongs to. A fork adoption or a hard reset can move a
+// node to another history, whose log starts over and does not reach an index
+// of the one before for a long time, if ever (RT-15900).
+//
+// The zero value waits for nothing. A token without an InstanceID, as from a
+// leader that does not send one yet, is waited for by its index alone.
+type WaitToken struct {
+	InstanceID string
+	Index      uint64
+}
+
+// errOtherHistory is returned by waitFor for a token of another raft history
+// than the local one. Cache.waitFor answers it with the leader's latest index.
+var errOtherHistory = errors.New("wait index belongs to another raft history")
+
 // WaitFor blocks until the FSM has applied uid, or until ctx expires.
+func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
+	return s.waitFor(ctx, WaitToken{Index: uid})
+}
+
+// waitFor blocks until the FSM has applied the index of token, or until ctx
+// expires. A token of another history returns errOtherHistory, see applied.
 //
 // The wait takes no lock on purpose. The broadcast sites run on raft's own
 // goroutines — uidApplied on the FSM goroutine, regSystemUID on the main
@@ -369,17 +400,18 @@ func (s *fsmWrapper) endStartup(index, term, epoch uint64) bool {
 // This makes the WAKE path lock-free, not the whole apply path: applySysUIDs
 // still takes sysUIDsM, shared with queueSysUID on the main goroutine. That
 // contention is bounded by two goroutines and a slice reslice, not by the
-// waiter count, which is why it stays.
-func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
+// waiter count, which is why it stays. The history check of a token reads the
+// instance ID under the read side of raftMutex, which no broadcast site takes.
+func (s *fsmWrapper) waitFor(ctx context.Context, token WaitToken) error {
 	for {
-		if s.getLastApplied() >= uid {
-			return nil
+		if ok, err := s.applied(token); ok || err != nil {
+			return err
 		}
 
 		// Install first, then re-check: see the ordering note above.
 		ch := s.cond.WaitChan()
-		if s.getLastApplied() >= uid {
-			return nil
+		if ok, err := s.applied(token); ok || err != nil {
+			return err
 		}
 
 		select {
@@ -392,8 +424,8 @@ func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
 			// random even though the condition was actually met. Re-check once
 			// so a wait that succeeded exactly at the deadline is not reported
 			// as a timeout (m25).
-			if s.getLastApplied() >= uid {
-				return nil
+			if ok, err := s.applied(token); ok || err != nil {
+				return err
 			}
 			if s.hasLeader != nil && !s.hasLeader() {
 				return errors.Join(ctx.Err(), ErrWaitFor, ErrNoLeader)
@@ -401,6 +433,24 @@ func (s *fsmWrapper) WaitFor(ctx context.Context, uid uint64) error {
 			return errors.Join(ctx.Err(), ErrWaitFor)
 		}
 	}
+}
+
+// applied reports whether the FSM has applied the index of token. An index
+// means nothing in another history, so a token that names its history is
+// compared with the local instance ID on every pass of the wait, and a
+// mismatch returns errOtherHistory whatever lastApplied says.
+//
+// lastApplied is read first. A rebuild resets it before it adopts the new
+// instance ID, and the raft that applies the new log starts after both
+// (reinitRaftAdoptingInstance), so an ID that still matches after the read
+// means the value read is not one of the new log.
+func (s *fsmWrapper) applied(token WaitToken) (bool, error) {
+	applied := s.getLastApplied()
+
+	if token.InstanceID != "" && s.instanceID != nil && s.instanceID() != token.InstanceID {
+		return false, errOtherHistory
+	}
+	return applied >= token.Index, nil
 }
 
 func (s *fsmWrapper) uidApplied(uid uint64) {

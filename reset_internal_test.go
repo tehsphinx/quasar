@@ -504,3 +504,196 @@ func TestSendHardResetRestoresRefusalSentinel(t *testing.T) {
 		t.Fatalf("sendHardReset returned %v, want errOutranksInitiator", err)
 	}
 }
+
+// The instance IDs of two raft histories.
+const (
+	historyA = "history-a"
+	historyB = "history-b"
+)
+
+// answeringStoreTransport answers every persisted Store with resp, the way a
+// leader answers with an index of its log and its instance ID.
+type answeringStoreTransport struct {
+	transports.Transport
+	resp *pb.StoreResponse
+}
+
+func (t *answeringStoreTransport) SupportsPersisted() bool { return true }
+
+func (t *answeringStoreTransport) StorePersisted(context.Context, *pb.Store, transports.PersistedStoreOpts,
+) (*pb.StoreResponse, error) {
+	return t.resp, nil
+}
+
+// TestWaitTokenAcrossRaftRebuild covers a wait index that is kept across a
+// rebuild of raft on a fresh log. Store answers with the index its write got in
+// the leader's log, and an embedder waits for that index before it reads. After
+// a fork adoption the node is in another history, whose log starts over: on
+// rt74qa it went from index 151 763 to about 3 100, and every read that waited
+// for the old index timed out for almost three hours (RT-15900). The token
+// names the history, so such an index is refused instead of waited for. A hard
+// reset inside one history leaves the leader's log as it is, and there the
+// wiped node still has to reach the index before it reads.
+func TestWaitTokenAcrossRaftRebuild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, inmem := transports.NewInmemTransport("")
+	tr := &answeringStoreTransport{
+		Transport: inmem,
+		resp:      &pb.StoreResponse{Uid: 151763, InstanceId: historyA},
+	}
+	c, err := NewCache(ctx, &stubFSM{},
+		WithLocalID("follower"),
+		WithTransport(tr),
+		WithSuffrage(raft.Nonvoter),
+		WithDiscovery(noopDiscovery{}),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+	c.setInstanceID(historyA)
+
+	token, err := c.store(ctx, "key", []byte("value"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if expected := (WaitToken{InstanceID: historyA, Index: 151763}); token != expected {
+		t.Fatalf("store returned %+v, expected %+v", token, expected)
+	}
+
+	// A hard reset by the leader of the same history.
+	if err := c.localHardReset("reset-1", historyA, false, "", 0); err != nil {
+		t.Fatalf("localHardReset: %v", err)
+	}
+	waitCtx, cancelWait := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancelWait()
+	if err := c.fsm.waitFor(waitCtx, token); !errors.Is(err, ErrWaitFor) {
+		t.Fatalf("wait on the wiped node returned %v, expected it to wait for the index", err)
+	}
+	c.fsm.uidApplied(token.Index)
+	if err := c.fsm.waitFor(ctx, token); err != nil {
+		t.Fatalf("wait with the index applied: %v", err)
+	}
+
+	// A fork adoption. The new log is behind the index at first and past it
+	// later, and the index is one of this history in neither case.
+	if err := c.localHardReset("reset-2", historyB, false, "", 0); err != nil {
+		t.Fatalf("localHardReset: %v", err)
+	}
+	for _, applied := range []uint64{3100, token.Index} {
+		c.fsm.uidApplied(applied)
+		if err := c.fsm.waitFor(ctx, token); !errors.Is(err, errOtherHistory) {
+			t.Fatalf("wait in another history at index %d returned %v, expected errOtherHistory", applied, err)
+		}
+	}
+}
+
+// TestWaitForTokenOfAnotherHistoryWaitsForLeaderLatest covers what a caller
+// gets for a token of another history: a wait for the leader's latest index,
+// as WaitForMasterLatest does, instead of a wait for an index this log is far
+// from.
+func TestWaitForTokenOfAnotherHistoryWaitsForLeaderLatest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, &stubFSM{},
+		WithLocalID("leader"),
+		WithTransport(tr),
+		WithDiscovery(noopDiscovery{}),
+		WithBootstrapWait(0),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	// The leader answers its own write with its instance ID.
+	token, err := c.store(ctx, "key", []byte("value"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if token.InstanceID == "" || token.InstanceID != c.getInstanceID() || token.Index == 0 {
+		t.Fatalf("store returned %+v, expected an index of instance %q", token, c.getInstanceID())
+	}
+
+	inj := &FSMInjector{cache: c}
+	waitCtx, cancelWait := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancelWait()
+
+	if err := inj.WaitFor(waitCtx, WaitToken{InstanceID: historyA, Index: 151763}); err != nil {
+		t.Fatalf("WaitFor a token of another history: %v", err)
+	}
+	// The same index in this history is still waited for.
+	err = inj.WaitFor(waitCtx, WaitToken{InstanceID: token.InstanceID, Index: 151763})
+	if !errors.Is(err, ErrWaitFor) {
+		t.Fatalf("WaitFor an index ahead of the log returned %v, expected it to wait for the index", err)
+	}
+}
+
+// TestWaitTokenWithoutDiscovery covers a cluster without discovery. Nothing
+// reconciles the instance ID there: every node keeps the one it minted at
+// bootstrap, so the leader's differs from a follower's although both are in
+// one history. A follower has to take the leader's index as it is.
+func TestWaitTokenWithoutDiscovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	addr1, t1 := transports.NewInmemTransport("")
+	addr2, t2 := transports.NewInmemTransport("")
+	t1.Connect(addr2, t2)
+	t2.Connect(addr1, t1)
+
+	servers := []raft.Server{
+		{ID: "cache1", Address: addr1, Suffrage: raft.Voter},
+		{ID: "cache2", Address: addr2, Suffrage: raft.Voter},
+	}
+	var caches []*Cache
+	for i, tr := range []*transports.InmemTransport{t1, t2} {
+		c, err := NewCache(ctx, &stubFSM{},
+			WithLocalID(string(servers[i].ID)),
+			WithTransport(tr),
+			WithServers(servers),
+		)
+		if err != nil {
+			t.Fatalf("NewCache: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Shutdown() })
+		caches = append(caches, c)
+	}
+	for _, c := range caches {
+		if err := c.WaitReady(ctx); err != nil {
+			t.Fatalf("WaitReady: %v", err)
+		}
+	}
+	leader, follower := caches[0], caches[1]
+	if follower.IsLeader() {
+		leader, follower = follower, leader
+	}
+
+	// The reply of the leader carries its instance ID to the follower.
+	token, err := follower.store(ctx, "key", []byte("value"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if token.InstanceID == "" || token.InstanceID != leader.getInstanceID() || token.Index == 0 {
+		t.Fatalf("store returned %+v, expected an index of the leader's instance %q", token, leader.getInstanceID())
+	}
+
+	inj := &FSMInjector{cache: follower}
+	if err := inj.WaitFor(ctx, token); err != nil {
+		t.Fatalf("WaitFor the write: %v", err)
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancelWait()
+	err = inj.WaitFor(waitCtx, WaitToken{InstanceID: token.InstanceID, Index: token.Index + 1000})
+	if !errors.Is(err, ErrWaitFor) {
+		t.Fatalf("WaitFor an index ahead of the log returned %v, expected it to wait for the index", err)
+	}
+}
