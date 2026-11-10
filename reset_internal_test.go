@@ -504,3 +504,128 @@ func TestSendHardResetRestoresRefusalSentinel(t *testing.T) {
 		t.Fatalf("sendHardReset returned %v, want errOutranksInitiator", err)
 	}
 }
+
+// parkedStoreTransport holds the first persisted Store until released and
+// answers every one with uid, the way a leader answers with an index of its
+// log.
+type parkedStoreTransport struct {
+	transports.Transport
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	uid     uint64
+}
+
+func (t *parkedStoreTransport) SupportsPersisted() bool { return true }
+
+func (t *parkedStoreTransport) StorePersisted(context.Context, *pb.Store, transports.PersistedStoreOpts,
+) (*pb.StoreResponse, error) {
+	t.once.Do(func() { close(t.entered) })
+	<-t.release
+	return &pb.StoreResponse{Uid: t.uid}, nil
+}
+
+// TestStoreAcrossRaftRebuildReturnsNoWaitIndex covers a write that is in flight
+// while raft is rebuilt on a fresh log. Its reply carries an index of the log
+// the write was issued against. The new log starts over, so an embedder that
+// waits for that index before its reads times out on every one of them until
+// the new log has grown past it, which on rt74qa it never did (RT-15900). The
+// write itself was applied, so store reports success with nothing to wait for.
+func TestStoreAcrossRaftRebuildReturnsNoWaitIndex(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, inmem := transports.NewInmemTransport("")
+	tr := &parkedStoreTransport{
+		Transport: inmem,
+		entered:   make(chan struct{}),
+		release:   make(chan struct{}),
+		uid:       151763,
+	}
+	c, err := NewCache(ctx, &stubFSM{},
+		WithLocalID("follower"),
+		WithTransport(tr),
+		WithSuffrage(raft.Nonvoter),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+
+	type result struct {
+		uid uint64
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		uid, err := c.store(ctx, "key", []byte("value"))
+		done <- result{uid, err}
+	}()
+	<-tr.entered
+
+	if err := c.localHardReset("reset-1", "history-b", false, "", 0); err != nil {
+		t.Fatalf("localHardReset: %v", err)
+	}
+	close(tr.release)
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("store across the rebuild: %v", res.err)
+	}
+	if res.uid != 0 {
+		t.Errorf("store across the rebuild returned uid %d, an index of the previous log", res.uid)
+	}
+
+	// A write issued against the rebuilt raft keeps the index it is answered with.
+	uid, err := c.store(ctx, "key", []byte("value"))
+	if err != nil {
+		t.Fatalf("store after the rebuild: %v", err)
+	}
+	if uid != tr.uid {
+		t.Errorf("store after the rebuild returned uid %d, expected %d", uid, tr.uid)
+	}
+}
+
+// genRecordingFSM records the raft generation its Reset runs in.
+type genRecordingFSM struct {
+	stubFSM
+	gen     func() uint64
+	inReset atomic.Uint64
+}
+
+func (f *genRecordingFSM) Reset() error {
+	if f.gen != nil {
+		f.inReset.Store(f.gen())
+	}
+	return f.stubFSM.Reset()
+}
+
+// TestRaftGenerationMovesBeforeFSMReset pins the order inside a rebuild. An
+// embedder drops its wait index in the FSM's Reset. A write answered after that
+// Reset, but before the generation moved, would pass the check in store and hand
+// the embedder an index of the previous log again.
+func TestRaftGenerationMovesBeforeFSMReset(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fsm := &genRecordingFSM{}
+	_, tr := transports.NewInmemTransport("")
+	c, err := NewCache(ctx, fsm,
+		WithLocalID("follower"),
+		WithTransport(tr),
+		WithSuffrage(raft.Nonvoter),
+	)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown() })
+
+	before := c.fsm.raftGen.Load()
+	fsm.gen = c.fsm.raftGen.Load
+	if err := c.localHardReset("reset-1", "history-b", false, "", 0); err != nil {
+		t.Fatalf("localHardReset: %v", err)
+	}
+	if got := fsm.inReset.Load(); got != before+1 {
+		t.Errorf("the FSM was reset in raft generation %d, expected %d: the generation has to move first", got, before+1)
+	}
+}

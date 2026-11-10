@@ -54,6 +54,12 @@ func (s *FSMInjector) WaitForKnownLatest(ctx context.Context) error {
 // It returns the unique identifier (UID) associated with the stored data and
 // any error encountered during the operation.
 //
+// The UID is the index of the write in the raft log, for a caller that waits
+// for it (WaitFor) before it reads. Zero means there is nothing to wait for:
+// raft was rebuilt on a fresh log while the write was in flight. Store cannot
+// see a rebuild that lands after it returned, so a caller that keeps the UID
+// has to drop it when the FSM's Reset ran during the call.
+//
 // Variadic StoreOption arguments configure how the call interacts with a
 // transport that supports persisted-FIFO mode (see WithRetry). Options
 // are no-ops on transports that do not implement persisted-FIFO.

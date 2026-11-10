@@ -622,7 +622,17 @@ func (s *Cache) GetServerList() ([]raft.Server, error) {
 
 func (s *Cache) store(ctx context.Context, key string, data []byte, opts ...StoreOption) (uint64, error) {
 	cmd := cmdStore(key, data)
+
+	gen := s.fsm.raftGen.Load()
 	_, uid, err := s.apply(ctx, cmd, resolveStoreOpts(opts))
+	if s.fsm.raftGen.Load() != gen {
+		// raft was rebuilt on a fresh log while the write was in flight, so uid
+		// indexes the previous log. The new one starts over and does not reach
+		// it for a long time, if ever: a caller that waited for it before its
+		// reads would time out on every one of them (RT-15900). Zero is nothing
+		// to wait for.
+		uid = 0
+	}
 	return uid, err
 }
 
@@ -1449,6 +1459,15 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 
 	// No raft goroutine is left running: the FSM wipe and the store swap below
 	// cannot race an apply or a snapshot.
+	//
+	// The raft reset comes first: it starts a new generation of indexes, and
+	// an FSM that keeps a wait index drops it in its Reset. In the other order
+	// a write answered in between would hand that FSM an index of the old log
+	// with nothing left to tell it apart (see Cache.store). This narrows the
+	// gap, it does not close it: a caller records the index after Store has
+	// returned, and a rebuild can still land between the two. Only the caller
+	// can drop an index it recorded across its own Reset.
+	s.fsm.applyRaftReset()
 	if err := s.fsm.applyReset(full); err != nil {
 		// Past the shutdown there is no way back to the old raft, so returning
 		// here would leave the node inert with nothing to retry it (m5).
@@ -1458,7 +1477,6 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 		s.logger.Error("hard reset: clearing the FSM failed; rebuilding raft anyway",
 			"local-id", s.localID, "full", full, "error", err)
 	}
-	s.fsm.applyRaftReset()
 
 	s.newStores()
 	if adoptInstanceID != "" {

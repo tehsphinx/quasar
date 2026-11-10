@@ -44,6 +44,10 @@ type KVCache struct {
 
 // Store stores the given data associated with the provided key in the cache.
 // It returns the UID (unique identifier) of the stored data and any error that occurred during the process.
+//
+// The UID is the index of the write in the raft log. Zero means there is nothing
+// to wait for: raft was rebuilt on a fresh log while the write was in flight. A
+// caller that keeps the UID has to drop it when a reset ran during the call.
 func (s *KVCache) Store(ctx context.Context, key string, data []byte) (uint64, error) {
 	return s.store(ctx, key, data)
 }
