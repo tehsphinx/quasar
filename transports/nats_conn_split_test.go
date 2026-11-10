@@ -13,6 +13,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/nats.go"
+	"github.com/tehsphinx/quasar/internal/frozennats"
 )
 
 // TestNATSTransport_RaftConnsSplitBySubject pins the RT-13733 connection
@@ -262,5 +263,68 @@ func TestNATSTransport_PipelineStaysOffTheLiveConn(t *testing.T) {
 	}
 	if got := trans.connRepl.Stats().OutMsgs - repl.OutMsgs; got < maxPipelineInflight {
 		t.Errorf("the replication connection carried %d of %d pipelined requests", got, maxPipelineInflight)
+	}
+}
+
+// TestNATSTransport_RaftConnsLeaveAFrozenServer freezes the NATS server under a
+// transport. Every raft connection has to notice within seconds: the quiet ones
+// by their pings, and the bulk connection, which carries the cache writes and is
+// kept publishing here, by the write that no longer goes through. The caller's
+// connection, on the client defaults, is the control: it is still attached,
+// which is what the raft connections used to be too (RT-15911).
+func TestNATSTransport_RaftConnsLeaveAFrozenServer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	srv := frozennats.Run(t)
+	conn, err := nats.Connect(srv.URL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close()
+
+	trans, err := NewNATSTransport(ctx, conn, "test-cache", "frozen-server1")
+	if err != nil {
+		t.Fatalf("NewNATSTransport: %v", err)
+	}
+	raftConns := []struct {
+		name string
+		conn *nats.Conn
+	}{{"live", trans.connLive}, {"repl", trans.connRepl}, {"bulk", trans.connBulk}}
+	for _, c := range raftConns {
+		if c.conn == conn {
+			t.Fatalf("the %s connection fell back to the caller's connection", c.name)
+		}
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		payload := make([]byte, 64<<10)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = trans.connBulk.Publish("load", payload)
+			}
+		}
+	}()
+
+	srv.Freeze()
+	frozenAt := time.Now()
+	const within = 12 * time.Second
+	for _, c := range raftConns {
+		for c.conn.IsConnected() {
+			if time.Since(frozenAt) > within {
+				t.Fatalf("the %s connection is still attached to the frozen server after %s", c.name, within)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Logf("the %s connection left the frozen server after %s", c.name, time.Since(frozenAt).Round(100*time.Millisecond))
+	}
+
+	if !conn.IsConnected() {
+		t.Error("the caller's connection left too; it should be on its own settings")
 	}
 }

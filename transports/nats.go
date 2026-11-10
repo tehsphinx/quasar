@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -30,6 +32,30 @@ const (
 	// because no caller has needed to tune it; it becomes a NATSOption with
 	// this default if one ever does.
 	maxInflightCacheRPCs = 256
+
+	// LivePingInterval and LiveMaxPingsOut make a connection give up on a NATS
+	// server that stopped answering after six seconds at most, and move to the
+	// next one. The nats.go defaults (2 minutes, 2 pings) leave a connection
+	// attached to a frozen server for minutes: its status stays connected while
+	// nothing it publishes is delivered and nothing reaches its subscriptions.
+	// Members connect to a random server of the cluster. One whose liveness
+	// connection sits on such a server can neither ask for a vote nor be asked,
+	// and one whose bulk connection does cannot write to the cache: two healthy
+	// nodes lose their election, or their cache, to a third node's NATS server
+	// (RT-15911).
+	//
+	// The ping timer alone only covers a quiet connection. The client writes to
+	// the socket under the lock the timer needs, and once the buffers towards a
+	// frozen server are full every write blocks for the flusher timeout, a
+	// minute by default, pings included. stallTimeout covers the busy one.
+	LivePingInterval = 2 * time.Second
+	LiveMaxPingsOut  = 2
+
+	// stallTimeout is how long a write to a raft connection may block before the
+	// connection is closed, which makes the client reconnect to the next
+	// server. A server that has not taken a byte for this long is not serving
+	// the connection.
+	stallTimeout = 5 * time.Second
 )
 
 var (
@@ -150,6 +176,9 @@ func (s *NATSTransport) dialRaftConn(conn *nats.Conn, role string) *nats.Conn {
 	opts.AsyncErrorCB = raftConnErrorHandler(s.logger, role)
 	opts.DiscoveredServersCB = nil
 	opts.LameDuckModeHandler = nil
+	opts.PingInterval = LivePingInterval
+	opts.MaxPingsOut = LiveMaxPingsOut
+	opts.CustomDialer = stallDialer{inner: dialerOf(&opts)}
 
 	nc, err := opts.Connect()
 	if err != nil {
@@ -159,6 +188,53 @@ func (s *NATSTransport) dialRaftConn(conn *nats.Conn, role string) *nats.Conn {
 	}
 	s.ownedConns = append(s.ownedConns, nc)
 	return nc
+}
+
+// dialerOf returns the dialer a connection with these options is opened with.
+func dialerOf(opts *nats.Options) nats.CustomDialer {
+	if opts.CustomDialer != nil {
+		return opts.CustomDialer
+	}
+	// Connect fills Dialer in when the caller left it nil.
+	return opts.Dialer
+}
+
+// stallDialer dials connections that are closed when a write to them blocks for
+// stallTimeout. Closing is what gets the client out: the blocked writer returns
+// and releases the connection lock, the read loop fails and the client
+// reconnects. A write timeout alone leaves it attached, with every later write
+// blocking for the timeout again.
+type stallDialer struct {
+	inner nats.CustomDialer
+}
+
+// Dial implements nats.CustomDialer.
+func (d stallDialer) Dial(network, address string) (net.Conn, error) {
+	conn, err := d.inner.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	return &stallConn{Conn: conn}, nil
+}
+
+// SkipTLSHandshake passes on what the wrapped dialer says: a dialer that already
+// did the TLS handshake tells the client so through this method.
+func (d stallDialer) SkipTLSHandshake() bool {
+	skipper, ok := d.inner.(interface{ SkipTLSHandshake() bool })
+	return ok && skipper.SkipTLSHandshake()
+}
+
+type stallConn struct {
+	net.Conn
+}
+
+func (c *stallConn) Write(p []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(stallTimeout))
+	n, err := c.Conn.Write(p)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		_ = c.Conn.Close()
+	}
+	return n, err
 }
 
 // raftConnErrorHandler is the AsyncErrorCB of the dedicated raft connections.
