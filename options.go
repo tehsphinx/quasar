@@ -39,6 +39,7 @@ type options struct {
 	bootstrapFallback  time.Duration
 	noLeaderTimeout    time.Duration
 	maxInflightApplies int
+	maxLogBytes        int
 	hclogLogger        hclog.Logger
 	slogLogger         *slog.Logger
 
@@ -309,6 +310,27 @@ func WithNoLeaderTimeout(timeout time.Duration) Option {
 func WithMaxInflightApplies(n int) Option {
 	return func(o *options) {
 		o.maxInflightApplies = n
+	}
+}
+
+// WithMaxLogBytes caps the memory of the in-memory raft log. Once the log has
+// outgrown maxBytes, the cache has raft take a snapshot, and the compaction that
+// follows drops the oldest entries until the rest fits half of maxBytes. The
+// window a lagging follower can be repaired from is therefore between half and
+// all of maxBytes: many entries where they are small, few where they are large.
+//
+// raft's own settings count entries: SnapshotThreshold decides when it
+// snapshots, TrailingLogs how many entries a compaction keeps. Both stay in
+// force. The cap only ever keeps more than raft asked for and snapshots sooner
+// than raft would, so set TrailingLogs low, or it is that count and not the cap
+// that sizes the log. Without a cap, a count sized for a cluster of small
+// entries is gigabytes of log, in every member, on a cluster of large ones.
+//
+// The cap is soft: the log overshoots it by what is appended while the snapshot
+// runs. Zero (the default) leaves the log to raft's settings alone.
+func WithMaxLogBytes(maxBytes int) Option {
+	return func(o *options) {
+		o.maxLogBytes = maxBytes
 	}
 }
 
