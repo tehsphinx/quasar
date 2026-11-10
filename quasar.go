@@ -142,6 +142,9 @@ func newCache(ctx context.Context, fsm *fsmWrapper, inject func(*FSMInjector), c
 	c.applySem = inflight.NewApply(c.logger, cfg.cacheName, cfg.maxInflightApplies)
 	c.persistedRestart = make(chan struct{}, 1)
 	fsm.hasLeader = c.hasLeader
+	if cfg.discovery != nil {
+		fsm.instanceID = c.getInstanceID
+	}
 	inject(&FSMInjector{cache: c})
 
 	transport, err := getTransport(ctx, cfg)
@@ -628,10 +631,27 @@ func (s *Cache) GetServerList() ([]raft.Server, error) {
 	return configuration.Servers, nil
 }
 
-func (s *Cache) store(ctx context.Context, key string, data []byte, opts ...StoreOption) (uint64, error) {
+func (s *Cache) store(ctx context.Context, key string, data []byte, opts ...StoreOption) (WaitToken, error) {
 	cmd := cmdStore(key, data)
-	_, uid, err := s.apply(ctx, cmd, resolveStoreOpts(opts))
-	return uid, err
+	resp, uid, err := s.apply(ctx, cmd, resolveStoreOpts(opts))
+	return WaitToken{InstanceID: resp.GetStore().GetInstanceId(), Index: uid}, err
+}
+
+// waitFor waits until the local FSM has applied the write token names. The
+// index of a token of another history says nothing here, so such a token is
+// answered with a wait for the leader's latest index instead: the caller then
+// reads no older state than the leader has.
+func (s *Cache) waitFor(ctx context.Context, token WaitToken) error {
+	err := s.fsm.waitFor(ctx, token)
+	if !errors.Is(err, errOtherHistory) {
+		return err
+	}
+
+	uid, err := s.masterLastIndex(ctx)
+	if err != nil {
+		return err
+	}
+	return s.fsm.WaitFor(ctx, uid)
 }
 
 func (s *Cache) masterLastIndex(ctx context.Context) (uint64, error) {
@@ -693,6 +713,9 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 	}
 
 	rft, ctxRaft := s.getRaftWithCtx()
+	// Read before the write is proposed, for the Store response: it has to name
+	// the history the index is from, and after a rebuild the ID is the next one's.
+	instanceID := s.getInstanceID()
 	cmd, err := s.persist(ctx, ctxRaft, rft, cmd)
 	if err != nil {
 		return nil, 0, err
@@ -713,6 +736,9 @@ func (s *Cache) applyLocal(ctx context.Context, cmd *pb.Command) (*pb.CommandRes
 	resp := fut.Response().(applyResponse)
 	if r := resp.err; r != nil {
 		return nil, 0, fmt.Errorf("apply function returned error: %w", r)
+	}
+	if store := resp.resp.GetStore(); store != nil {
+		store.InstanceId = instanceID
 	}
 
 	return resp.resp, index, nil
@@ -1064,9 +1090,9 @@ func (s *Cache) handleRPC(ctx context.Context, rpc raft.RPC) {
 	)
 	switch cmd := rpc.Command.(type) {
 	case *pb.Store:
-		var uid uint64
-		uid, err = s.store(ctx, cmd.Key, cmd.Data)
-		resp = &pb.StoreResponse{Uid: uid}
+		var token WaitToken
+		token, err = s.store(ctx, cmd.Key, cmd.Data)
+		resp = &pb.StoreResponse{Uid: token.Index, InstanceId: token.InstanceID}
 	case *pb.ResetCache:
 		if cmd.Hard {
 			err = s.localHardReset(cmd.Uuid, cmd.GetInitiatorInstanceId(), cmd.GetFull(),

@@ -110,8 +110,9 @@ See [`examples/basic`](examples/basic) for a runnable version.
 - **FSM.** The state machine that applies committed log entries to your data.
   Quasar replicates opaque byte commands; your FSM decides what they mean.
 - **UID.** Every committed write is assigned a monotonic Raft log index, surfaced
-  as a `uint64` UID. UIDs are the unit of consistency: you wait for a UID to be
-  applied locally before reading.
+  as a `WaitToken` that pairs it with the ID of the Raft history it belongs to.
+  UIDs are the unit of consistency: you wait for a UID to be applied locally
+  before reading.
 - **Transport.** How Raft RPCs (and forwarded writes) travel between nodes —
   NATS, TCP, or a custom implementation.
 - **Discovery.** How nodes find each other, join the cluster, and get pruned
@@ -267,7 +268,7 @@ func (f *counterFSM) Reset() error { f.mu.Lock(); f.n = 0; f.mu.Unlock(); return
 // Snapshot / Restore: serialize and reload f.n (see hashicorp/raft FSMSnapshot).
 
 // Add replicates a delta through Raft and returns its UID.
-func (f *counterFSM) Add(ctx context.Context, delta int64) (uint64, error) {
+func (f *counterFSM) Add(ctx context.Context, delta int64) (quasar.WaitToken, error) {
 	buf := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutVarint(buf, delta)
 	return f.inj.Store(ctx, buf[:n])

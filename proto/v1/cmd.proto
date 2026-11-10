@@ -49,6 +49,11 @@ message Store {
 
 message StoreResponse {
   uint64 uid = 1;
+
+  // instance_id is the raft instance ID of the leader that took the write, the history uid is an
+  // index of. A node waiting for uid compares it with its own, so that an index of another history is
+  // not waited for (RT-15900). Empty from a leader that does not send it yet.
+  string instance_id = 2;
 }
 
 message LatestUid {}

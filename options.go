@@ -375,11 +375,12 @@ func getLoadOptions(opts []LoadOption) loadOptions {
 }
 
 type loadOptions struct {
-	waitFor uint64
+	waitFor WaitToken
 }
 
-// WaitForUID adds a raft uid to be applied before reading a value.
-func WaitForUID(uid uint64) LoadOption {
+// WaitForUID adds a write, by the WaitToken its Store returned, to be applied
+// before reading a value.
+func WaitForUID(uid WaitToken) LoadOption {
 	return func(opt *loadOptions) {
 		opt.waitFor = uid
 	}

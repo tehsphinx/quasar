@@ -15,12 +15,15 @@ type FSMInjector struct {
 	cache *Cache
 }
 
-// WaitFor waits for the given `uid` to be applied by the local FSM.
-func (s *FSMInjector) WaitFor(ctx context.Context, uid uint64) error {
+// WaitFor waits for the write the given token names to be applied by the local
+// FSM. A token of another raft history than the local one is not waited for by
+// its index: WaitFor then waits for the latest entry of the master instead, as
+// WaitForMasterLatest does.
+func (s *FSMInjector) WaitFor(ctx context.Context, token WaitToken) error {
 	ctx, cancel := getWaitCtx(ctx)
 	defer cancel()
 
-	return s.cache.fsm.WaitFor(ctx, uid)
+	return s.cache.waitFor(ctx, token)
 }
 
 // WaitForMasterLatest waits for the latest entry in the master's Raft log to be applied by the local FSM.
@@ -51,13 +54,14 @@ func (s *FSMInjector) WaitForKnownLatest(ctx context.Context) error {
 }
 
 // Store stores the given byte slice in the cache. It invokes the store method of the cache instance.
-// It returns the unique identifier (UID) associated with the stored data and
-// any error encountered during the operation.
+// It returns the WaitToken of the stored data, for a caller that waits for the
+// write (WaitFor) before it reads, and any error encountered during the
+// operation.
 //
 // Variadic StoreOption arguments configure how the call interacts with a
 // transport that supports persisted-FIFO mode (see WithRetry). Options
 // are no-ops on transports that do not implement persisted-FIFO.
-func (s *FSMInjector) Store(ctx context.Context, bts []byte, opts ...StoreOption) (uint64, error) {
+func (s *FSMInjector) Store(ctx context.Context, bts []byte, opts ...StoreOption) (WaitToken, error) {
 	return s.cache.store(ctx, "", bts, opts...)
 }
 
