@@ -335,10 +335,19 @@ func rpcHandler[Req proto.Message](
 			return
 		}
 
+		// The send must give way to shutdown like the other transports': a
+		// full channel nobody drains would otherwise park this subscription's
+		// dispatcher past the transport's lifetime (RT-14146). The slot is
+		// released here because no goroutine was started to release it.
 		chResp := make(chan raft.RPCResponse, 1)
-		ch <- raft.RPC{
-			RespChan: chResp,
-			Command:  toCommand(req),
+		select {
+		case ch <- raft.RPC{RespChan: chResp, Command: toCommand(req)}:
+		case <-ctx.Done():
+			if sem != nil {
+				sem.Release()
+			}
+			s.handleError(msg, raft.ErrTransportShutdown)
+			return
 		}
 
 		if sem == nil {
@@ -643,6 +652,11 @@ func (s *NATSTransport) handleHeartbeat(ctx context.Context) func(*nats.Msg) {
 			Command:  protoMsg.Convert(),
 		}
 
+		// One deadline bounds the hand-off and the response wait together, so
+		// the whole callback stays within the heartbeat window (RT-14146).
+		waitCtx, cancel := s.respCtx(ctx)
+		defer cancel()
+
 		s.heartbeatFnLock.Lock()
 		fn := s.heartbeatFn
 		s.heartbeatFnLock.Unlock()
@@ -653,17 +667,22 @@ func (s *NATSTransport) handleHeartbeat(ctx context.Context) func(*nats.Msg) {
 			// raft registers, or the window between a reinit's Shutdown and the
 			// new raft's rebind. Route to the consumer so the beat reaches the
 			// live raft (once it drains Consumer()) instead of being dropped.
-			s.chConsume <- rpc
+			// With the consumer full and nobody draining it, give up when the
+			// sender has: it falls back to entries.append after the same window.
+			select {
+			case s.chConsume <- rpc:
+			case <-waitCtx.Done():
+				s.handleError(msg, fmt.Errorf("no raft bound to drain heartbeat: %w", waitCtx.Err()))
+				return
+			}
 		}
 
-		waitCtx, cancel := s.respCtx(ctx)
 		bts, err := s.awaitResponse(waitCtx, chResp, func(i interface{}) *pb.CommandResponse {
 			resp, _ := i.(*raft.AppendEntriesResponse)
 			return &pb.CommandResponse{Resp: &pb.CommandResponse_AppendEntries{
 				AppendEntries: pb.ToAppendEntriesResponse(resp),
 			}}
 		})
-		cancel()
 		if err != nil {
 			s.handleError(msg, fmt.Errorf("failed to consume message: %w", err))
 			return
