@@ -80,6 +80,10 @@ type fsmWrapper struct {
 	fsm FSM
 
 	lastApplied uint64
+	// raftGen counts the rebuilds of raft on a fresh log (applyRaftReset). An
+	// index handed out before a rebuild belongs to the previous log, see
+	// Cache.store.
+	raftGen atomic.Uint64
 	// restoreIndex is the meta index of the snapshot raft most recently
 	// opened from the wrapped snapshot store (see wrapSnapshotStore). raft's
 	// runFSM opens a snapshot and immediately calls Restore on the same
@@ -213,6 +217,7 @@ func (s *fsmWrapper) StoreConfiguration(index uint64, _ raft.Configuration) {
 }
 
 func (s *fsmWrapper) applyRaftReset() {
+	s.raftGen.Add(1)
 	s.setLastApplied(0)
 	s.resetSysUIDs()
 }
