@@ -177,6 +177,10 @@ func newCache(ctx context.Context, fsm *fsmWrapper, inject func(*FSMInjector), c
 		go c.runQuorumRecoveryWatch(ctx)
 	}
 
+	if c.fsm.starting.Load() {
+		go c.endStartupReplay(ctx)
+	}
+
 	if transport.SupportsPersisted() {
 		go c.runPersistedConsumer(ctx)
 	}
@@ -429,6 +433,10 @@ func (s *Cache) tryFallbackBootstrap(rft *raft.Raft, due func() bool, after, win
 		"fallback-wait", after,
 		"leader-ping-window", window,
 	)
+	// A history starts here, on a log that starts over. A replay boundary left
+	// by a rebuild on the history of the leader that went away would make its
+	// first entries pass for that leader's (see Replayer).
+	s.fsm.replayUpTo(0, 0)
 	s.bootstrapCluster(rft, raft.Configuration{
 		Servers: []raft.Server{{ID: raft.ServerID(s.localID), Address: transport.LocalAddr()}},
 	})
@@ -931,12 +939,28 @@ func (s *Cache) WaitReady(ctx context.Context) error {
 		return err
 	}
 
-	// wait for master index to be applied locally
-	uid, err := s.masterLastIndex(ctx)
+	// wait for master index to be applied locally. What comes after it is news
+	// to an embedder that waited to be ready; if the log changed meanwhile,
+	// endStartupReplay asks again.
+	uid, _, err := s.lastIndexEndingStartup(ctx)
 	if err != nil {
 		return err
 	}
 	return s.fsm.WaitFor(ctx, uid)
+}
+
+// lastIndexEndingStartup is masterLastIndex for a caller that takes the answer
+// as where the cluster stood: it ends the startup replay with it (see
+// Replayer). ended is false when the log changed while the leader was asked.
+func (s *Cache) lastIndexEndingStartup(ctx context.Context) (uid uint64, ended bool, err error) {
+	// Both are taken before asking: a rebuild meanwhile voids the answer, and
+	// what a leader elected meanwhile wrote is of a higher term and stays news.
+	epoch, term := s.fsm.startupEpoch(), s.raft().CurrentTerm()
+	uid, err = s.masterLastIndex(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	return uid, s.fsm.endStartup(uid, term, epoch), nil
 }
 
 func (s *Cache) waitForLeader(ctx context.Context) error {
@@ -1467,6 +1491,15 @@ func (s *Cache) reinitRaftAdoptingInstance(adoptInstanceID string, full bool) er
 	// gap, it does not close it: a caller records the index after Store has
 	// returned, and a rebuild can still land between the two. Only the caller
 	// can drop an index it recorded across its own Reset.
+	//
+	// Before the indexes start over: what this process applied so far comes
+	// back as replays if the rebuilt raft rejoins the same history. In another
+	// history the same indexes can hold other entries, so there nothing is.
+	var replayUntil, replayTerm uint64
+	if adoptInstanceID != "" && adoptInstanceID == s.getInstanceID() {
+		replayUntil, replayTerm = s.fsm.replayedSoFar()
+	}
+	s.fsm.replayUpTo(replayUntil, replayTerm)
 	s.fsm.applyRaftReset()
 	if err := s.fsm.applyReset(full); err != nil {
 		// Past the shutdown there is no way back to the old raft, so returning
@@ -1672,6 +1705,34 @@ func (s *Cache) watchQuorumOnRaft(ctx, ctxRaft context.Context, rft *raft.Raft, 
 	}
 
 	recoveryLoop(ctx, ctxRaft, chObs, s.hasLeader, fire, after, s.leaderStableFor(after))
+}
+
+// endStartupReplay ends the replay a fresh process starts in (see Replayer) once
+// the process knows where the cluster stands: the leader's last index. Until
+// then every entry it applies is the cluster's past. It does not depend on the
+// embedder calling WaitReady.
+func (s *Cache) endStartupReplay(ctx context.Context) {
+	warned := false
+	for {
+		if err := s.waitForLeader(ctx); err != nil {
+			return
+		}
+		_, ended, err := s.lastIndexEndingStartup(ctx)
+		if err == nil && ended {
+			return
+		}
+		if err != nil && !warned {
+			warned = true
+			s.logger.Warn("startup replay: the leader does not answer with its last index; what this node applies stays a replay until it does",
+				"local-id", s.localID, "error", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(recoveryRetryAfter):
+		}
+	}
 }
 
 // leaderStableFor is how long a freshly-observed leader must persist before it
@@ -1931,6 +1992,12 @@ func (s *Cache) recoverQuorum() error {
 	// one (see snapshotStore.Create).
 	conf := raftConfig(s.cfg)
 	rftNew, err := s.rebuildRaft(func() error {
+		// What RecoverCluster re-applies up to here, this process has applied
+		// before, in this attempt or an earlier one that failed, or it is the
+		// past of the cluster the process was still catching up on. Entries
+		// beyond it were stored but never applied: those are news.
+		s.fsm.replayUpTo(s.fsm.replayedSoFar())
+
 		if snaps, err := s.snapshotStore.List(); err != nil {
 			return fmt.Errorf("list snapshots: %w", err)
 		} else if len(snaps) == 0 {

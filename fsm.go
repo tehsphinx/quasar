@@ -45,6 +45,26 @@ type FSM interface {
 	Reset() error
 }
 
+// Replayer is an optional extension of FSM. ReplayCmd applies a command like
+// ApplyCmd does, for a log entry that is not news to anyone the node serves:
+//
+//   - an entry this process had applied before raft was rebuilt on the same
+//     history: quorum recovery re-applies the log behind the newest snapshot,
+//     and a follower rebuilt by a hard reset fetches the leader's log again;
+//   - an entry the cluster had when a fresh process joined it, applied while
+//     that process was catching up.
+//
+// An FSM that notifies others of the changes it applies implements it to bring
+// its state up to date without notifying them a second time, days late. One that
+// does not gets every entry through ApplyCmd.
+//
+// After the node adopted another history, the catch-up goes through ApplyCmd:
+// what the other branch applied is news to this node, and an index cannot tell
+// it from what both branches share (RT-15906).
+type Replayer interface {
+	ReplayCmd(cmd []byte) error
+}
+
 // FullResetter is an optional extension of FSM. When the FSM implements it,
 // quasar calls ResetFull(full) instead of Reset() when applying a reset,
 // passing whether stores that normally survive a reset must also be cleared (a
@@ -72,6 +92,11 @@ func wrapFSM(fsm FSM) *fsmWrapper {
 	if _, ok := fsm.(*kvFSM); ok {
 		s.isLogApplier = true
 	}
+	// A fresh process starts in replay: what it applies until it knows where
+	// the cluster stands is the cluster's past (see Cache.endStartupReplay).
+	if _, ok := fsm.(Replayer); ok {
+		s.starting.Store(true)
+	}
 	return s
 }
 
@@ -84,6 +109,20 @@ type fsmWrapper struct {
 	// index handed out before a rebuild belongs to the previous log, see
 	// Cache.store.
 	raftGen atomic.Uint64
+	// replayUntil, replayTerm and starting decide which entries a Replayer gets
+	// as replays, see isReplay. replayMu orders their changes; replayEpoch
+	// counts the times the log changed under the boundary, see endStartup.
+	replayMu    sync.Mutex
+	replayEpoch uint64
+	replayUntil atomic.Uint64
+	replayTerm  atomic.Uint64
+	starting    atomic.Bool
+	// lastCmd and lastCmdTerm are the index and the term of the last command
+	// the FSM applied. Unlike lastApplied they never run ahead of it: that one
+	// also takes the index of a noop when it is stored, which a later leader
+	// can still replace with a command.
+	lastCmd     atomic.Uint64
+	lastCmdTerm atomic.Uint64
 	// restoreIndex is the meta index of the snapshot raft most recently
 	// opened from the wrapped snapshot store (see wrapSnapshotStore). raft's
 	// runFSM opens a snapshot and immediately calls Restore on the same
@@ -112,6 +151,10 @@ type applyResponse struct {
 
 func (s *fsmWrapper) Apply(log *raft.Log) interface{} {
 	defer s.uidApplied(log.Index)
+	defer func() {
+		s.lastCmd.Store(log.Index)
+		s.lastCmdTerm.Store(log.Term)
+	}()
 
 	if s.isLogApplier {
 		if fsm, ok := s.fsm.(logApplier); ok {
@@ -219,6 +262,8 @@ func (s *fsmWrapper) StoreConfiguration(index uint64, _ raft.Configuration) {
 func (s *fsmWrapper) applyRaftReset() {
 	s.raftGen.Add(1)
 	s.setLastApplied(0)
+	s.lastCmd.Store(0)
+	s.lastCmdTerm.Store(0)
 	s.resetSysUIDs()
 }
 
@@ -234,8 +279,84 @@ func (s *fsmWrapper) applyReset(full bool) error {
 }
 
 func (s *fsmWrapper) store(log *raft.Log, cmd *pb.Store) (*pb.CommandResponse, error) {
-	err := s.fsm.ApplyCmd(cmd.Data)
+	var err error
+	if replayer, ok := s.fsm.(Replayer); ok && s.isReplay(log) {
+		err = replayer.ReplayCmd(cmd.Data)
+	} else {
+		err = s.fsm.ApplyCmd(cmd.Data)
+	}
 	return respStore(&pb.StoreResponse{Uid: log.Index}), err
+}
+
+// isReplay reports whether log is a replay, see Replayer: any entry while the
+// process is starting, and afterwards an entry within the boundary. The
+// boundary is an index and a term. Whoever writes an entry under an index that
+// was taken before does it as a leader elected later, in a higher term: a node
+// that wins an election after a hard reset wiped the voters ahead of it, or the
+// node that recovered the quorum alone. Its entries are news whatever their
+// index.
+func (s *fsmWrapper) isReplay(log *raft.Log) bool {
+	return s.starting.Load() ||
+		log.Index <= s.replayUntil.Load() && log.Term <= s.replayTerm.Load()
+}
+
+// replayUpTo sets the boundary: every entry up to index, written in a term up
+// to term, is a replay. It is called when the log changes under the FSM:
+// before raft is rebuilt, with replayedSoFar when the rebuilt raft has the same
+// history and with nothing when it adopts another one, and with nothing when a
+// history starts on this node.
+func (s *fsmWrapper) replayUpTo(index, term uint64) {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+
+	s.replayEpoch++
+	s.replayUntil.Store(index)
+	s.replayTerm.Store(term)
+}
+
+// replayedSoFar is the boundary to keep across a rebuild of raft on the same
+// history: the last command this process applied, or the boundary it has when
+// that reaches further, as it does on a process that is still catching up.
+// Only raft's goroutines move it, so it is read once they are gone.
+func (s *fsmWrapper) replayedSoFar() (index, term uint64) {
+	if until := s.replayUntil.Load(); until > s.lastCmd.Load() {
+		return until, s.replayTerm.Load()
+	}
+	return s.lastCmd.Load(), s.lastCmdTerm.Load()
+}
+
+// startupEpoch is what endStartup tells an index of the current log by. It is
+// taken before the leader is asked for the index.
+func (s *fsmWrapper) startupEpoch() uint64 {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+
+	return s.replayEpoch
+}
+
+// endStartup ends the replay a fresh process starts in. index is where the
+// cluster stood when the process learned it, and term the term the process was
+// in when it asked: entries up to both stay replays, others are news. It
+// reports false and changes nothing when the log changed since epoch was
+// taken: index is then one of the log before, and as a boundary on the new
+// log, which starts over, it would turn news into replays for as long as that
+// log needs to reach it.
+func (s *fsmWrapper) endStartup(index, term, epoch uint64) bool {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+
+	if !s.starting.Load() {
+		return true
+	}
+	if s.replayEpoch != epoch {
+		return false
+	}
+	if index > s.replayUntil.Load() {
+		s.replayUntil.Store(index)
+		s.replayTerm.Store(term)
+	}
+	s.starting.Store(false)
+	return true
 }
 
 // WaitFor blocks until the FSM has applied uid, or until ctx expires.
