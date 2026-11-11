@@ -11,6 +11,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/tehsphinx/quasar"
 	"github.com/tehsphinx/quasar/pb/v1"
+	"github.com/tehsphinx/quasar/transports"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -28,7 +29,8 @@ var _ quasar.Discovery = (*NATSDiscovery)(nil)
 // NATSDiscovery is a type that represents a discovery mechanism using NATS messaging system.
 // It implements the quasar.Discovery interface.
 type NATSDiscovery struct {
-	nc    *nats.Conn
+	nc    *nats.Conn // the connection the discovery was given
+	conn  *nats.Conn // the one the pings travel on, see dial; set by Run
 	cache *quasar.DiscoveryInjector
 
 	subj       string
@@ -46,8 +48,11 @@ func (s *NATSDiscovery) Inject(cache *quasar.DiscoveryInjector) {
 // Run starts the NATSDiscovery service. This is a non-blocking call.
 // Implements quasar.Discovery.
 func (s *NATSDiscovery) Run(ctx context.Context) error {
-	discoverySub, err := s.nc.Subscribe(s.subj, s.discoveryHandler)
+	s.conn = s.dial(fmt.Sprintf("quasar-%s-%s-discovery", s.cache.Name(), s.serverInfo.ID))
+
+	discoverySub, err := s.conn.Subscribe(s.subj, s.discoveryHandler)
 	if err != nil {
+		s.closeConn()
 		return err
 	}
 
@@ -56,6 +61,7 @@ func (s *NATSDiscovery) Run(ctx context.Context) error {
 		// ping failure returned without ever installing the unsubscribe path,
 		// leaking the subscription (m18).
 		_ = discoverySub.Unsubscribe()
+		s.closeConn()
 		return r
 	}
 
@@ -64,8 +70,57 @@ func (s *NATSDiscovery) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = discoverySub.Unsubscribe()
+		s.closeConn()
 	}()
 	return nil
+}
+
+// dial opens the connection the pings travel on, from the options of the
+// connection the discovery was given, so it inherits its credentials, TLS config
+// and server list.
+//
+// The pings need a connection of their own for the same reason the raft
+// liveness RPCs do (see transports.LivePingInterval): a peer that is not heard
+// for the alive window counts as dead, and a connection that shares a busy
+// socket can stay attached to a NATS server that stopped answering for minutes.
+// Next to nothing travels on this one, so it leaves such a server within
+// seconds and the pings resume on the next one.
+//
+// A connection that cannot be opened is not fatal: the pings then travel on the
+// connection the discovery was given, as they did before.
+func (s *NATSDiscovery) dial(name string) *nats.Conn {
+	opts := s.nc.Opts
+	opts.Name = name
+	opts.PingInterval = transports.LivePingInterval
+	opts.MaxPingsOut = transports.LiveMaxPingsOut
+	// The lifecycle callbacks belong to the application connection: one that
+	// exits the process when its connection closes must not fire for this one.
+	opts.DisconnectedCB = nil
+	opts.DisconnectedErrCB = func(_ *nats.Conn, err error) {
+		s.logger().Warn("discovery NATS connection disconnected", "error", err)
+	}
+	opts.ReconnectedCB = func(_ *nats.Conn) {
+		s.logger().Info("discovery NATS connection reconnected")
+	}
+	opts.ClosedCB = nil
+	opts.AsyncErrorCB = nil
+	opts.DiscoveredServersCB = nil
+	opts.LameDuckModeHandler = nil
+
+	conn, err := opts.Connect()
+	if err != nil {
+		s.logger().Error("failed to open the discovery NATS connection, falling back to the shared connection", "error", err)
+		return s.nc
+	}
+	return conn
+}
+
+// closeConn closes the connection dial opened. The one the discovery was given
+// stays the caller's.
+func (s *NATSDiscovery) closeConn() {
+	if s.conn != s.nc {
+		s.conn.Close()
+	}
 }
 
 func (s *NATSDiscovery) runPinging(ctx context.Context) {
@@ -106,7 +161,7 @@ func (s *NATSDiscovery) ping() error {
 		return err
 	}
 
-	return s.nc.Publish(s.subj, bts)
+	return s.conn.Publish(s.subj, bts)
 }
 
 func (s *NATSDiscovery) discoveryHandler(msg *nats.Msg) {
@@ -143,7 +198,7 @@ func (s *NATSDiscovery) discoveryHandler(msg *nats.Msg) {
 	// Pings are plain publishes (see ping / runPinging), never request-reply,
 	// so msg.Reply is always empty here — the former msg.Respond branch was
 	// dead (RT-13042 S8). Responses go back out on the shared subject.
-	if r := s.nc.Publish(s.subj, bts); r != nil {
+	if r := s.conn.Publish(s.subj, bts); r != nil {
 		s.logger().Warn("discovery ping response failed", "error", r)
 		return
 	}
