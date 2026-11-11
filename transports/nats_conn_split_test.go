@@ -5,6 +5,7 @@ package transports
 import (
 	"bytes"
 	"context"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -326,5 +327,99 @@ func TestNATSTransport_RaftConnsLeaveAFrozenServer(t *testing.T) {
 
 	if !conn.IsConnected() {
 		t.Error("the caller's connection left too; it should be on its own settings")
+	}
+}
+
+// TestLeaveSilentServer opens connections the way an application does, with
+// nats.Connect and the option, against two servers. A quiet one and one that
+// keeps publishing both have to leave the first server within seconds of its
+// freeze and arrive on the second; a connection without the option is the
+// control and stays attached (RT-15913).
+func TestLeaveSilentServer(t *testing.T) {
+	srv, other := frozennats.Run(t), frozennats.Run(t)
+	connect := func(opts ...nats.Option) *nats.Conn {
+		// In the order given, so every connection starts on srv.
+		opts = append([]nats.Option{nats.DontRandomize()}, opts...)
+		conn, err := nats.Connect(srv.URL()+","+other.URL(), opts...)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(conn.Close)
+		if conn.ConnectedUrl() != srv.URL() {
+			t.Fatalf("connected to %s, want the first server %s", conn.ConnectedUrl(), srv.URL())
+		}
+		return conn
+	}
+	control := connect()
+	conns := []struct {
+		name string
+		conn *nats.Conn
+	}{{"quiet", connect(LeaveSilentServer)}, {"publishing", connect(LeaveSilentServer)}}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		payload := make([]byte, 64<<10)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = conns[1].conn.Publish("load", payload)
+			}
+		}
+	}()
+
+	srv.Freeze()
+	frozenAt := time.Now()
+	const within = 15 * time.Second
+	for _, c := range conns {
+		for c.conn.ConnectedUrl() != other.URL() {
+			if time.Since(frozenAt) > within {
+				t.Fatalf("the %s connection is not on the other server %s after the freeze (connected to %q)",
+					c.name, within, c.conn.ConnectedUrl())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Logf("the %s connection was on the other server %s after the freeze", c.name, time.Since(frozenAt).Round(100*time.Millisecond))
+	}
+
+	if control.ConnectedUrl() != srv.URL() {
+		t.Error("the connection without the option left too")
+	}
+}
+
+// Hand-built options carry no timeout when the option runs: the dialer it
+// wraps must not be left without one.
+func TestLeaveSilentServer_DialTimeoutOfHandBuiltOptions(t *testing.T) {
+	var opts nats.Options
+	if err := LeaveSilentServer(&opts); err != nil {
+		t.Fatal(err)
+	}
+	dialer, ok := opts.CustomDialer.(stallDialer).inner.(*net.Dialer)
+	if !ok {
+		t.Fatalf("inner dialer is %T, want a *net.Dialer", opts.CustomDialer.(stallDialer).inner)
+	}
+	if dialer.Timeout != nats.DefaultTimeout {
+		t.Errorf("dial timeout %s, want the client's default %s", dialer.Timeout, nats.DefaultTimeout)
+	}
+}
+
+// The raft connections copy the options of the application connection. One that
+// was opened with LeaveSilentServer must not end up with a wrapper around the
+// wrapper.
+func TestLeaveSilentServer_AppliedTwiceWrapsOnce(t *testing.T) {
+	opts := nats.GetDefaultOptions()
+	for range 2 {
+		if err := LeaveSilentServer(&opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dialer, ok := opts.CustomDialer.(stallDialer)
+	if !ok {
+		t.Fatalf("custom dialer is %T, want the stall dialer", opts.CustomDialer)
+	}
+	if _, nested := dialer.inner.(stallDialer); nested {
+		t.Error("the stall dialer wraps another stall dialer")
 	}
 }
