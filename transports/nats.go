@@ -176,9 +176,7 @@ func (s *NATSTransport) dialRaftConn(conn *nats.Conn, role string) *nats.Conn {
 	opts.AsyncErrorCB = raftConnErrorHandler(s.logger, role)
 	opts.DiscoveredServersCB = nil
 	opts.LameDuckModeHandler = nil
-	opts.PingInterval = LivePingInterval
-	opts.MaxPingsOut = LiveMaxPingsOut
-	opts.CustomDialer = stallDialer{inner: dialerOf(&opts)}
+	_ = LeaveSilentServer(&opts)
 
 	nc, err := opts.Connect()
 	if err != nil {
@@ -190,13 +188,51 @@ func (s *NATSTransport) dialRaftConn(conn *nats.Conn, role string) *nats.Conn {
 	return nc
 }
 
+// LeaveSilentServer is a nats.Option that makes a connection give up on a NATS
+// server that stopped answering, the way the raft connections do: pings every
+// LivePingInterval, and a write that blocks for stallTimeout closes the socket.
+// It is exported for the connections of the embedding application, which are
+// exposed in the same way: everything they publish to a frozen server is lost
+// while their status stays connected (RT-15913).
+//
+// It wraps the dialer the options hold, so it goes after the options that set
+// a dialer or the connect timeout. Options that already carry it, like those
+// the raft connections copy from an application connection, are not wrapped a
+// second time.
+//
+// What a connection gives up for it:
+//   - stallTimeout bounds every write to the socket and replaces the client's
+//     own write deadline, a FlusherTimeout included.
+//   - The client splits the connect timeout between the addresses of a host
+//     name only for its own dialer. Through this one every address gets the
+//     whole timeout.
+//   - A dialer that does the TLS handshake itself hands back a connection the
+//     client no longer recognizes as TLS (TLSConnectionState).
+func LeaveSilentServer(opts *nats.Options) error {
+	opts.PingInterval = LivePingInterval
+	opts.MaxPingsOut = LiveMaxPingsOut
+	if _, wrapped := opts.CustomDialer.(stallDialer); !wrapped {
+		opts.CustomDialer = stallDialer{inner: dialerOf(opts)}
+	}
+	return nil
+}
+
 // dialerOf returns the dialer a connection with these options is opened with.
 func dialerOf(opts *nats.Options) nats.CustomDialer {
 	if opts.CustomDialer != nil {
 		return opts.CustomDialer
 	}
-	// Connect fills Dialer in when the caller left it nil.
-	return opts.Dialer
+	if opts.Dialer != nil {
+		return opts.Dialer
+	}
+	// What Connect fills in when the caller left both nil. Hand-built options
+	// get their default timeout only in Connect, after the option ran; without
+	// one a dial would wait for the operating system to give up.
+	timeout := opts.Timeout
+	if timeout == 0 {
+		timeout = nats.DefaultTimeout
+	}
+	return &net.Dialer{Timeout: timeout}
 }
 
 // stallDialer dials connections that are closed when a write to them blocks for
