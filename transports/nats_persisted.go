@@ -334,8 +334,11 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context, apply PersistedA
 	// unavailable consumer does not keep a new leader from draining every other
 	// shard (RT-15781). The start fails only when no shard connected or the
 	// caller gave up; the cache then retries the whole start, and a
-	// single-shard queue keeps failing its start exactly as before.
-	var errs []error
+	// single-shard queue keeps failing its start exactly as before. The shards
+	// connect concurrently, so a JetStream that does not answer costs one
+	// request timeout in total, not one per shard.
+	errs := make([]error, q.shards)
+	var wg sync.WaitGroup
 	for i := 0; i < q.shards; i++ {
 		c := &natsPersistedConsumer{
 			queue: q,
@@ -344,17 +347,28 @@ func (q *natsPersistedQueue) startConsumer(ctx context.Context, apply PersistedA
 			group: g,
 		}
 		g.consumers = append(g.consumers, c)
-		if r := c.connect(ctx, stream); r != nil {
-			errs = append(errs, r)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = c.connect(ctx, stream)
+		}()
+	}
+	wg.Wait()
+	failed := 0
+	for _, r := range errs {
+		if r != nil {
+			failed++
 		}
 	}
-	if len(errs) == q.shards || ctx.Err() != nil {
+	if failed == q.shards || ctx.Err() != nil {
 		g.stopContexts()
 		cancel()
 		return nil, errors.Join(append(errs, ctx.Err())...)
 	}
-	for _, r := range errs {
-		q.logger.Error("persisted consumer shard failed to start; reconnecting", "error", r)
+	for i, r := range errs {
+		if r != nil {
+			q.logger.Error("persisted consumer shard failed to start; reconnecting", "shard", i, "error", r)
+		}
 	}
 
 	g.launch(pullCtx)
