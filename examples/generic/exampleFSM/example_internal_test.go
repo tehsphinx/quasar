@@ -2,6 +2,7 @@ package exampleFSM
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -139,5 +140,28 @@ func TestRestoreErrorKeepsState(t *testing.T) {
 				t.Errorf("state before the failed restore lost: %v", err)
 			}
 		})
+	}
+}
+
+// failingSink is a raft.SnapshotSink whose writes fail.
+type failingSink struct {
+	err      error
+	canceled bool
+}
+
+func (s *failingSink) Write([]byte) (int, error) { return 0, s.err }
+func (s *failingSink) Close() error              { return nil }
+func (s *failingSink) ID() string                { return "failing" }
+func (s *failingSink) Cancel() error             { s.canceled = true; return nil }
+
+func TestPersistWriteErrorCancelsSink(t *testing.T) {
+	sink := &failingSink{err: errors.New("disk full")}
+	snap := &snapshot{musicians: []Musician{{Name: "Miles"}}}
+
+	if err := snap.Persist(sink); !errors.Is(err, sink.err) {
+		t.Fatalf("Persist error = %v, want %v", err, sink.err)
+	}
+	if !sink.canceled {
+		t.Error("Persist did not cancel the sink after a write error")
 	}
 }
