@@ -111,6 +111,9 @@ func (s *InMemoryFSM) GetMusicianLocal(name string) (Musician, error) {
 
 // GetCityLocal gets a value from the local cache. There is no consistency guarantee here.
 func (s *InMemoryFSM) GetCityLocal(name string) (City, error) {
+	s.citiesM.RLock()
+	defer s.citiesM.RUnlock()
+
 	city, ok := s.cities[name]
 	if !ok {
 		return City{}, fmt.Errorf("city %s not found", name)
@@ -154,7 +157,7 @@ func (s *InMemoryFSM) setMusician(musician Musician) {
 
 func (s *InMemoryFSM) setCity(city City) {
 	s.citiesM.Lock()
-	defer s.citiesM.RUnlock()
+	defer s.citiesM.Unlock()
 
 	s.cities[city.Name] = city
 }
@@ -211,8 +214,19 @@ func (s *snapshot) Persist(sink raft.SnapshotSink) error {
 	return nil
 }
 
+// maxSnapshotLine bounds a single snapshot entry. bufio.Scanner's default of 64 KiB is too
+// small for larger values.
+const maxSnapshotLine = 16 * 1024 * 1024
+
+// Restore replaces the whole state with the snapshot, as raft.FSM requires. It decodes into
+// fresh maps and swaps them in only once the snapshot was read completely, so a broken
+// snapshot leaves the previous state untouched and readers never see a half-restored FSM.
 func (s *InMemoryFSM) Restore(reader io.ReadCloser) error {
+	musicians := map[string]Musician{}
+	cities := map[string]City{}
+
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxSnapshotLine)
 	var dataType string
 	for scanner.Scan() {
 		bts := scanner.Bytes()
@@ -231,15 +245,28 @@ func (s *InMemoryFSM) Restore(reader io.ReadCloser) error {
 			if err := json.Unmarshal(bts, &musician); err != nil {
 				return err
 			}
-			s.setMusician(musician)
+			musicians[musician.Name] = musician
 		case sectCities:
 			var city City
 			if err := json.Unmarshal(bts, &city); err != nil {
 				return err
 			}
-			s.setCity(city)
+			cities[city.Name] = city
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	s.musiciansM.Lock()
+	s.citiesM.Lock()
+	defer func() {
+		s.citiesM.Unlock()
+		s.musiciansM.Unlock()
+	}()
+
+	s.musicians = musicians
+	s.cities = cities
 	return nil
 }
 
