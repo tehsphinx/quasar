@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 
 	"github.com/hashicorp/raft"
@@ -106,6 +107,8 @@ func (s *InMemoryFSM) GetMusicianLocal(name string) (Musician, error) {
 	if !ok {
 		return Musician{}, fmt.Errorf("musician %s not found", name)
 	}
+	// The lock guards the map, not the slice's backing array: hand out a copy the caller may modify.
+	musician.Instruments = slices.Clone(musician.Instruments)
 	return musician, nil
 }
 

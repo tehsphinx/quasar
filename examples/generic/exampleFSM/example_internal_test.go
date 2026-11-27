@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/hashicorp/raft"
 )
 
 func cityCmd(t *testing.T, city City) []byte {
@@ -164,4 +166,60 @@ func TestPersistWriteErrorCancelsSink(t *testing.T) {
 	if !sink.canceled {
 		t.Error("Persist did not cancel the sink after a write error")
 	}
+}
+
+func TestGetMusicianLocalReturnsCopy(t *testing.T) {
+	fsm := NewInMemoryFSM()
+	fsm.setMusician(Musician{Name: "Miles", Instruments: []string{"trumpet"}})
+
+	m, err := fsm.GetMusicianLocal("Miles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Instruments[0] = "kazoo"
+
+	m, err = fsm.GetMusicianLocal("Miles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Instruments[0] != "trumpet" {
+		t.Fatalf("instrument = %q, want trumpet", m.Instruments[0])
+	}
+}
+
+// TestConcurrentMusicianMutateSnapshot fails under -race when GetMusicianLocal hands out
+// the FSM's Instruments array.
+func TestConcurrentMusicianMutateSnapshot(t *testing.T) {
+	fsm := NewInMemoryFSM()
+	fsm.setMusician(Musician{Name: "Miles", Instruments: []string{"trumpet"}})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			m, err := fsm.GetMusicianLocal("Miles")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			m.Instruments[0] = "kazoo"
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			snap, err := fsm.Snapshot()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if err := snap.Persist(&raft.DiscardSnapshotSink{}); err != nil {
+				t.Error(err)
+				return
+			}
+			snap.Release()
+		}
+	}()
+	wg.Wait()
 }
