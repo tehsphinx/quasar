@@ -193,7 +193,15 @@ const (
 	sectCities    = "--> cities <--"
 )
 
-func (s *snapshot) Persist(sink raft.SnapshotSink) error {
+// Persist writes the snapshot to the sink. On error it cancels the sink, as the
+// raft.FSMSnapshot contract asks.
+func (s *snapshot) Persist(sink raft.SnapshotSink) (err error) {
+	defer func() {
+		if err != nil {
+			_ = sink.Cancel()
+		}
+	}()
+
 	if err := s.newSection(sink, sectMusicians); err != nil {
 		return err
 	}
