@@ -177,7 +177,9 @@ func (h *InmemQueueHub) cancelPublish(item *inmemPersistedItem) {
 	defer h.m.Unlock()
 	sh := h.shards[item.shard]
 	for i, q := range sh.queue {
-		if q == item {
+		// Match on the reply channel, not the pointer: a redelivered item is
+		// a fresh copy sharing the publisher's replyCh (RT-14145).
+		if q.replyCh == item.replyCh {
 			sh.queue = append(sh.queue[:i], sh.queue[i+1:]...)
 			return
 		}
@@ -279,7 +281,7 @@ func (h *InmemQueueHub) releaseLocked(t *InmemTransport) error {
 	// Equivalent to a JS NAK per shard.
 	for _, sh := range h.shards {
 		if sh.inflight != nil {
-			sh.queue = append([]*inmemPersistedItem{sh.inflight}, sh.queue...)
+			sh.queue = append([]*inmemPersistedItem{sh.inflight.redelivery()}, sh.queue...)
 			sh.inflight = nil
 		}
 		if sh.items != nil {
@@ -346,20 +348,22 @@ func (h *InmemQueueHub) deliverLocked() {
 
 // settle is called by an inmemPersistedItem when the consumer terminates
 // it (success / error / NAK). The hub uses this hook to clear that
-// partition's inflight slot and deliver its next queued item.
-func (h *InmemQueueHub) settle(item *inmemPersistedItem, reply inmemPersistedReply, requeue bool) {
+// partition's inflight slot and deliver its next queued item. It reports false
+// when item is no longer the partition's delivery: releaseLocked requeued a
+// copy between terminate marking item settled and settle taking h.m.
+func (h *InmemQueueHub) settle(item *inmemPersistedItem, reply inmemPersistedReply, requeue bool) bool {
 	h.m.Lock()
 	defer h.m.Unlock()
 
 	sh := h.shards[item.shard]
 	if sh.inflight != item {
-		return
+		return false
 	}
 	sh.inflight = nil
 	if requeue {
 		// NAK path: keep the item, push back to the head of its partition,
 		// deliver to the next consumer (often after a leader flip).
-		sh.queue = append([]*inmemPersistedItem{item}, sh.queue...)
+		sh.queue = append([]*inmemPersistedItem{item.redelivery()}, sh.queue...)
 	} else {
 		// Success / error path: notify the publisher.
 		select {
@@ -368,6 +372,7 @@ func (h *InmemQueueHub) settle(item *inmemPersistedItem, reply inmemPersistedRep
 		}
 	}
 	h.deliverLocked()
+	return true
 }
 
 // inmemPersistedReply is the unified reply envelope (success or error).
@@ -433,12 +438,6 @@ func (i *inmemPersistedItem) NackWithDelay(_ context.Context) error {
 // ErrAlreadySettled like the NATS item does, so the cache's "nacked despite
 // successful apply" branch (persisted.go) is reachable without a JetStream
 // server.
-//
-// One gap remains on purpose: releaseLocked requeues an item whose apply is
-// still running without marking it settled, so that apply's ReplySuccess
-// settles here and returns nil while the hub's settle() no-ops on the
-// inflight guard. Closing it means requeuing a fresh copy rather than the
-// same struct, the way JetStream redelivers.
 func (i *inmemPersistedItem) terminate(reply inmemPersistedReply, requeue bool) error {
 	i.m.Lock()
 	if i.settled {
@@ -447,6 +446,29 @@ func (i *inmemPersistedItem) terminate(reply inmemPersistedReply, requeue bool) 
 	}
 	i.settled = true
 	i.m.Unlock()
-	i.hub.settle(i, reply, requeue)
+	if !i.hub.settle(i, reply, requeue) {
+		return ErrAlreadySettled
+	}
 	return nil
+}
+
+// redelivery marks this delivery settled and returns a fresh, unsettled copy
+// of it for the queue, the way JetStream redelivers a new message instead of
+// reviving the old one. The next consumer can settle the copy (RT-14145), and
+// a late reply on this delivery — an apply still running when releaseLocked
+// requeued it — reports ErrAlreadySettled. Called with h.m held; terminate
+// never holds i.m while taking h.m, so the lock order is safe.
+func (i *inmemPersistedItem) redelivery() *inmemPersistedItem {
+	i.m.Lock()
+	i.settled = true
+	i.m.Unlock()
+	return &inmemPersistedItem{
+		hub:         i.hub,
+		command:     i.command,
+		replyCh:     i.replyCh,
+		retry:       i.retry,
+		shard:       i.shard,
+		deadline:    i.deadline,
+		hasDeadline: i.hasDeadline,
+	}
 }

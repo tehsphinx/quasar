@@ -133,6 +133,129 @@ func TestInmemQueueHub_NackRequeuesToNextConsumer(t *testing.T) {
 	asrt.NoErr(leaderB.StopPersistedConsumer())
 }
 
+// TestInmemQueueHub_RedeliveredItemSettles is the RT-14145 regression: an
+// item the consumer Nacks is redelivered as a fresh delivery that the next
+// consumer can settle. Before the fix the hub requeued the same, already
+// settled struct, so every reply on the redelivery returned ErrAlreadySettled
+// and the shard never delivered again.
+//
+// Both orderings of a leader flip are covered: the consumer's Nack landing
+// before StopPersistedConsumer, and a stale Nack landing after it.
+func TestInmemQueueHub_RedeliveredItemSettles(t *testing.T) {
+	tests := []struct {
+		name string
+		// flip takes leaderA's delivery and steps leaderA down.
+		flip func(t *testing.T, ctx context.Context, leaderA *InmemTransport, sinkA <-chan PersistedItem)
+	}{
+		{
+			name: "nack then stop",
+			flip: func(t *testing.T, ctx context.Context, leaderA *InmemTransport, sinkA <-chan PersistedItem) {
+				asrt := is.New(t)
+				asrt.NoErr((<-sinkA).NackWithDelay(ctx))
+				// The hub redelivers to leaderA straight away; it steps down
+				// before replying, so that delivery is stale too.
+				redelivered := <-sinkA
+				asrt.NoErr(leaderA.StopPersistedConsumer())
+				asrt.True(errors.Is(redelivered.ReplySuccess(ctx, &pb.StoreResponse{Uid: 1}), ErrAlreadySettled))
+			},
+		},
+		{
+			name: "stop then stale nack",
+			flip: func(t *testing.T, ctx context.Context, leaderA *InmemTransport, sinkA <-chan PersistedItem) {
+				asrt := is.New(t)
+				item := <-sinkA
+				asrt.NoErr(leaderA.StopPersistedConsumer())
+				asrt.True(errors.Is(item.NackWithDelay(ctx), ErrAlreadySettled))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			asrt := is.New(t)
+
+			hub := NewInmemQueueHub()
+			_, producer := NewInmemTransport("")
+			_, leaderA := NewInmemTransport("")
+			_, leaderB := NewInmemTransport("")
+			ConnectInmemQueueHub(hub, producer, leaderA, leaderB)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			applyA, sinkA := itemSink(1)
+			_, err := leaderA.StartPersistedConsumer(ctx, applyA)
+			asrt.NoErr(err)
+
+			publishErr := make(chan error, 1)
+			publishUID := make(chan uint64, 1)
+			go func() {
+				r, e := producer.StorePersisted(ctx, &pb.Store{Key: "kNack"}, PersistedStoreOpts{Retry: true})
+				publishErr <- e
+				if e == nil {
+					publishUID <- r.Uid
+				}
+			}()
+
+			tt.flip(t, ctx, leaderA, sinkA)
+
+			applyB, sinkB := itemSink(1)
+			_, err = leaderB.StartPersistedConsumer(ctx, applyB)
+			asrt.NoErr(err)
+
+			select {
+			case item := <-sinkB:
+				asrt.Equal(string(item.Command().Key), "kNack")
+				asrt.True(item.Retry())
+				asrt.NoErr(item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 9}))
+			case <-time.After(2 * time.Second):
+				t.Fatal("leaderB did not receive the redelivered item")
+			}
+
+			asrt.NoErr(<-publishErr)
+			asrt.Equal(<-publishUID, uint64(9))
+
+			asrt.NoErr(leaderB.StopPersistedConsumer())
+		})
+	}
+}
+
+// TestInmemQueueHub_ReplyRacingStopReportsSettled covers the interleaving
+// where a reply marks its delivery settled, then waits on the hub lock while
+// StopPersistedConsumer requeues a copy. The reply did not take effect, so it
+// must report ErrAlreadySettled rather than nil (RT-14145).
+func TestInmemQueueHub_ReplyRacingStopReportsSettled(t *testing.T) {
+	asrt := is.New(t)
+
+	hub := NewInmemQueueHub()
+	_, producer := NewInmemTransport("")
+	_, leaderA := NewInmemTransport("")
+	ConnectInmemQueueHub(hub, producer, leaderA)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	applyA, sinkA := itemSink(1)
+	_, err := leaderA.StartPersistedConsumer(ctx, applyA)
+	asrt.NoErr(err)
+	go func() { _, _ = producer.StorePersisted(ctx, &pb.Store{Key: "kRace"}, PersistedStoreOpts{Retry: true}) }()
+	item := (<-sinkA).(*inmemPersistedItem)
+
+	// Hold the hub lock so the reply parks between marking the item settled
+	// and settling it on the hub.
+	hub.m.Lock()
+	replyErr := make(chan error, 1)
+	go func() { replyErr <- item.ReplySuccess(ctx, &pb.StoreResponse{Uid: 1}) }()
+	for settled := false; !settled; {
+		item.m.Lock()
+		settled = item.settled
+		item.m.Unlock()
+	}
+	asrt.NoErr(hub.releaseLocked(leaderA))
+	hub.m.Unlock()
+
+	asrt.True(errors.Is(<-replyErr, ErrAlreadySettled))
+}
+
 // TestInmemQueueHub_FIFOOrder verifies that producers fanning into the
 // hub are drained in publish order — the single-in-flight invariant
 // (one item delivered to the consumer at a time) is enough to preserve
