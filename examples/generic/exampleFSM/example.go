@@ -196,6 +196,12 @@ const (
 	sectCities    = "--> cities <--"
 )
 
+// snapshotSections lists the section headers in the order Persist writes them. Restore
+// requires each of them exactly once and in this order.
+var snapshotSections = []string{sectMusicians, sectCities}
+
+var errMalformedSnapshot = errors.New("malformed snapshot")
+
 // Persist writes the snapshot to the sink. On error it cancels the sink, as the
 // raft.FSMSnapshot contract asks.
 func (s *snapshot) Persist(sink raft.SnapshotSink) (err error) {
@@ -232,6 +238,8 @@ const maxSnapshotLine = 16 * 1024 * 1024
 // Restore replaces the whole state with the snapshot, as raft.FSM requires. It decodes into
 // fresh maps and swaps them in only once the snapshot was read completely, so a broken
 // snapshot leaves the previous state untouched and readers never see a half-restored FSM.
+// Data before the first section header, or a section missing, repeated or out of order,
+// counts as broken.
 func (s *InMemoryFSM) Restore(reader io.ReadCloser) error {
 	musicians := map[string]Musician{}
 	cities := map[string]City{}
@@ -239,14 +247,16 @@ func (s *InMemoryFSM) Restore(reader io.ReadCloser) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxSnapshotLine)
 	var dataType string
+	next := 0 // index of the next header expected in snapshotSections
 	for scanner.Scan() {
 		bts := scanner.Bytes()
-		switch string(bts) {
-		case sectMusicians:
-			dataType = sectMusicians
-			continue
-		case sectCities:
-			dataType = sectCities
+		switch header := string(bts); header {
+		case sectMusicians, sectCities:
+			if next == len(snapshotSections) || header != snapshotSections[next] {
+				return fmt.Errorf("%w: unexpected section header %q", errMalformedSnapshot, header)
+			}
+			dataType = header
+			next++
 			continue
 		}
 
@@ -263,10 +273,15 @@ func (s *InMemoryFSM) Restore(reader io.ReadCloser) error {
 				return err
 			}
 			cities[city.Name] = city
+		default:
+			return fmt.Errorf("%w: data before the first section header", errMalformedSnapshot)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return err
+	}
+	if next < len(snapshotSections) {
+		return fmt.Errorf("%w: missing section %q", errMalformedSnapshot, snapshotSections[next])
 	}
 
 	s.musiciansM.Lock()
