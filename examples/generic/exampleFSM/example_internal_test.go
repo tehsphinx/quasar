@@ -1,6 +1,7 @@
 package exampleFSM
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -127,8 +128,8 @@ func TestRestoreLargeEntry(t *testing.T) {
 
 func TestRestoreErrorKeepsState(t *testing.T) {
 	tests := map[string]string{
-		"bad json":       sectCities + "\n{not json\n",
-		"line too large": sectCities + "\n" + strings.Repeat("x", maxSnapshotLine+1) + "\n",
+		"bad json":       sectMusicians + "\n" + sectCities + "\n{not json\n",
+		"line too large": sectMusicians + "\n" + sectCities + "\n" + strings.Repeat("x", maxSnapshotLine+1) + "\n",
 	}
 	for name, snap := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -223,3 +224,59 @@ func TestConcurrentMusicianMutateSnapshot(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+func TestRestoreRejectsBadStructure(t *testing.T) {
+	const city = `{"name":"Zurich","country":"CH"}`
+	tests := map[string]string{
+		"data before header": city + "\n" + sectMusicians + "\n" + sectCities + "\n",
+		"missing section":    sectMusicians + "\n",
+		"repeated header":    sectMusicians + "\n" + sectCities + "\n" + city + "\n" + sectCities + "\n",
+		"reordered headers":  sectCities + "\n" + city + "\n" + sectMusicians + "\n",
+	}
+	for name, snap := range tests {
+		t.Run(name, func(t *testing.T) {
+			fsm := NewInMemoryFSM()
+			fsm.setCity(City{Name: "Bern"})
+
+			err := fsm.Restore(io.NopCloser(strings.NewReader(snap)))
+			if !errors.Is(err, errMalformedSnapshot) {
+				t.Fatalf("Restore error = %v, want %v", err, errMalformedSnapshot)
+			}
+			if _, err := fsm.GetCityLocal("Bern"); err != nil {
+				t.Errorf("state before the failed restore lost: %v", err)
+			}
+			if _, err := fsm.GetCityLocal("Zurich"); err == nil {
+				t.Error("city from the rejected snapshot was restored")
+			}
+		})
+	}
+}
+
+// TestRestoreEmptySections round-trips an empty FSM through Snapshot, Persist and Restore.
+func TestRestoreEmptySections(t *testing.T) {
+	snap, err := NewInMemoryFSM().Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &bufferSink{}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatal(err)
+	}
+
+	fsm := NewInMemoryFSM()
+	fsm.setCity(City{Name: "Bern"})
+	if err := fsm.Restore(io.NopCloser(&sink.Buffer)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fsm.GetCityLocal("Bern"); err == nil {
+		t.Error("city from before the restore survived")
+	}
+}
+
+type bufferSink struct {
+	bytes.Buffer
+}
+
+func (s *bufferSink) ID() string    { return "test" }
+func (s *bufferSink) Cancel() error { return nil }
+func (s *bufferSink) Close() error  { return nil }
